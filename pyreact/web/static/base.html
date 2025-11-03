@@ -1,0 +1,139 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>PyReact App</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <style>
+      html,body{margin:0;padding:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu}
+      
+      .chat-message {
+        display: flex;
+        margin-bottom: 8px;
+        animation: fadeIn 0.2s ease-in;
+      }
+      
+      .chat-message.user {
+        justify-content: flex-end;
+      }
+      
+      .chat-message.system {
+        justify-content: center;
+      }
+      
+      .chat-message.assistant {
+        justify-content: flex-start;
+      }
+      
+      .message-bubble {
+        max-width: 70%;
+        padding: 12px 16px;
+        border-radius: 18px;
+        word-wrap: break-word;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+      }
+      
+      .chat-message.user .message-bubble {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border-bottom-right-radius: 4px;
+      }
+      
+      .chat-message.assistant .message-bubble {
+        background: #f1f5f9;
+        color: #1e293b;
+        border: 1px solid #e2e8f0;
+        border-bottom-left-radius: 4px;
+      }
+      
+      .chat-message.system .message-bubble {
+        background: #fef3c7;
+        color: #92400e;
+        border: 1px solid #fde68a;
+        font-size: 0.9em;
+        font-style: italic;
+      }
+      
+      .message-bubble.info {
+        background: #dbeafe !important;
+        color: #1e40af !important;
+        border-color: #93c5fd !important;
+      }
+      
+      .message-bubble.warning {
+        background: #fef3c7 !important;
+        color: #92400e !important;
+        border-color: #fde68a !important;
+      }
+      
+      .message-bubble.error {
+        background: #fee2e2 !important;
+        color: #991b1b !important;
+        border-color: #fca5a5 !important;
+      }
+      
+      .message-sender {
+        font-size: 0.75em;
+        margin-bottom: 4px;
+        opacity: 0.7;
+        font-weight: 500;
+      }
+      
+      .log-entry {
+        background: #0b1020;
+        color: #e7f0ff;
+        padding: 4px 12px;
+        font-family: monospace;
+        font-size: 11px;
+        line-height: 1.2;
+        margin: 0;
+        animation: fadeIn 0.3s ease-in;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        overflow-x: auto;
+      }
+
+      .log-entry:first-child,             
+      :not(.log-entry) + .log-entry
+      {
+        border-top-left-radius: 12px;
+        border-top-right-radius: 12px;
+        margin-top: 8px;             
+      }
+
+      .log-entry:last-child,                
+      .log-entry:has(+ :not(.log-entry))   
+      {
+        border-bottom-left-radius: 12px;
+        border-bottom-right-radius: 12px;
+        margin-bottom: 8px;    
+      }
+
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(0); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+    </style>
+  </head>
+  <body class="m-0 p-0 font-sans grid grid-rows-[auto_1fr_auto] h-screen">
+    <div id="dbg"
+      class="sticky top-0 flex gap-2 items-center py-2 px-3 bg-[#f7f7f8] border-b border-[#e5e7eb] z-10">
+      <button id="dbg-tree"
+        class="px-3 py-1 border border-gray-300 rounded-[6px] bg-white cursor-pointer hover:bg-gray-100 transition-colors">
+        Print VNode Tree (Ctrl+V)
+      </button>
+      <button id="dbg-trace"
+        class="px-3 py-1 border border-gray-300 rounded-[6px] bg-white cursor-pointer hover:bg-gray-100 transition-colors">
+        Print Render Trace (Ctrl+T)
+      </button>
+    </div>
+    <div id="chat-container" class="py-2 px-4 overflow-auto">
+      <div id="chronological-output" class="space-y-2"></div>
+    </div>
+    <input id="cli"
+      class="py-2 px-4 border-0 border-t border-gray-300 text-[16px] outline-none"
+      placeholder="type and press Enter…" autofocus />
+    <script src="/static/app.js"></script>
+  </body>
+</html>
