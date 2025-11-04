@@ -1,5 +1,5 @@
 [tool.poetry]
-authors = ["Edmar Miyake <edmar.miyake@gmail.com>", Arthur Jacobina <email27arthur@gmail.com>]
+authors = ["Edmar Miyake <edmar.miyake@gmail.com>", "Arthur Jacobina <email27arthur@gmail.com>"]
 description = ""
 include = [{ path = "pyreact/web/static/base.html", format = "wheel" }]
 name = "pyreact"

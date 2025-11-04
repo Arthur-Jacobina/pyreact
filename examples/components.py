@@ -1,7 +1,7 @@
 from integrations.dspy_integration import DSPyProvider, use_dspy_module
 from integrations.use_dspy import use_dspy_call
-from log import Log
-from message import Message
+from .log import Log
+from .message import Message
 from pyreact.components.keystroke import Keystroke
 from pyreact.core.core import component, hooks
 from pyreact.core.provider import create_context
@@ -14,7 +14,7 @@ from pyreact.router import (
     use_routes_catalog,
 )
 from pyreact.router.route import use_route_params
-from router_agent import RouterAgent as ProjectRouterAgent
+from .router_agent import RouterAgent as ProjectRouterAgent
 import dspy
 import os
 import dotenv
