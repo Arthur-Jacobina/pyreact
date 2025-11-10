@@ -1,7 +1,7 @@
 from typing import Callable, List, Dict, Optional, Any, TypedDict
 import dspy
 
-from .message import Message
+from message import Message
 from pyreact.core.core import component, hooks
 from pyreact.router import use_route, use_routes_catalog
 from integrations.use_dspy import use_dspy_call

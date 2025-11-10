@@ -1,8 +1,8 @@
 from integrations.dspy_integration import DSPyProvider, use_dspy_module
 from integrations.use_dspy import use_dspy_call
-from .log import Log
-from .message import Message
-from pyreact.components.keystroke import Keystroke
+from log import Log
+from message import Message
+from pyreact.prebuilt.domain.keystroke import use_keystroke
 from pyreact.core.core import component, hooks
 from pyreact.core.provider import create_context
 from pyreact.router import (
@@ -14,7 +14,7 @@ from pyreact.router import (
     use_routes_catalog,
 )
 from pyreact.router.route import use_route_params
-from .router_agent import RouterAgent as ProjectRouterAgent
+from router_agent import RouterAgent as ProjectRouterAgent
 import dspy
 import os
 import dotenv
@@ -181,6 +181,8 @@ def QAHome():
             return
         set_last_message(line)
 
+    use_keystroke(on_submit=on_enter)
+
     return [
         Message(
             key="welcome",
@@ -188,7 +190,6 @@ def QAHome():
             sender="assistant",
             message_type="info",
         ),
-        Keystroke(key="qa_input", on_submit=on_enter),
         GuardRail(
             key="guardrail",
             question=last_message,
@@ -229,6 +230,13 @@ def Home():
         else:
             set_user_query(k)
 
+    use_keystroke(on_submit=handle_navigate_with_params)
+
+    def handle_agent_navigate(path, ver):
+        print(f"Navigating to {path} (ver: {ver})")
+        if path and isinstance(path, str):
+            navigate(path)
+
     id_text = (
         f" (ID: {route_params.get('id', 'none')})" if route_params.get("id") else ""
     )
@@ -250,7 +258,6 @@ def Home():
             key="catalog",
             text=f"Rotas disponíveis: {[r.get('name') or r['path'] for r in (catalog or [])]}",
         ),
-        Keystroke(key="nav", on_submit=handle_navigate_with_params),
         Message(
             key="instruction",
             text="Digite um comando natural para navegar (ex: 'ir para about' ou 'abrir QA') e pressione Enter:",
@@ -261,7 +268,7 @@ def Home():
         ProjectRouterAgent(
             key="agent-router",
             message=user_query,
-            on_navigate=lambda x, y: print(f"Navigating to {x} (ver: {y})"),
+            on_navigate=handle_agent_navigate,
         ),
     ]
 
@@ -276,6 +283,8 @@ def About():
             navigate("/home/about-redirect", query={"from": "about"})
         elif k == "s":
             navigate("/about", query={"search": "documentation", "filter": "recent"})
+
+    use_keystroke(on_submit=handle_navigation)
 
     search_text = (
         f" (Search: {query_params.get('search', 'none')})"
@@ -295,7 +304,6 @@ def About():
             text="Press 'h' to go home with params, 's' to add search query",
             trigger="mount",
         ),
-        Keystroke(key="about-nav", on_submit=handle_navigation),
     ]
 
 

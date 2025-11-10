@@ -1,6 +1,6 @@
 from pyreact.boot import run_web
 from pyreact.core.core import component
-from .components import Root
+from components import Root
 import os
 import dotenv
 import dspy

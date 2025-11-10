@@ -76,7 +76,8 @@
       try {
         const msg = JSON.parse(ev.data);
         if (msg.channel === 'ui' && msg.type === 'nav') {
-          if (location.pathname !== msg.data) history.pushState({}, '', msg.data);
+          const currentUrl = location.pathname + location.search + location.hash;
+          if (currentUrl !== msg.data) history.pushState({}, '', msg.data);
           return;
         }
         if (msg.channel === 'logs' && msg.type === 'stdout') {
