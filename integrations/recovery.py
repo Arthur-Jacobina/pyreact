@@ -26,6 +26,7 @@ from typing import Any, Iterable, List, Optional, Sequence
 
 from pyreact.core.harness import Boundary, Middleware, Next, middleware
 from pyreact.core.recovery import (  # noqa: F401  (re-exports)
+    BoundaryTimeout,
     CircuitOpen,
     RetryOn,
     _base,
@@ -40,9 +41,11 @@ from pyreact.core.recovery import (  # noqa: F401  (re-exports)
     retry,
     retry_after_of,
     should_fall_back,
+    timeout,
 )
 
 __all__ = [
+    "BoundaryTimeout",
     "CircuitOpen",
     "circuit_breaker",
     "exponential",
@@ -52,6 +55,7 @@ __all__ = [
     "retry",
     "retry_after_of",
     "should_fall_back",
+    "timeout",
 ]
 
 
