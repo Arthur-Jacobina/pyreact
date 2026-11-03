@@ -503,6 +503,17 @@ class Call:
     ``submit(**inputs)`` does the same and returns the asyncio.Task.
     ``ver`` bumps only when a call settles, so ``use_effect(..., [call.ver])``
     fires exactly once per completed call.
+
+    Call identity: ``inputs`` are the inputs of the in-flight call (the
+    settled one once it settles) and ``tag`` the value passed as
+    ``run(..., tag=...)`` with them -- e.g. the turn id, so a component can
+    tell whether ``result`` answers *this* turn without extra state::
+
+        check.run(comment=text, tag=turn.id)
+        done = check.tag == turn.id and not check.loading
+
+    ``tag`` is not sent to the module (unless its signature has a ``tag``
+    input field).
     """
 
     run: Callable[..., None]
@@ -513,6 +524,8 @@ class Call:
     loading: bool = False
     error: Optional[BaseException] = None
     usage: Optional[Dict[str, Any]] = None
+    inputs: Optional[Dict[str, Any]] = None
+    tag: Any = None
 
     def __iter__(self):  # legacy tuple-unpacking: run, (result, ver), loading, error
         return iter((self.run, (self.result, self.ver), self.loading, self.error))
@@ -542,7 +555,8 @@ class StreamCall(Call):
 def _reducer(state, action):
     typ = action["type"]
     if typ == "start":
-        return {**state, "loading": True, "error": None, "partial": {}}
+        return {**state, "loading": True, "error": None, "partial": {},
+                "inputs": action["inputs"], "tag": action["tag"]}
     if typ == "loading":
         return {**state, "loading": action["loading"]}
     if typ == "partial":
@@ -550,16 +564,17 @@ def _reducer(state, action):
     if typ == "success":
         return {**state, "loading": action["loading"], "result": action["result"],
                 "error": None, "ver": state["ver"] + 1, "usage": action["usage"],
-                "partial": action.get("partial", state["partial"])}
+                "partial": action.get("partial", state["partial"]),
+                "inputs": action["inputs"], "tag": action["tag"]}
     if typ == "error":
         return {**state, "loading": action["loading"], "result": None,
                 "error": action["error"], "ver": state["ver"] + 1,
-                "usage": action["usage"]}
+                "usage": action["usage"], "inputs": action["inputs"], "tag": action["tag"]}
     return state
 
 
 _INITIAL = {"loading": False, "result": None, "error": None, "ver": 0, "usage": None,
-            "partial": {}}
+            "partial": {}, "inputs": None, "tag": None}
 
 
 def _use_call_machine(
@@ -616,7 +631,8 @@ def _use_call_machine(
             return False
         return ref["cfg"]["policy"] == "parallel" or ref["latest"] is task
 
-    async def _do(inputs: dict, cfg: dict, turn: Optional[str], call_id: Optional[str] = None):
+    async def _do(inputs: dict, cfg: dict, turn: Optional[str], call_id: Optional[str] = None,
+                  tag: Any = None):
         me = asyncio.current_task()
         loop = asyncio.get_running_loop()
         partial: Dict[str, str] = {}
@@ -663,8 +679,9 @@ def _use_call_machine(
         if not _current(me):
             return
         still = any(not t.done() for t in ref["tasks"])
+        ident = {"inputs": dict(inputs), "tag": tag}
         if err is not None:
-            dispatch({"type": "error", "error": err, "usage": usage, "loading": still})
+            dispatch({"type": "error", "error": err, "usage": usage, "loading": still, **ident})
             return
         if cfg["stream_fields"]:
             # Non-streaming LM (or cache hit): show the final values.
@@ -673,11 +690,14 @@ def _use_call_machine(
                 if val is not None:
                     partial[f] = str(val)
         dispatch({"type": "success", "result": result, "usage": usage, "loading": still,
-                  "partial": dict(partial)})
+                  "partial": dict(partial), **ident})
 
     def _submit(**inputs) -> Optional[asyncio.Task]:
         call_id = inputs.pop("_call_id", None)  # internal: caller-chosen id
         cfg = ref["cfg"]
+        tag = None
+        if "tag" in inputs and not _has_input(cfg["module"], "tag"):
+            tag = inputs.pop("tag")
         pol = cfg["policy"]
         inflight = [t for t in ref["tasks"] if not t.done()]
         if pol == "ignore" and inflight:
@@ -687,9 +707,9 @@ def _use_call_machine(
                 t.cancel()  # superseded: don't keep paying for a stale LLM call
             ref["tasks"].clear()
         turn = cfg["turn_id"] if cfg["turn_id"] is not None else tm.current_turn_id()
-        dispatch({"type": "start"})
+        dispatch({"type": "start", "inputs": dict(inputs), "tag": tag})
         task = spawn(
-            _do(inputs, cfg, turn, call_id), owner=ctx, turn=turn,
+            _do(inputs, cfg, turn, call_id, tag), owner=ctx, turn=turn,
             name=f"dspy_call:{tm.component_path(ctx)}"
         )
         ref["latest"] = task
@@ -713,10 +733,22 @@ def _use_call_machine(
     common = dict(
         run=run, submit=submit, cancel=cancel, result=state["result"], ver=state["ver"],
         loading=state["loading"], error=state["error"], usage=state["usage"],
+        inputs=state["inputs"], tag=state["tag"],
     )
     if stream_fields is not None:
         return StreamCall(**common, partial=state["partial"], fields=tuple(stream_fields))
     return Call(**common)
+
+
+def _has_input(module, field_name: str) -> bool:
+    """True if ``module``'s signature declares an input called ``field_name``."""
+    from .architectures import signature_of
+
+    try:
+        sig = dspy.ensure_signature(signature_of(module))
+        return field_name in getattr(sig, "input_fields", {})
+    except Exception:
+        return False
 
 
 def _dspy_ctx():
