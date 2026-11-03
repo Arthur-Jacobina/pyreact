@@ -2,7 +2,9 @@
 
     architecture  how a component thinks        use_module(sig, arch="cot" | "rlm" | ...)
     optimizer     build step -> better program  optimize(program, trainset=..., metric=...)
-    hot swap      HMR into the running app      result.hot_swap(app, "supervisor")
+    learned prog  a prop / context              LearnedProgram(key="supervisor", src="x.json")
+                                                use_module(sig, program=use_learned("supervisor"))
+    hot swap      HMR = a re-render             src changes -> users re-render with it
     events        the trace you debug/learn from dataset_from_events(app.events, key)
                                                 explain(call_id) / inspect_program(program)
 
@@ -55,6 +57,7 @@ from .optimizers import (
     register_optimizer,
     unregister_optimizer,
 )
+from .programs import LearnedProgram, SavedProgram, use_learned
 from .result import OptimizationResult, diff_states, load
 
 install_commands()
@@ -77,6 +80,10 @@ __all__ = [
     "list_optimizers",
     "OptimizationResult",
     "load",
+    # learned programs are props
+    "LearnedProgram",
+    "use_learned",
+    "SavedProgram",
     "diff_states",
     "count_lm_calls",
     "BudgetError",

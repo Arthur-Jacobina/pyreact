@@ -60,6 +60,87 @@ def _apply_restored(restore: Dict[Any, Any], env: Optional[DSPyEnv], key: Any, m
         env.compiled[key] = mod
     return mod
 
+
+class _Applied:
+    """Marker on a live module: which learned program it currently carries
+    (by id) and its own state from before (restored when the program goes
+    away). Not a dict: ``dspy.Module.named_parameters`` walks dict attrs."""
+
+    __slots__ = ("program_id", "base")
+
+    def __init__(self, program_id: int, base: Dict[str, Any]) -> None:
+        self.program_id, self.base = program_id, base
+
+
+_LEARNED_ATTRS = ("_pyreact_result_path", "_pyreact_optimizer")
+
+
+def _bump_version(key: Any) -> None:
+    """Count a swap in ``ModuleVersions`` (``:modules`` shows it) without
+    scheduling renders: this runs inside the render that applies it."""
+    from .optimize import ModuleVersions
+
+    versions = dict(ModuleVersions._ctx.value or {})
+    versions[key] = versions.get(key, 0) + 1
+    ModuleVersions._ctx.value = versions
+
+
+def _use_program(env: Optional[DSPyEnv], key: Any, live: Any, program: Any) -> Any:
+    """Hook behind ``program=`` (``use_module`` / ``use_agent`` / ``use_call``).
+
+    Applies the learned state of ``program`` (instructions, demos: its
+    ``dump_state()``) onto ``live``, the component's own module, so its
+    bindings (ReAct tools, architecture kwargs) stay. Runs on render and is
+    idempotent: a new ``program`` object (a re-render after the
+    ``LearnedProgram`` source changed) is applied once; ``program=None``
+    after a program was applied restores ``live``'s own state (the
+    baseline). The module is marked compiled (``env.compiled``), so the
+    suspend participant, ``:modules`` and optimizers see it as learned.
+    """
+    box = hooks.use_ref(None)
+    mine = box.current
+    if mine is not None and mine[0] is not live:  # rebuilt: starts from its baseline
+        mine = box.current = None
+    if program is None or program is live:
+        if mine is not None:
+            info = getattr(live, "_pyreact_learned", None)
+            if isinstance(info, _Applied) and info.program_id == mine[1]:
+                try:
+                    live.load_state(info.base)
+                except Exception as exc:
+                    tm.publish("error", {"phase": "learned", "key": repr(key),
+                                         "error": repr(exc)})
+                for attr in ("_pyreact_learned", *_LEARNED_ATTRS):
+                    live.__dict__.pop(attr, None)
+                if env is not None and env.compiled.get(key) is live:
+                    del env.compiled[key]
+            box.current = None
+        return live
+    info = getattr(live, "_pyreact_learned", None)
+    if not (isinstance(info, _Applied) and info.program_id == id(program)):
+        try:
+            base = info.base if isinstance(info, _Applied) else live.dump_state()
+            live.load_state(program.dump_state())
+        except Exception as exc:
+            tm.publish("error", {"phase": "learned", "key": repr(key), "error": repr(exc)})
+            return live
+        try:
+            live._pyreact_learned = _Applied(id(program), base)
+            for attr in _LEARNED_ATTRS:
+                if getattr(program, attr, None) is not None:
+                    setattr(live, attr, getattr(program, attr))
+                else:
+                    live.__dict__.pop(attr, None)
+        except Exception:
+            pass
+        if env is not None and key is not None:
+            env.compiled[key] = live
+        if key is not None:
+            _bump_version(key)
+    box.current = (live, id(program))
+    return live
+
+
 __all__ = [
     "Call",
     "StreamCall",
@@ -111,6 +192,7 @@ def use_module(
     name: Optional[str] = None,
     deps: Optional[list] = None,
     compile_with_optimizer: bool = False,
+    program: Any = None,
     _key: Optional[Tuple] = None,
     **kwargs,
 ) -> Any:
@@ -134,6 +216,11 @@ def use_module(
       (optimizer, GEPA, ``OptimizationResult.hot_swap``) it is returned
       instead, transparently.
     - ``deps``: rebuild when changed (e.g. new demos / instructions).
+    - ``program``: a learned program for this module, typically
+      ``program=use_learned("router")`` (a ``LearnedProgram`` above). Its
+      learned state is applied onto this component's module (hot swap is a
+      re-render with another program); ``None`` = the module's own state.
+      Wins over ``env.compiled``.
     """
     if isinstance(signature_or_module, dspy.Module):
         return signature_or_module
@@ -210,6 +297,7 @@ def use_module(
 
     restore = hooks.get_service(RESTORE_SERVICE, dict)
     mod = hooks.use_memo(_factory, deps=[key, deps_key, id(env.caches), kw_sig])
+    _use_program(env, key, mod, program)
 
     if compile_with_optimizer and env.optimizer is not None:
         _use_compile(env, key, mod, ctx)
@@ -266,6 +354,7 @@ def use_agent_call(
     name: Optional[str] = None,
     turn_id: Optional[str] = None,
     deps: Optional[list] = None,
+    program: Any = None,
     **arch_kwargs,
 ) -> "Call":
     """One-liner: ``use_call(use_module(signature, arch=arch, **arch_kwargs))``.
@@ -274,7 +363,7 @@ def use_agent_call(
     ``cancel``, ``result``/``ver``/``loading``/``error``/``usage``), same
     ``llm.*`` events, same cancellation -- switch ``arch`` like a prop.
     """
-    mod = use_module(signature, arch=arch, name=name, deps=deps, **arch_kwargs)
+    mod = use_module(signature, arch=arch, name=name, deps=deps, program=program, **arch_kwargs)
     return use_call(mod, model=model, lm=lm, policy=policy, name=name, turn_id=turn_id)
 
 
@@ -844,15 +933,23 @@ def use_call(
     policy: str = "replace",
     name: Optional[str] = None,
     turn_id: Optional[str] = None,
+    program: Any = None,
 ) -> Call:
     """Call a DSPy module as an effect.
 
     ``policy``: ``"replace"`` (new call cancels the in-flight one; default),
     ``"parallel"`` (all run; each settle bumps ``ver``), ``"ignore"`` (drop
-    new calls while one is in flight).
+    new calls while one is in flight). ``program``: a learned program whose
+    state is applied onto ``module`` first (see :func:`use_module`).
     """
+    _use_call_program(module, program)
     return _use_call_machine(module, model=model, lm=lm, policy=policy, name=name,
                              turn_id=turn_id)
+
+
+def _use_call_program(module, program) -> None:
+    env = hooks.use_context(_dspy_ctx())
+    _use_program(env, getattr(module, "_pyreact_key", None), module, program)
 
 
 def use_stream(
@@ -865,6 +962,7 @@ def use_stream(
     name: Optional[str] = None,
     turn_id: Optional[str] = None,
     throttle: float = 0.05,
+    program: Any = None,
 ) -> StreamCall:
     """Like :func:`use_call`, but rerenders with partial text while streaming.
 
@@ -875,6 +973,7 @@ def use_stream(
     """
     if isinstance(listen, str):
         listen = (listen,)
+    _use_call_program(module, program)
     return _use_call_machine(module, model=model, lm=lm, policy=policy, name=name,
                              turn_id=turn_id, stream_fields=tuple(listen), throttle=throttle)
 
@@ -1030,11 +1129,14 @@ def use_agent(
     name: Optional[str] = None,
     policy: str = "replace",
     turn_id: Optional[str] = None,
+    program: Any = None,
 ) -> Call:
     """ReAct agent over tools (Tool, callables, or ToolProvider names).
 
     Sync tools run in a worker thread; every tool call publishes
     ``tool.start`` / ``tool.end``. Returns a :class:`Call`.
+    ``program``: a learned program (``program=use_learned("coder")``): its
+    instructions and demos are applied to this agent, its tools stay.
     """
     registry = use_tools()
     resolved = resolve_tools(tools, registry)
@@ -1056,7 +1158,8 @@ def use_agent(
     restore = hooks.get_service(RESTORE_SERVICE, dict)
     # Rebuild only when signature, tool set, limits, or name change.
     react = hooks.use_memo(_build, deps=[key, tools_key, max_iters])
-    compiled = env.compiled.get(key) if env is not None else None
+    _use_program(env, key, react, program)
+    compiled = env.compiled.get(key) if env is not None and program is None else None
     if compiled is not None and compiled is not react:
         # A learned program was hot-swapped in for this agent: take its state
         # (instructions, demos) and keep the live tool bindings.
