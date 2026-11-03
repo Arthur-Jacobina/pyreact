@@ -26,11 +26,13 @@ from typing import Any, Iterable, List, Optional, Sequence
 
 from pyreact.core.harness import Boundary, Middleware, Next, middleware
 from pyreact.core.recovery import (  # noqa: F401  (re-exports)
+    CircuitOpen,
     RetryOn,
     _base,
     _brief,
     _cancelling,
     _predicate,
+    circuit_breaker,
     exponential,
     fallback,
     is_retryable,
@@ -41,6 +43,8 @@ from pyreact.core.recovery import (  # noqa: F401  (re-exports)
 )
 
 __all__ = [
+    "CircuitOpen",
+    "circuit_breaker",
     "exponential",
     "fallback",
     "fallback_model",

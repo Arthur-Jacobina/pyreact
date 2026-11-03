@@ -18,6 +18,7 @@ the session doing the call (and the process-global bus), with the boundary's
     recovery.retry      {kind, name, boundary_id, attempt, delay, error, hint}
     recovery.exhausted  {kind, name, boundary_id, attempts, error}
     recovery.fallback   {kind, name, boundary_id, to, error}
+    recovery.circuit    {kind, name, boundary_id, key, state, prev, failures, error}
 
 DSPy-aware recovery (switching models) lives in :mod:`integrations.recovery`.
 """
@@ -28,6 +29,7 @@ import asyncio
 import email.utils
 import inspect
 import random
+import threading
 import time
 from typing import Any, Callable, Iterable, Optional, Tuple, Type, Union
 
@@ -35,6 +37,8 @@ from .harness import Blocked, Boundary, Middleware, Next, middleware
 
 __all__ = [
     "Backoff",
+    "CircuitOpen",
+    "circuit_breaker",
     "RetryOn",
     "exponential",
     "fallback",
@@ -298,3 +302,153 @@ def fallback(
             return out
 
     return _fallback
+
+
+# ---------------------------------------------------------------------------
+# circuit breaker
+# ---------------------------------------------------------------------------
+class CircuitOpen(Exception):
+    """Raised instead of running a call whose circuit is open (fail fast).
+
+    ``retryable = False``: :func:`retry` does not retry it, while
+    :func:`fallback` / ``fallback_model`` do substitute it. ``retry_after``
+    is the time left before the circuit lets a trial call through."""
+
+    retryable = False
+
+    def __init__(self, key: Any, retry_after: float = 0.0):
+        super().__init__(f"circuit {key!r} is open (retry in {retry_after:.1f}s)")
+        self.key = key
+        self.retry_after = retry_after
+
+
+def _default_key(b: Boundary) -> Any:
+    return b.attrs.get("model") or b.name
+
+
+def circuit_breaker(
+    failure_threshold: int = 5,
+    reset_timeout: float = 30.0,
+    key: Callable[[Boundary], Any] = _default_key,
+    kinds: Optional[Iterable[str]] = DEFAULT_KINDS,
+    *,
+    failure_on: Optional[RetryOn] = None,
+    fallback: Optional[Callable[[Boundary, BaseException], Any]] = None,
+    clock: Callable[[], float] = time.monotonic,
+    name: str = "circuit_breaker",
+) -> Middleware:
+    """Stop calling something that keeps failing; probe it again later.
+
+    One circuit per ``key(b)`` (default: the ``llm`` model, else the
+    boundary name — e.g. the tool):
+
+    - **closed**: calls run; ``failure_threshold`` consecutive failures
+      (``failure_on``: type(s) or predicate, default every ``Exception`` but
+      ``Blocked``; cancellations never count) open it;
+    - **open**: calls fail fast with :class:`CircuitOpen` — or return
+      ``fallback(b, exc)`` when given — without running; after
+      ``reset_timeout`` seconds the next call is a trial (**half-open**);
+    - **half-open**: one trial at a time (others fail fast); success closes
+      the circuit, failure re-opens it.
+
+    Transitions publish ``recovery.circuit``; ``b.attrs["circuit"]`` is the
+    state the call met. The returned middleware has ``.state(key)`` and
+    ``.reset(key=None)`` for inspection and tests. Put it *inside*
+    ``retry`` (each attempt counts) and ``fallback_model`` (an open circuit
+    falls back immediately): ``[fallback_model, retry, circuit_breaker,
+    timeout]``.
+    """
+    if failure_threshold < 1:
+        raise ValueError("failure_threshold must be >= 1")
+    counts = _predicate(failure_on, should_fall_back)
+    circuits: dict = {}
+    lock = threading.Lock()
+
+    def _get(k: Any) -> dict:
+        c = circuits.get(k)
+        if c is None:
+            c = circuits[k] = {"state": "closed", "failures": 0, "opened_at": 0.0,
+                               "trial": False}
+        return c
+
+    def _move(b: Boundary, k: Any, c: dict, state: str, error: Any = None) -> None:
+        prev, c["state"] = c["state"], state
+        if state == "open":
+            c["opened_at"] = clock()
+        if state == "closed":
+            c["failures"] = 0
+        publish_recovery("recovery.circuit", {
+            **_base(b), "key": str(k), "state": state, "prev": prev,
+            "failures": c["failures"], "error": _brief(error) if error else None}, b)
+
+    async def _reject(b: Boundary, k: Any, remaining: float) -> Any:
+        exc = CircuitOpen(k, remaining)
+        if fallback is None:
+            raise exc
+        b.attrs["fallback"] = True
+        out = fallback(b, exc)
+        if inspect.isawaitable(out):
+            out = await out
+        return out
+
+    @middleware(kinds=kinds, name=name)
+    async def _breaker(b: Boundary, call_next: Next) -> Any:
+        k = key(b)
+        reject: Optional[float] = None
+        is_trial = False
+        with lock:
+            c = _get(k)
+            if c["state"] == "open":
+                elapsed = clock() - c["opened_at"]
+                if elapsed >= reset_timeout:
+                    _move(b, k, c, "half_open")
+                else:
+                    reject = reset_timeout - elapsed
+            if reject is None and c["state"] == "half_open":
+                if c["trial"]:
+                    reject = 0.0  # a trial is in flight
+                else:
+                    c["trial"] = is_trial = True
+            b.attrs["circuit"] = "open" if reject is not None else c["state"]
+        if reject is not None:
+            return await _reject(b, k, reject)
+        try:
+            out = await call_next(b)
+        except BaseException as exc:
+            with lock:
+                if is_trial:
+                    c["trial"] = False
+                if isinstance(exc, Exception) and counts(exc):
+                    c["failures"] += 1
+                    if c["state"] == "half_open" or (
+                            c["state"] == "closed" and c["failures"] >= failure_threshold):
+                        _move(b, k, c, "open", exc)
+            raise
+        with lock:
+            if is_trial:
+                c["trial"] = False
+            if c["state"] == "half_open":
+                _move(b, k, c, "closed")
+            else:
+                c["failures"] = 0
+        return out
+
+    def state(k: Any) -> str:
+        with lock:
+            c = circuits.get(k)
+            if c is None:
+                return "closed"
+            if c["state"] == "open" and clock() - c["opened_at"] >= reset_timeout:
+                return "half_open"
+            return c["state"]
+
+    def reset(k: Any = None) -> None:
+        with lock:
+            if k is None:
+                circuits.clear()
+            else:
+                circuits.pop(k, None)
+
+    _breaker.state = state  # type: ignore[attr-defined]
+    _breaker.reset = reset  # type: ignore[attr-defined]
+    return _breaker
