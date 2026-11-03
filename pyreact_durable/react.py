@@ -109,11 +109,6 @@ def _open(log: Any, log_factory: Optional[Callable[[str], Any]], session_id: str
     raise TypeError(f"Durable: unsupported log {src!r}")
 
 
-# Deprecated: {resolved path: {"leaf": id}} filled by DurableParticipant from a
-# manifest written before Durable dehydrated itself (read for one release).
-RESTORE_SERVICE = "pyreact_durable.restore"
-
-
 def _log_key(slog: SessionLog) -> str:
     return str(Path(slog.path).resolve())
 
@@ -294,14 +289,11 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
 
     def _open_and_restore():
         slog, owned = _open(log, log_factory, sid)
-        legacy = hooks.get_service(RESTORE_SERVICE, dict).pop(_log_key(slog), None)
         rec = hydrated if live.current is None else None  # first open only
         if rec and rec.get("path") != _log_key(slog):
             _degrade(session, "log moved", path=_log_key(slog), expected=rec.get("path"))
         elif rec:
             _checkout(slog, rec.get("leaf"))
-        elif legacy:
-            _checkout(slog, legacy.get("leaf"))
         return slog, owned
 
     opened = hooks.use_memo(_open_and_restore, [log_src, log_factory is None, sid])

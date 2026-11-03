@@ -11,12 +11,11 @@ import warnings
 
 import pytest
 
-from pyreact.boot import AppRunner, DirectoryManifestStore, DirectorySnapshots, hydrate_root
+from pyreact.boot import DirectorySnapshots, hydrate_root
 from pyreact.boot import create_root
 from pyreact.core import HydrationWarning, component, hooks, use_turn
 from pyreact_durable import (
     Durable,
-    DurableParticipant,
     SessionLog,
     use_conversation,
     use_persistent_state,
@@ -181,34 +180,6 @@ def test_replaced_log_is_a_mismatch(roots, tmp_path):
     roots.append(r)
     assert [m["kind"] for m in r.mismatches] == ["error"]
     assert [d["reason"] for d in r.session.degraded] == ["log replaced"]
-
-
-# ---------------------------------------------------------------------------
-# Deprecated: AppRunner(participants=[DurableParticipant]) keeps working
-# ---------------------------------------------------------------------------
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_deprecated_participant_still_round_trips(tmp_path):
-    with pytest.warns(DeprecationWarning, match="DurableParticipant is deprecated"):
-        DurableParticipant()
-    app = AppRunner(make_app(tmp_path), default_session=False,
-                    participants=[DurableParticipant],
-                    manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
-    try:
-        s = app.open_session("old")
-        s.invoke("hello", wait=True, timeout=5)
-        m = s.suspend()
-        assert m["participants"]["durable"] == {}
-        assert m["slices"][SLICE]["log"]["leaf"]  # Durable's own slice
-    finally:
-        app.shutdown()
-    app2 = AppRunner(make_app(tmp_path), default_session=False,
-                     participants=[DurableParticipant],
-                     manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
-    try:
-        r = app2.resume("old")
-        assert r.services["seen"][0] == (1, 2) and r.degraded == []
-    finally:
-        app2.shutdown()
 
 
 def test_hidden_activity_keeps_the_log_open(roots, tmp_path):

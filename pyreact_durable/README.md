@@ -319,9 +319,6 @@ replaced log is a `hydration.mismatch` (`kind: "error"`, also
 `session.resume.degraded`, `participant: "durable"`) and the provider opens
 the file as usual (a fresh log if it is gone); a vanished leaf only degrades.
 
-`DurableParticipant` is deprecated (a `DeprecationWarning`): the legacy
-`session.suspend()` manifest carries the same slice, so its fragment is empty.
-
 ## CLI
 
 ```bash
