@@ -45,4 +45,5 @@ include = ["pyreact", "pyreact_durable", "pyreact_otel", "pyreact_sandbox"]
 [tool.pytest.ini_options]
 markers = [
     "examples: runs every example end to end offline (deselect with -m 'not examples')",
+    "docker: needs a Docker daemon; skipped when unavailable (deselect with -m 'not docker')",
 ]
