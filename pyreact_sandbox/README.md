@@ -249,6 +249,36 @@ What survives what:
 | `autosnapshot="turn"` | snapshot of the last turn | snapshot of the last finished turn | snapshot image |
 | `on_close="snapshot"` | snapshot at close | (no close) → the record's live id is reattached if alive | snapshot image |
 
+### Suspend / resume with the whole agent (`SandboxParticipant`)
+
+With pyreact's stateful sessions (`session.suspend()` / `app.resume(id)`, see
+"Stateful agents" in the main README), `SandboxParticipant` puts every
+sandbox the session created into the suspend manifest:
+
+```python
+from pyreact_sandbox import SandboxParticipant
+app = AppRunner(App, participants=[DurableParticipant, SandboxParticipant],
+                manifest_store=DirectoryManifestStore("runs/manifests"))
+# mode: participants=[lambda s: SandboxParticipant(s, mode="suspend")]
+```
+
+```json
+"sandbox": {"mode": "snapshot", "sandboxes": [{"key": "default", "store_key": "agent/default",
+            "driver": "docker", "sandbox_id": null, "snapshot": {"id": "pyreact-sandbox:…"}, "spec": {}}]}
+```
+
+| `mode` | at suspend | at resume |
+|---|---|---|
+| `snapshot` (default) | snapshot, then destroy | new sandbox from the snapshot |
+| `suspend` | pause (`docker pause`), keep | reattach + unpause (else the last snapshot) |
+| `keep` | leave running | reattach |
+
+The manifest's record wins over the provider's `SnapshotStore` for the same
+key. If the snapshot is gone (or the sandbox, or the driver changed), a
+fresh sandbox boots and `session.resume.degraded` is published
+(`participant: "sandbox"`, `reason: "snapshot missing"` ...). `suspend()`
+returns once the sandboxes reached their final state.
+
 ## Integrations
 
 **RLM in Docker** — `SandboxInterpreter(sandbox_or_handle)` implements dspy's

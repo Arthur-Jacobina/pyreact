@@ -215,3 +215,60 @@ def test_rlm_interpreter_runs_inside_the_container(docker):
         assert sb.read_file_sync("x.txt") == b"HI"
     finally:
         sb.destroy_sync()
+
+
+@pytest.mark.parametrize("mode", ["snapshot", "suspend"])
+def test_session_suspend_resume_brings_the_container_back(docker, tmp_path, mode):
+    from pyreact.boot import AppRunner, DirectoryManifestStore
+    from pyreact.core import component, hooks, use_turn
+    from pyreact_sandbox.react import SandboxProvider, use_sandbox, wait_closed
+
+    @component
+    def Shell():
+        sb = use_sandbox()
+        turn = use_turn()
+        bus = hooks.get_service("event_bus", lambda: None)
+
+        async def act():
+            r = await sb.exec(turn.text)
+            bus.publish("message", {"text": r.stdout.strip(), "sender": "sandbox"})
+
+        hooks.use_effect(lambda: act() if turn else None, [turn and turn.id])
+        return []
+
+    def make():
+        @component
+        def App():
+            return [SandboxProvider(key="sbx", driver=docker, spec=spec(), on_close="destroy",
+                                    children=[Shell(key="sh")])]
+
+        return AppRunner(App, default_session=False,
+                         participants=[lambda s: ps.SandboxParticipant(s, mode=mode)],
+                         manifest_store=DirectoryManifestStore(tmp_path / "m"))
+
+    app = make()
+    try:
+        s = app.open_session("dk")
+        s.invoke("sh -c 'echo persisted > /tmp/state.txt'", wait=True, timeout=120)
+        m = s.suspend()
+        [rec] = m["participants"]["sandbox"]["sandboxes"]
+        if mode == "suspend":
+            assert inspect(rec["sandbox_id"])["State"]["Paused"] is True
+        else:
+            assert rec["snapshot"]["id"].startswith("pyreact-sandbox:")
+    finally:
+        app.shutdown()
+        wait_closed(60)
+
+    app = make()
+    try:
+        texts = []
+        app.on_session(open=lambda sess: sess.event_bus.subscribe(
+            lambda ev: texts.append(ev.payload["text"]), ["message"]))
+        r = app.resume("dk")
+        r.invoke("cat /tmp/state.txt", wait=True, timeout=120)
+        assert texts == ["persisted"] and r.degraded == []
+        app.close_session("dk")
+    finally:
+        app.shutdown()
+        wait_closed(60)
