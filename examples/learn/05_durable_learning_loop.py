@@ -28,7 +28,8 @@ Phases (each one is a separate process in real life)::
     uv run python -m pyreact_durable show runs/store_router.jsonl
     uv run python -m pyreact_durable events runs/store_router.jsonl --kind feedback
 
-Uses the ``claude -p`` dev LM (haiku). ``all`` makes roughly 50-70 LM calls.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
+``all`` makes roughly 50-70 LM calls.
 """
 
 from __future__ import annotations
@@ -41,15 +42,18 @@ from typing import List, Optional, Tuple
 from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_examples
 from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
-from integrations.claude_cli_lm import ClaudeCLILM
+from examples._lm import example_lm
 from integrations.feedback import send_feedback
 from integrations.learn import build_module, dataset_from_events, load, optimize
 from pyreact.boot import bootstrap
 from pyreact.core import component, hooks, use_turn
 from pyreact_durable import Durable, SessionLog
 
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": ["all", "--log", "{tmp}/store.jsonl", "--out", "{tmp}/router.json", "--budget", "16"]}
+
 LOG = "runs/store_router.jsonl"
-ARTIFACT = "artifacts/learn/router_from_journal.json"
+ARTIFACT = "artifacts/learn/router_from_journal.json"  # default --out
 KEY = "supervisor"  # module name -> the handle hot_swap / datasets use
 
 
@@ -112,7 +116,7 @@ def serve(
     Returns accuracy. With ``program``, the saved optimization result is
     loaded and hot-swapped into the running app before the first message.
     """
-    lm = lm or ClaudeCLILM("haiku")
+    lm = lm or example_lm()
     results: dict = {}
     app = bootstrap(make_app(lm, log_path, results))
     try:
@@ -143,7 +147,7 @@ def serve(
 
 def learn(*, log_path: str, out: str, budget: int = 24, lm=None):
     """Journal -> dataset -> GEPA -> artifact. Runs offline (no app)."""
-    lm = lm or ClaudeCLILM("haiku")
+    lm = lm or example_lm()
 
     # 1. The journal is the dataset. Only *rated* calls count (unrated ones,
     #    e.g. the held-out evaluation, would leak and carry unchecked labels);

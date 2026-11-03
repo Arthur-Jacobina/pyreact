@@ -15,7 +15,7 @@ from), the same cancellation. Each user input is a turn naming the arch to use.
     uv run python -m examples.learn.01_architectures            # predict, cot, rlm
     uv run python -m examples.learn.01_architectures cot rlm    # pick some
 
-Uses the ``claude -p`` dev LM (no API key). ~8 LM calls.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``). ~8 LM calls.
 """
 
 from __future__ import annotations
@@ -25,10 +25,13 @@ import sys
 import time
 
 from integrations import DSPyProvider, use_agent_call
-from integrations.claude_cli_lm import ClaudeCLILM
+from examples._lm import OFFLINE, example_lm
 from integrations.learn import explain
 from pyreact.boot import bootstrap
 from pyreact.core import component, hooks, use_turn
+
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": []}
 
 SIG = "context: str, question: str -> answer: str"
 
@@ -79,8 +82,8 @@ def App():
 
 
 def main(archs: list[str]) -> None:
-    lm = ClaudeCLILM("haiku")
-    models = {"default": lm, "fast": ClaudeCLILM("haiku")}
+    lm = example_lm()
+    models = {"default": lm, "fast": example_lm()}
 
     @component
     def Root():
@@ -130,4 +133,5 @@ def main(archs: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or ["predict", "cot", "rlm"])
+    # rlm needs a real model writing code in the sandbox; skipped offline
+    main(sys.argv[1:] or (["predict", "cot"] if OFFLINE else ["predict", "cot", "rlm"]))

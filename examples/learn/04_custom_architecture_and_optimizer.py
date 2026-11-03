@@ -12,7 +12,7 @@
 
     uv run python -m examples.learn.04_custom_architecture_and_optimizer
 
-Uses the ``claude -p`` dev LM. ~17 LM calls.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``). ~17 LM calls.
 """
 
 from __future__ import annotations
@@ -24,10 +24,13 @@ import dspy
 
 from integrations import DSPyProvider, use_agent_call
 from integrations.architectures import build_module
-from integrations.claude_cli_lm import ClaudeCLILM
+from examples._lm import example_lm, out_path
 from integrations.learn import evaluate, optimize, register_architecture, register_optimizer
 from pyreact.boot import bootstrap
 from pyreact.core import component, hooks, use_turn
+
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": []}
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +121,7 @@ def team_match(example, pred):
 
 
 def main() -> None:
-    lm = ClaudeCLILM("haiku")
+    lm = example_lm()
 
     print("1) custom architecture 'majority' inside a component")
 
@@ -143,7 +146,7 @@ def main() -> None:
     res = optimize(build_module(TicketSig, "predict"), trainset=VAL, valset=VAL,
                    metric=team_match, optimizer="instruction_menu", lm=lm,
                    candidates=[HOUSE_RULES])
-    res.save("artifacts/learn/04_instruction_menu.json")
+    res.save(out_path("04_instruction_menu.json"))
     print(res.report())
     print(res.diff())
 
