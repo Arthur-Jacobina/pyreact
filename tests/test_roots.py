@@ -215,7 +215,9 @@ def test_hydration_mismatches_are_reported_not_fatal(roots):
 def test_hydrate_root_errors():
     store = MemorySnapshots()
     with pytest.raises(KeyError):
-        hydrate_root(make_app([]), session_id="ghost", store=store)
+        hydrate_root(make_app([]), session_id="ghost", store=store, if_missing="raise")
+    with pytest.raises(ValueError, match="if_missing"):
+        hydrate_root(make_app([]), session_id="ghost", store=store, if_missing="nope")
     with pytest.raises(ValueError, match="snapshot= or store="):
         hydrate_root(make_app([]), session_id="x")
     snap = {"format": "pyreact.snapshot/1", "session_id": "a", "slices": {}, "turns": {}}
@@ -326,3 +328,21 @@ def test_render_to_renders_message_events_and_replays_recent_ones(roots, capsys)
         root.render_to("html")
     with pytest.raises(TypeError):
         root.render_to(42)
+
+
+def test_hydrate_root_with_no_stored_snapshot_mounts_a_fresh_tree(roots):
+    log = []
+    store = MemorySnapshots()
+    with pytest.warns(RuntimeWarning, match="no snapshot for session 'new'"):
+        root = hydrate_root(make_app(log), session_id="new", store=store)
+    roots.append(root)
+    assert ("effect", "mount") in log and root.mismatches == []
+    assert root.session.degraded == [
+        {"participant": "snapshot", "reason": "no snapshot", "store": repr(store)}]
+    [ev] = root.events.recent(None, ["session.resume.degraded"])
+    assert ev.payload["reason"] == "no snapshot" and ev.payload["session_id"] == "new"
+    assert root.send("first", wait=True, timeout=5) == "new/t1"
+    root.suspend()  # into the store: the next hydrate_root finds it
+    root2 = hydrate_root(make_app(log), session_id="new", store=store)
+    roots.append(root2)
+    assert root2.ref("agent")["seen"] == ["first"] and root2.session.degraded == []
