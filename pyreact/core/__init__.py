@@ -9,6 +9,7 @@ from .events import Event, EventBus
 from .turns import Turn, TurnManager, TurnStore, use_turn
 from .turn_hooks import use_on_turn
 from .io_hooks import use_emit, use_event, use_input
+from .refs import REFS_SERVICE, use_imperative_handle
 from . import runtime
 from . import harness
 from . import recovery
@@ -36,6 +37,8 @@ __all__ = [
     "use_input",
     "use_event",
     "use_emit",
+    "use_imperative_handle",
+    "REFS_SERVICE",
     "runtime",
     "harness",
     "recovery",
