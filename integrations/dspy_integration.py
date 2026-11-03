@@ -1,8 +1,18 @@
 # dspy_integration.py ---------------------------------------
+"""DSPy environment as React-style context.
+
+LMs, adapter and settings are *context*: ``DSPyProvider`` scopes them to a
+subtree and hooks apply them per call with ``dspy.context(...)``. Nothing
+here mutates global ``dspy.settings`` (``dspy.configure`` is owner-thread /
+owner-task only, and per-render mutation leaked across subtrees).
+"""
+
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, Tuple, Optional
-import asyncio
+from typing import Any, Dict, Optional, Tuple
+
 import dspy
+
 from pyreact.core.core import component, hooks
 from pyreact.core.provider import create_context
 
@@ -17,6 +27,27 @@ class DSPyEnv:
     caches: Dict = field(default_factory=dict)  # (module_key -> module)
     compiled: Dict = field(default_factory=dict)  # (module_key -> compiled module)
     settings: Dict = field(default_factory=dict)  # free for flags (timeout, etc.)
+    adapter: Optional[Any] = None  # e.g. dspy.JSONAdapter(); None = DSPy default
+    # module keys with an optimizer compile in flight (dedupe across components)
+    compiling: set = field(default_factory=set, repr=False)
+
+    def lm_for(self, model: Optional[str] = None, lm: Optional[Any] = None) -> Any:
+        """Resolve an LM: explicit ``lm`` > ``models[model]`` > ``models['default']``."""
+        if lm is not None:
+            return lm
+        if model is not None and model in self.models:
+            return self.models[model]
+        return self.models.get("default")
+
+    def context(self, model: Optional[str] = None, lm: Optional[Any] = None, **extra):
+        """``dspy.context`` applying this env's LM (and adapter) for one call."""
+        overrides = dict(extra)
+        selected = self.lm_for(model, lm)
+        if selected is not None:
+            overrides["lm"] = selected
+        if self.adapter is not None:
+            overrides.setdefault("adapter", self.adapter)
+        return dspy.context(**overrides) if overrides else nullcontext()
 
 
 # Create DSPy context - will be automatically managed by create_context
@@ -32,6 +63,13 @@ def use_dspy_env() -> DSPyEnv:
     return env
 
 
+def _identity_key(mapping: Optional[Dict[str, Any]]) -> Tuple:
+    # Inline dicts are rebuilt every render; key on their *items'* identity.
+    if not mapping:
+        return ()
+    return tuple(sorted((str(k), id(v)) for k, v in mapping.items()))
+
+
 @component
 def DSPyProvider(
     *,
@@ -39,8 +77,16 @@ def DSPyProvider(
     models: Optional[Dict[str, Any]] = None,
     optimizer=None,
     settings=None,
+    adapter=None,
     children=None,
 ):
+    # Module caches survive env rebuilds (modules are LM-agnostic: the LM is
+    # applied per call). Compiled programs are tied to the optimizer.
+    store = hooks.use_memo(
+        lambda: {"caches": {}, "compiled": {}, "compiling": set(), "optimizer": None},
+        [],
+    )
+
     def _factory():
         model_registry = dict(models or {})
         default_lm = lm if lm is not None else model_registry.get("default")
@@ -48,27 +94,30 @@ def DSPyProvider(
             raise ValueError(
                 "DSPyProvider requires either 'lm' or models['default'] to be provided."
             )
-
-        # Ensure registry has a 'default'
         model_registry.setdefault("default", default_lm)
-        env = DSPyEnv(
+        if store["optimizer"] is not optimizer:
+            store["optimizer"] = optimizer
+            store["compiled"] = {}
+        return DSPyEnv(
             models=model_registry,
             optimizer=optimizer,
-            settings=settings or {},
+            caches=store["caches"],
+            compiled=store["compiled"],
+            settings=dict(settings or {}),
+            adapter=adapter,
+            compiling=store["compiling"],
         )
-        return env
 
-    # Create environment directly without use_memo to avoid re-creation issues
-    env = _factory()
-
-    # Configure the global default LM once per env
-    if env.models.get("default"):
-        try:
-            dspy.configure(lm=env.models["default"])
-        except Exception:
-            # If configuration fails, continue without global configuration
-            pass
-
+    env = hooks.use_memo(
+        _factory,
+        deps=[
+            id(lm),
+            _identity_key(models),
+            id(optimizer),
+            _identity_key(settings),
+            id(adapter),
+        ],
+    )
     return [DSPyContext(value=env, children=children or [])]
 
 
@@ -88,41 +137,18 @@ def use_dspy_module(
     """
     Creates (or reuses from cache) a DSPy Module parameterized by the Signature.
     Optionally compiles with the Provider's optimizer.
+
+    Cache key is ``(module_cls.__name__, signature name, name)`` — shared by
+    every component using the same triple. Prefer :func:`integrations.use_module`
+    for per-component instances.
     """
-    env = use_dspy_env()
-    deps_key = tuple(deps) if deps is not None else None
-    module_key = _mk_module_key(module_cls, signature, name)
+    from .hooks import use_module
 
-    def factory():
-        mod = module_cls(signature)
-        env.caches[module_key] = mod
-        return mod
-
-    mod = hooks.use_memo(
-        lambda: env.caches.get(module_key) or factory(), deps=[module_key, deps_key]
+    return use_module(
+        signature,
+        module_cls,
+        name=name,
+        deps=deps,
+        compile_with_optimizer=compile_with_optimizer,
+        _key=_mk_module_key(module_cls, signature, name),
     )
-
-    if compile_with_optimizer and env.optimizer is not None:
-        compiled = env.compiled.get(module_key)
-
-        if compiled is None:
-            # trigger compilation outside the event-loop thread to avoid UI blocking
-            def kick_compile():
-                def work():
-                    return env.optimizer.compile(mod)
-
-                fut = asyncio.get_running_loop().run_in_executor(None, work)
-
-                async def _await_and_store():
-                    try:
-                        cm = await fut
-                        env.compiled[module_key] = cm
-                        env.caches[module_key] = cm
-                    except Exception:
-                        pass
-
-                asyncio.create_task(_await_and_store())
-
-            hooks.use_effect(kick_compile, [module_key])  # run once
-
-    return env.compiled.get(module_key, mod)
