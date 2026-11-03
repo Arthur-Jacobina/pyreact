@@ -39,6 +39,15 @@ How a re-run is conditioned (the retry contract): before calling
 Retries exhausted: ``on_exhausted="raise"`` (default) raises
 :class:`VerificationFailed`, ``"flag"`` returns the last result.
 
+Learning from failures: with ``to_feedback=True`` a call that *ends*
+failing (flagged, raised or exhausted -- not one a retry fixed) also
+publishes a ``feedback`` event ``{"score", "text", "target": call_id,
+"by": verifier}``, the same event ``send_feedback`` / ``:feedback`` publish,
+so ``dataset_from_events(..., require_feedback=True)`` collects exactly the
+inputs the verifier rejected, with its feedback, for GEPA. Use
+``on_fail="flag"`` (or ``on_exhausted="flag"``) to keep the outputs in the
+dataset; a raised call is an ``llm.error`` (``include_errors=True``).
+
 Built-in checks: :func:`schema`, :func:`assert_that`, :func:`grounded_in`
 (``integrations.harness.llm_judge`` for an LM judge). Pass a list to run
 several as one verifier (all must pass; feedback is joined).
@@ -55,7 +64,7 @@ from pyreact.core.harness import Boundary, Next
 
 from ._base import HarnessMiddleware, Kinds
 from ._base import resolve as _resolve
-from ._events import emit
+from ._events import emit, publish
 
 __all__ = [
     "Verdict",
@@ -148,7 +157,7 @@ class verify(HarnessMiddleware):  # noqa: N801 - reads as a function
                  on_fail: str = "raise", max_attempts: int = 2,
                  threshold: Optional[float] = None, on_exhausted: str = "raise",
                  inject: Optional[Callable[[Boundary, str], None]] = None,
-                 name: Optional[str] = None) -> None:
+                 to_feedback: bool = False, name: Optional[str] = None) -> None:
         checks = list(check) if isinstance(check, (list, tuple)) else [check]
         if not checks or not all(callable(c) for c in checks):
             raise TypeError("verify needs a check callable (or a list of them)")
@@ -163,6 +172,7 @@ class verify(HarnessMiddleware):  # noqa: N801 - reads as a function
         self.on_fail, self.max_attempts, self.on_exhausted = on_fail, max_attempts, on_exhausted
         self.threshold = threshold
         self.inject = inject
+        self.to_feedback = to_feedback
 
     # -- one verdict ------------------------------------------------------------
     async def evaluate(self, b: Boundary, result: Any) -> Verdict:
@@ -186,6 +196,12 @@ class verify(HarnessMiddleware):  # noqa: N801 - reads as a function
         b.attrs.setdefault("verdicts", []).append(v.as_dict())
         emit("verify.passed" if v.passed else "verify.failed", b,
              **{k: val for k, val in v.as_dict().items() if k not in ("passed", "attempt")})
+
+    def _feedback(self, b: Boundary, v: Verdict) -> None:
+        text = v.feedback or f"failed {self.harness_name}"
+        publish("feedback", {"score": float(v.score), "text": f"[{self.harness_name}] {text}",
+                             "target": b.attrs.get("call_id") or b.id, "by": self.harness_name},
+                turn_id=b.turn_id, source=b.component)
 
     def _condition(self, b: Boundary, v: Verdict) -> None:
         b.attempt += 1
@@ -214,6 +230,8 @@ class verify(HarnessMiddleware):  # noqa: N801 - reads as a function
             else:
                 v.action = self.on_fail
             self._record(b, v)
+            if self.to_feedback and v.action in ("flag", "raise", "exhausted"):
+                self._feedback(b, v)
             if v.action == "flag":
                 return result
             if v.action in ("raise", "exhausted"):
