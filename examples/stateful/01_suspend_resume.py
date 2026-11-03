@@ -1,26 +1,37 @@
-"""01 - Suspend a whole coding agent, resume it in another process.
+"""01 - Suspend a whole coding agent, hydrate it in another process.
 
-An *agent* here is a session's whole state: its durable conversation and
-component state (``pyreact_durable``), its Docker sandbox with the files it
-wrote (``pyreact_sandbox``), its learned prompt (``integrations.learn``) and
-the turn it was in the middle of. ``session.suspend()`` turns all of that
-into one manifest; ``app.resume(session_id)`` brings it back.
+An *agent* here is its tree's state: its durable conversation
+(``pyreact_durable``), its sandbox with the files it wrote
+(``pyreact_sandbox``), its learned prompt (``integrations.learn``) and the
+turn it was in the middle of. The tree declares all of it; outside code only
+talks to the **root** (ADR 0001)::
+
+    root = create_root(App, session_id="coder-1", store=DirectorySnapshots(...))
+    root.send(Q1, wait=True)
+    root.ref("coder").learned.set("coder", path)   # LearnedProgram state: a re-render
+    root.suspend(on_active="interrupt") # hide -> dehydrate -> snapshot -> unmount
+    ...
+    root = hydrate_root(App, session_id="coder-1", store=...)   # next process
 
 Process 1 (``--phase work``):
-  1. seed the sandbox with a brief (``TASK.md``) and ask the coding agent a
-     question; it writes and runs ``fib.py`` in the sandbox;
-  2. "learn": save a better prompt as an ``integrations.learn`` result and
-     hot-swap it into the agent (no optimizer run, no LLM call);
-  3. ask a follow-up and, while the agent is working on it, **suspend**
-     (``on_active="interrupt"``): the turn is cut short and carried in the
-     manifest, the sandbox is snapshotted then destroyed, the manifest is
-     printed.
+  1. the agent mounts with a brief: an effect writes ``TASK.md`` into its
+     sandbox; it is asked a question and writes and runs ``fib.py``;
+  2. "learn": a better prompt is saved as an ``integrations.learn`` result
+     and becomes the program of ``LearnedProgram(key="coder")`` -- the
+     provider's state, set through its registry (no optimizer run, no LLM
+     call);
+  3. a follow-up is asked and, while the agent is working on it, the root
+     is **suspended** (``on_active="interrupt"``): the turn is cut short and
+     carried in the snapshot, which is printed.
 
-Process 2 (``--phase resume``): a new runner **resumes** the session. Before
-the first render the conversation, the log leaf, the sandbox snapshot and
-the learned prompt are handed back; then the cut turn re-runs by itself --
-its LLM calls that had answered are **replayed** from the log (``durable_lm``)
--- and the agent finishes the task using the files from process 1.
+Process 2 (``--phase resume``): ``hydrate_root`` mounts the same tree with the
+snapshot. Every library hands its own slice back during the first render
+(``use_dehydrate``): ``Durable`` its log and leaf (the conversation),
+``SandboxProvider`` / ``use_sandbox`` the snapshot taken on suspend (the
+files), ``LearnedProgram`` the learned prompt. Then the cut turn re-runs by
+itself -- its LLM calls that had answered are **replayed** from the log
+(``durable_lm``) -- and the agent finishes the task using the files from
+process 1.
 
     uv run python -m examples.stateful.01_suspend_resume --demo            # both, 2 processes
     uv run python -m examples.stateful.01_suspend_resume --phase work
@@ -43,28 +54,25 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import dspy
 
 import pyreact_sandbox as ps
-from integrations import DSPyProvider, use_agent
-from integrations.learn import OptimizationResult
-from integrations.learn.hmr import resolve_module
-from integrations.stateful import CompiledModulesParticipant
-from pyreact.boot import AppRunner, DirectoryManifestStore
-from pyreact.core import component, hooks, use_emit, use_turn
-from pyreact_durable import (
-    Durable,
-    DurableParticipant,
-    SessionLog,
-    use_conversation,
-    use_durable_lm,
-)
-from pyreact_sandbox import SandboxParticipant, SandboxProvider, SandboxSpec, sandbox_tools
-from pyreact_sandbox import use_sandbox
-from pyreact_sandbox.react import HANDLES_SERVICE
-
+from examples._devtools import trace
 from examples._lm import example_lm
+from integrations import DSPyProvider, use_agent, use_dspy_env
+from integrations.learn import (
+    LearnedProgram,
+    OptimizationResult,
+    use_learned,
+    use_learned_registry,
+)
+from pyreact.boot import DirectorySnapshots, create_root, hydrate_root
+from pyreact.components.message import Message
+from pyreact.core import component, hooks, use_event, use_imperative_handle, use_turn
+from pyreact_durable import Durable, SessionLog, use_conversation, use_durable_lm
+from pyreact_sandbox import SandboxProvider, SandboxSpec, sandbox_tools, use_sandbox
 
 # Offline smoke run (tests/test_examples_smoke.py): local driver, state in a temp dir.
 SMOKE = {"args": ["--demo", "--driver", "local", "--state", "{tmp}/state"], "timeout": 240}
@@ -100,30 +108,37 @@ class Coder(dspy.Signature):
     answer: str = dspy.OutputField(desc="the final answer, one or two sentences")
 
 
-LMS: dict = {}  # this process's durable LM wrapper (for its replay stats)
-
-
+# ---------------------------------------------------------------------------
+# The tree
+# ---------------------------------------------------------------------------
 @component(transparent=True)  # no path segment: state lives at App/CodingAgent[coder]
 def LMLayer(lm=None, children=None):
     dlm = use_durable_lm(lm)  # every LM call journaled; re-runs replay them
-    LMS["durable"] = dlm
+    use_imperative_handle("lm", lambda: dlm, [id(dlm)])  # root.ref("lm").stats
     return [DSPyProvider(key="dspy", lm=dlm, children=children or [])]
 
 
 @component
-def CodingAgent():
+def CodingAgent(brief: str = "", on_tool_end=None):
     conv = use_conversation()                     # persisted Q/A pairs
-    sb = use_sandbox()                            # the session's sandbox
+    sb = use_sandbox(ref="sandbox")               # the session's sandbox; root.ref("sandbox")
     tools = hooks.use_memo(lambda: sandbox_tools(sb, timeout=30), [id(sb)])
-    agent = use_agent(Coder, tools=tools, max_iters=MAX_ITERS, name="coder")
+    program = use_learned("coder")                # the LearnedProgram above (None: baseline)
+    agent = use_agent(Coder, tools=tools, max_iters=MAX_ITERS, name="coder", program=program)
     turn = use_turn()
-    emit = use_emit()
+    restored = hooks.use_ref(len(conv))           # what the first render saw
 
-    def mounted():  # what the first render saw (restored before it, on resume)
-        emit("message", {"text": f"(mounted with {len(conv)} messages in the "
-                                        "conversation)", "sender": "system"})
-
-    hooks.use_effect(mounted, [])
+    # The brief is part of the workspace: an effect writes it into the sandbox
+    # (idempotent, so a hydrated agent may write it again).
+    hooks.use_effect(lambda: sb.write_file("TASK.md", brief) if brief else None,
+                     [id(sb), brief])
+    use_event("tool.end", lambda ev: on_tool_end(ev) if on_tool_end else None)
+    env = use_dspy_env()
+    registry = use_learned_registry()            # the LearnedProgram provider's handle
+    # imperative access for outside code: the live module, the learned registry
+    use_imperative_handle("coder", lambda: SimpleNamespace(
+        module=env.caches.get(("ReAct", "Coder", "coder")), learned=registry,
+        messages=len(conv)), [len(conv), id(program)])
 
     def ask():
         if turn is not None:
@@ -131,75 +146,78 @@ def CodingAgent():
 
     hooks.use_effect(ask, [turn and turn.id])
 
-    def answered():
-        if not agent.ver or turn is None:
-            return
-        if agent.error is not None:
-            emit("message", {"text": f"error: {agent.error!r}", "sender": "system"})
-            return
-        answer = agent.result.answer
-        conv.extend([{"role": "user", "content": turn.text},
-                     {"role": "assistant", "content": answer}])
-        emit("message", {"text": answer, "sender": "assistant"})
+    def remember():
+        if agent.ver and turn is not None and agent.error is None:
+            conv.extend([{"role": "user", "content": turn.text},
+                         {"role": "assistant", "content": agent.result.answer}])
 
-    hooks.use_effect(answered, [agent.ver])
-    return []
+    hooks.use_effect(remember, [agent.ver])
+
+    out = [Message(key="mounted", sender="system", trigger="mount",
+                   text=f"(mounted with {restored.current} messages in the conversation)")]
+    if agent.ver and agent.error is not None:
+        out.append(Message(key=f"error-{agent.ver}", text=f"error: {agent.error!r}",
+                           sender="system", message_type="error"))
+    elif agent.ver and agent.result is not None:
+        out.append(Message(key=f"answer-{agent.ver}", text=agent.result.answer,
+                           sender="assistant"))
+    return out
 
 
-def make_app(state: Path, driver, lm) -> AppRunner:
+def make_app(state: Path, driver, lm, on_tool_end=None):
     logs = state / "logs"
     logs.mkdir(parents=True, exist_ok=True)
 
     @component
     def App():
+        # Every provider dehydrates its own state on root.suspend() and gets
+        # it back on hydrate_root(): the log ref, the sandbox snapshot ref
+        # (taken on suspend, destroyed otherwise), the learned program.
         return [Durable(key="durable", log_factory=lambda sid: logs / f"{sid}.jsonl", children=[
-            LMLayer(key="lm", lm=lm, children=[
-                SandboxProvider(key="sandbox", driver=driver, spec=SPEC, on_close="destroy",
-                                children=[CodingAgent(key="coder")]),
+            LearnedProgram(key="coder", src=None, children=[
+                LMLayer(key="lm", lm=lm, children=[
+                    SandboxProvider(key="sandbox", driver=driver, spec=SPEC, on_close="destroy",
+                                    children=[
+                        CodingAgent(key="coder", brief=TASK, on_tool_end=on_tool_end),
+                    ]),
+                ]),
             ]),
         ])]
 
-    return AppRunner(
-        App, default_session=False,
-        participants=[
-            DurableParticipant,                                        # log + leaf
-            lambda s: SandboxParticipant(s, mode="snapshot"),          # snapshot -> restore
-            lambda s: CompiledModulesParticipant(s, dir=state / "learned"),  # learned prompts
-        ],
-        manifest_store=DirectoryManifestStore(state / "manifests"),
-    )
+    return App
 
 
 # ---------------------------------------------------------------------------
-# Output
+# Devtools output
 # ---------------------------------------------------------------------------
-def show(ev) -> None:
+def show(ev):
     p = ev.payload
     if ev.kind == "message":
-        print(f"\n{p.get('sender')}> {p.get('text')}", flush=True)
-    elif ev.kind == "tool.start":
-        print(f"  [tool] {p.get('tool')}({str(p.get('args'))[:120]})", flush=True)
-    elif ev.kind == "sandbox.exec":
+        return f"\n{p.get('sender')}> {p.get('text')}"
+    if ev.kind == "tool.start":
+        return f"  [tool] {p.get('tool')}({str(p.get('args'))[:120]})"
+    if ev.kind == "sandbox.exec":
         out = (p.get("stdout") or p.get("stderr") or p.get("error") or "").strip()
         code = p.get("exit_code")
-        print(f"  [sandbox.exec {p.get('op')}] {p.get('name')} -> "
-              f"{'' if code is None else f'exit {code} '}{out[:160]!r}", flush=True)
-    elif ev.kind in ("sandbox.created", "sandbox.restored", "sandbox.snapshot",
-                     "sandbox.destroyed", "sandbox.error"):
+        return (f"  [sandbox.exec {p.get('op')}] {p.get('name')} -> "
+                f"{'' if code is None else f'exit {code} '}{out[:160]!r}")
+    if ev.kind in ("sandbox.created", "sandbox.restored", "sandbox.snapshot",
+                   "sandbox.destroyed", "sandbox.error"):
         keep = {k: v for k, v in p.items() if k in ("sandbox_id", "mode", "snapshot", "error",
                                                    "policy")}
-        print(f"  [{ev.kind}] {keep}", flush=True)
-    elif ev.kind == "turn.start":
-        print(f"  [turn.start] {ev.turn_id}{' (resumed)' if p.get('resumed') else ''}",
-              flush=True)
-    elif ev.kind == "turn.end":
-        print(f"  [turn.end] {ev.turn_id} {p.get('status')}", flush=True)
-    elif ev.kind.startswith("session."):
+        return f"  [{ev.kind}] {keep}"
+    if ev.kind == "turn.start":
+        return f"  [turn.start] {ev.turn_id}{' (resumed)' if p.get('resumed') else ''}"
+    if ev.kind == "turn.end":
+        return f"  [turn.end] {ev.turn_id} {p.get('status')}"
+    if ev.kind.startswith("session.") or ev.kind == "hydration.mismatch":
         keep = {k: v for k, v in p.items() if k not in ("session_id",)}
-        print(f"  [{ev.kind}] {keep}", flush=True)
+        return f"  [{ev.kind}] {keep}"
+    return None
 
 
-KINDS = ["message", "tool.start", "sandbox.*", "turn.start", "turn.end", "session.*"]
+KINDS = ["message", "tool.start", "sandbox.*", "turn.start", "turn.end", "session.*",
+         "hydration.mismatch"]
 
 
 def _short(obj, n=160):
@@ -212,106 +230,110 @@ def _short(obj, n=160):
     return obj
 
 
-def lm_stats() -> str:
-    stats = getattr(LMS.get("durable"), "stats", None) or {}
+def lm_stats(dlm) -> str:
+    stats = getattr(dlm, "stats", None) or {}
     return (f"model calls this process: {stats.get('inner_calls', 0)}, replayed from the "
             f"log: {stats.get('replayed', 0)}")
-
-
-def sandbox_handle(session):
-    return session.services[HANDLES_SERVICE][f"{session.id}/default"]
 
 
 # ---------------------------------------------------------------------------
 # Phases
 # ---------------------------------------------------------------------------
-def learn(session, state: Path) -> None:
-    """Stand-in for an optimizer run: a better prompt, saved as a learn result
-    and hot-swapped in. CompiledModulesParticipant carries it across the restart."""
-    _env, key, mod = resolve_module(session, "coder")
-    learned = copy.deepcopy(mod)
+def learn(root, state: Path) -> str:
+    """Stand-in for an optimizer run: the agent's program with a better
+    prompt, saved as a learn result and set as the LearnedProgram's state."""
+    coder = root.ref("coder")
+    learned = copy.deepcopy(coder.module)
     for name, pred in learned.named_predictors():
         if name.startswith("react"):
             pred.signature = pred.signature.with_instructions(pred.signature.instructions
                                                               + LESSON)
-    res = OptimizationResult(program=learned, optimizer="manual", module_key=key)
-    path = res.save(str(state / "learned" / "coder.json"))
-    res.hot_swap(session, key)
-    session.wait_idle(timeout=10)
-    print(f"\n[learn] hot-swapped a learned prompt into {key[0]}:{key[2]} (saved: {path})",
-          flush=True)
+    path = OptimizationResult(program=learned, optimizer="manual", arch="react").save(
+        str(state / "learned" / "coder.json"))
+    coder.learned.set("coder", path)  # the provider's state: a re-render applies it
+    root.wait_idle(timeout=10)
+    print(f"\n[learn] LearnedProgram 'coder' <- {path}: the agent re-rendered with the "
+          "learned prompt", flush=True)
+    return path
 
 
 def phase_work(state: Path, driver, lm) -> None:
-    app = make_app(state, driver, lm)
-    app.on_session(open=lambda s: s.event_bus.subscribe(show, KINDS))
-    try:
-        s = app.open_session(SESSION)
-        h = sandbox_handle(s)
-        h.run_sync(lambda: h.write_file("TASK.md", TASK), timeout=300)
-        print(f"\nuser> {Q1}", flush=True)
-        s.invoke(Q1, wait=True, timeout=600)
+    tools_done = threading.Event()
+    seen = {"n": 0}
 
-        learn(s, state)
+    def on_tool_end(_ev):  # a callback prop (onToolEnd)
+        seen["n"] += 1
+        if seen["n"] >= SUSPEND_AFTER_TOOLS:
+            tools_done.set()
+
+    store = DirectorySnapshots(state / "snapshots")
+    root = create_root(make_app(state, driver, lm, on_tool_end), session_id=SESSION,
+                       store=store)
+    dlm = root.ref("lm")
+    try:
+        trace(root, KINDS, show)
+        root.wait_idle(timeout=300)  # the brief is in the sandbox
+        print(f"\nuser> {Q1}", flush=True)
+        root.send(Q1, wait=True, timeout=600)
+
+        learn(root, state)
 
         # The follow-up: suspend while the agent is working on it.
-        tools_done = threading.Event()
-        counter = {"n": 0}
-
-        def on_tool_end(ev):
-            counter["n"] += 1
-            if counter["n"] >= SUSPEND_AFTER_TOOLS:
-                tools_done.set()
-
-        unsub = s.event_bus.subscribe(on_tool_end, ["tool.end"])
+        tools_done.clear()
+        seen["n"] = 0
         print(f"\nuser> {Q2}", flush=True)
-        tid = s.invoke(Q2)
-        while not tools_done.wait(0.05) and s.turns.result(tid) is None:
-            pass
-        unsub()
+        tid = root.send(Q2)
+        while not tools_done.is_set():
+            try:
+                root.wait_turn(tid, timeout=0.05)
+                break  # it finished first (e.g. the offline LM makes no tool calls)
+            except TimeoutError:
+                pass
         print(f"\n--- suspending {SESSION} (on_active='interrupt') ---", flush=True)
-        manifest = s.suspend(on_active="interrupt")
-        print("\nmanifest " + manifest["ref"] + ":", flush=True)
-        print(json.dumps(_short(manifest), indent=2), flush=True)
+        snap = root.suspend(on_active="interrupt")
+        print(f"\nsnapshot {store.path_for(SESSION)}:", flush=True)
+        print(json.dumps(_short(snap), indent=2), flush=True)
     finally:
-        app.shutdown()
+        if not root.closed:
+            root.unmount()
         ps.wait_closed(120)
-    print(f"\n  ({lm_stats()})", flush=True)
+    print(f"\n  ({lm_stats(dlm)})", flush=True)
 
 
 def phase_resume(state: Path, driver, lm) -> None:
-    app = make_app(state, driver, lm)
-    app.on_session(open=lambda s: s.event_bus.subscribe(show, KINDS))
-    resumed: dict = {}
-    app.on_session(open=lambda s: s.event_bus.subscribe(
-        lambda ev: resumed.update(ev.payload), ["session.resumed"]))
+    store = DirectorySnapshots(state / "snapshots")
+    snap = store.load(SESSION)
+    if snap is None:
+        raise SystemExit(f"no snapshot for {SESSION!r} in {state / 'snapshots'}; "
+                         "run --phase work first")
+    carried = [t["id"] for t in (snap.get("turns") or {}).get("carry", [])]
+    print(f"\n--- new process: hydrating {SESSION} (carried turns: {carried}) ---", flush=True)
+    root = hydrate_root(make_app(state, driver, lm), session_id=SESSION, store=store)
+    dlm = root.ref("lm")
     try:
-        print(f"\n--- new process: resuming {SESSION} from its manifest ---", flush=True)
-        s = app.resume(SESSION)
+        trace(root, KINDS, show)  # replays what hydration published
+        sb = root.ref("sandbox")
+        listing = sb.run_sync(lambda: sb.exec("ls -1"), timeout=300)
+        print(f"\n[sandbox] files after hydrate: {listing.stdout.split()}", flush=True)
+        coder = root.ref("coder")
+        instr = coder.module.react.signature.instructions
+        print(f"[learn] learned prompt hydrated: {LESSON.strip() in instr}", flush=True)
+        print(f"[durable] conversation hydrated: {coder.messages} messages", flush=True)
+        print(f"  mismatches: {root.mismatches}", flush=True)
 
-        h = sandbox_handle(s)
-        listing = h.run_sync(lambda: h.exec("ls -1"), timeout=300)
-        print(f"\n[sandbox] files after resume: {listing.stdout.split()}", flush=True)
-        _env, _key, mod = resolve_module(s, "coder")
-        instr = mod.react.signature.instructions
-        print(f"[learn] learned prompt restored: {LESSON.strip()[:40]!r} in instructions = "
-              f"{LESSON.strip() in instr}", flush=True)
-
-        carried = resumed.get("turns") or []
         for tid in carried:  # the cut turn re-runs on its own
-            s.wait_turn(tid, timeout=600)
+            root.wait_turn(tid, timeout=600)
         if not carried:  # nothing was cut short (e.g. the offline LM): continue anyway
             print(f"\nuser> {Q3}", flush=True)
-            s.invoke(Q3, wait=True, timeout=600)
+            root.send(Q3, wait=True, timeout=600)
 
         print(f"\n--- suspending {SESSION} again ---", flush=True)
-        manifest = s.suspend()
-        frag = manifest["participants"]
-        print(f"manifest {manifest['ref']}: turn_seq={manifest['turn_seq']}, "
-              f"sandbox snapshot={frag['sandbox']['sandboxes'][0]['snapshot']['id']}",
-              flush=True)
+        snap = root.suspend()
+        print(f"snapshot: turns next_index={snap['turns'].get('next_index')}, "
+              f"slices: {sorted(snap['slices'])}", flush=True)
     finally:
-        app.shutdown()
+        if not root.closed:
+            root.unmount()
         ps.wait_closed(120)
     log = SessionLog.open(state / "logs" / f"{SESSION}.jsonl", readonly=True)
     try:
@@ -323,7 +345,7 @@ def phase_resume(state: Path, driver, lm) -> None:
           f"({journaled} LM calls journaled across both processes)", flush=True)
     for m in conv:
         print(f"  {m['role']:>9}: {str(m['content'])[:110]}", flush=True)
-    print(f"\n  ({lm_stats()})", flush=True)
+    print(f"\n  ({lm_stats(dlm)})", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +363,7 @@ def cleanup(driver_name: str, state: Path) -> None:
         report = ps.gc([drv], all=True, snapshots=True, labels=LABELS)
         if any(report.values()):
             print(f"gc: {report}", flush=True)
-    for sub in ("logs", "manifests", "learned", "local"):
+    for sub in ("logs", "snapshots", "learned", "local"):
         shutil.rmtree(state / sub, ignore_errors=True)
 
 
