@@ -9,8 +9,10 @@ Pieces (the full, costed pipeline is ``scripts/e2e_gepa.py``):
 - ``record_runs``: runs the router through a recorder-aware ``TracedModule``,
   then publishes ``feedback`` events; ``TraceRecorder.dataset`` turns them
   into the GEPA trainset (runs -> events -> dataset).
-- ``RouterDemo``: a running app (AppRunner) with the real ``SupervisorAgent``
-  from ``examples/tools.py``; ``hot_swap`` replaces its module live.
+- ``RouterDemo``: a running app (a root) with the real ``SupervisorAgent``
+  from ``examples/tools.py`` under ``LearnedProgram(key="supervisor",
+  src=...)``; the hot swap is a new ``src`` (state of the app, set through
+  its ``"learned"`` ref) -- a re-render, not a mutation of the module.
 
 Run the live hot-swap demo with a previously saved program::
 
@@ -21,15 +23,18 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import dspy
 
 from examples.tools import SPECIALISTS, RouteSpecialistSig, SupervisorAgent
-from integrations.dspy_integration import DSPyProvider, use_dspy_env
+from integrations.dspy_integration import DSPyProvider
 from integrations.feedback import TracedModule, TraceRecorder, send_feedback
-from integrations.optimize import hot_swap, instructions_of, load_compiled, module_key_for
-from pyreact.core import use_turn
+from integrations.learn import LearnedProgram, use_learned
+from integrations.optimize import instructions_of, load_compiled, module_key_for
+from pyreact.boot import create_root
+from pyreact.core import hooks, use_imperative_handle, use_turn
 from pyreact.core.core import component
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -205,14 +210,20 @@ def record_runs(
 # ---------------------------------------------------------------------------
 # A running app with the real SupervisorAgent, for the hot-swap demo
 # ---------------------------------------------------------------------------
-def make_router_app(models: Dict[str, Any], sink: Dict[str, Any]):
+def make_router_app(models: Dict[str, Any], routes: List[Tuple[str, str, int]]):
+    """The store's supervisor under a ``LearnedProgram``. Refs: ``"learned"``
+    (``swap(program)``: a new ``src``) and ``"router"`` (``program``: the
+    learned program the supervisor reads)."""
+
     @component
     def RouterHome():
-        sink["env"] = use_dspy_env()
         turn = use_turn()  # a new turn per input, even when the text repeats
+        program = use_learned("supervisor")  # what SupervisorAgent reads too
+        use_imperative_handle("router", lambda: SimpleNamespace(program=program),
+                              [id(program)])
 
-        def on_route(name, message, ver):
-            sink.setdefault("routes", []).append((message, name, ver))
+        def on_route(name, message, ver):  # a callback prop (onRoute)
+            routes.append((message, name, ver))
 
         return [
             SupervisorAgent(key="supervisor", message=turn.text if turn else "",
@@ -221,54 +232,48 @@ def make_router_app(models: Dict[str, Any], sink: Dict[str, Any]):
 
     @component
     def RouterDemo():
-        return [DSPyProvider(key="dspy", models=models, children=[RouterHome(key="home")])]
+        program, set_program = hooks.use_state(None)  # None: the baseline prompt
+        # set_program(lambda _: p): a program is callable, so never pass it bare
+        use_imperative_handle("learned", lambda: SimpleNamespace(
+            swap=lambda p: set_program(lambda _old: p)), [])
+        return [DSPyProvider(key="dspy", models=models, children=[
+            LearnedProgram(key="supervisor", src=program, children=[RouterHome(key="home")]),
+        ])]
 
     return RouterDemo
 
 
-def ask(app, sink, message: str, timeout: float = 180) -> Optional[str]:
-    n = len(sink.get("routes", []))
-    app.invoke(message, wait=True, timeout=timeout)
-    routes = sink.get("routes", [])
+def ask(root, routes: List[Tuple[str, str, int]], message: str,
+        timeout: float = 180) -> Optional[str]:
+    n = len(routes)
+    root.send(message, wait=True, timeout=timeout)
     return routes[-1][1] if len(routes) > n else None
 
 
 def demo_hot_swap(lm: Any, compiled: dspy.Module, message: str) -> Dict[str, Any]:
-    """Boot the app, route ``message``, hot-swap ``compiled``, route again."""
-    from pyreact.boot import bootstrap
-
-    sink: Dict[str, Any] = {}
-    app = bootstrap(make_router_app({"default": lm, "fast": lm, "reasoning": lm}, sink))
-    try:
-        before = ask(app, sink, message)
-        env = sink["env"]
-        scheduled = []
-
-        # hot_swap must run on the app loop (it schedules rerenders); any
-        # thread works once the runner is bound, but keep it explicit:
-        def _swap():
-            scheduled.extend(hot_swap(env, ROUTER_KEY, compiled))
-
-        app._loop.call_soon_threadsafe(_swap)
-        app.wait_idle(timeout=30)
-        after = ask(app, sink, message)
-        used = env.compiled.get(ROUTER_KEY) is compiled
-        # Did the post-swap LM call actually carry the optimized instructions?
-        new_instr = next(iter(instructions_of(compiled).values()), "")
-        probe = new_instr.strip().splitlines()[0][:60] if new_instr.strip() else ""
-        last = (getattr(lm, "history", None) or [{}])[-1]
-        msgs = last.get("messages") or [{"content": last.get("prompt") or ""}]
-        prompt_text = "\n".join(str(m.get("content", "")) for m in msgs)
-        return {
-            "message": message,
-            "before": before,
-            "after": after,
-            "rerendered": [getattr(c, "name", "?") for c in scheduled],
-            "env_has_compiled": used,
-            "prompt_has_new_instructions": bool(probe) and probe in prompt_text,
-        }
-    finally:
-        app.shutdown()
+    """Mount the app, route ``message``, swap ``compiled`` in as the learned
+    program (a re-render), route again."""
+    routes: List[Tuple[str, str, int]] = []
+    models = {"default": lm, "fast": lm, "reasoning": lm}
+    with create_root(make_router_app(models, routes), session_id="router-demo") as root:
+        before = ask(root, routes, message)
+        root.ref("learned").swap(compiled)  # LearnedProgram(src=compiled): a re-render
+        root.wait_idle(timeout=30)
+        after = ask(root, routes, message)
+        in_tree = root.ref("router").program is compiled
+    # Did the post-swap LM call actually carry the optimized instructions?
+    new_instr = next(iter(instructions_of(compiled).values()), "")
+    probe = new_instr.strip().splitlines()[0][:60] if new_instr.strip() else ""
+    last = (getattr(lm, "history", None) or [{}])[-1]
+    msgs = last.get("messages") or [{"content": last.get("prompt") or ""}]
+    prompt_text = "\n".join(str(m.get("content", "")) for m in msgs)
+    return {
+        "message": message,
+        "before": before,
+        "after": after,
+        "learned_in_tree": in_tree,
+        "prompt_has_new_instructions": bool(probe) and probe in prompt_text,
+    }
 
 
 def main(argv=None):

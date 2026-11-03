@@ -22,11 +22,13 @@ from collections import Counter
 
 import dspy
 
+from examples._devtools import collect, show_messages
+from examples._lm import example_lm, out_path
 from integrations import DSPyProvider, use_agent_call
 from integrations.architectures import build_module
-from examples._lm import example_lm, out_path
 from integrations.learn import evaluate, optimize, register_architecture, register_optimizer
-from pyreact.boot import bootstrap
+from pyreact.boot import create_root
+from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_turn
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -73,6 +75,13 @@ def Riddler():
     turn = use_turn()
     call = use_agent_call(SIG, arch="majority", n=3)  # <- the custom arch, as a prop
     hooks.use_effect(lambda: turn and call.run(riddle=turn.text), [turn and turn.id])
+    if call.error is not None:
+        return [Message(key=f"error-{call.ver}", text=f"error: {call.error}", sender="system",
+                        message_type="error")]
+    if call.result is not None:
+        r = call.result  # the majority answer, plus how the samples voted
+        return [Message(key=f"answer-{call.ver}", sender="assistant",
+                        text=f"{r.answer}  (votes={r.votes}, agreement={r.agreement:.0%})")]
     return []
 
 
@@ -129,17 +138,13 @@ def main() -> None:
     def Root():
         return [DSPyProvider(key="dspy", lm=lm, children=[Riddler(key="riddler")])]
 
-    app = bootstrap(Root)
-    ends = []
-    app.event_bus.subscribe(lambda ev: ends.append(ev.payload), ["llm.end"])
-    try:
-        app.invoke("I speak without a mouth and hear without ears. What am I? One word.",
-                   wait=True, timeout=300)
-    finally:
-        app.shutdown()
-    end = ends[-1]
-    print(f"   answer={end['outputs'].get('answer')!r} votes={end['outputs'].get('votes')} "
-          f"arch={end.get('module')} LM calls={end['usage']['lm_calls']} "
+    with create_root(Root, session_id="riddler") as root:
+        show_messages(root)
+        ends = collect(root, ["llm.end"])  # devtools: latency + LM calls of the call
+        root.send("I speak without a mouth and hear without ears. What am I? One word.",
+                  wait=True, timeout=300)
+    end = ends[-1].payload
+    print(f"   arch={end.get('module')} LM calls={end['usage']['lm_calls']} "
           f"latency={end['latency']:.1f}s")
 
     print("\n2) custom optimizer 'instruction_menu'")

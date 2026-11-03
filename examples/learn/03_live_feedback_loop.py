@@ -33,22 +33,22 @@ LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offl
 from __future__ import annotations
 
 import argparse
-import asyncio
+from types import SimpleNamespace
 
+from examples._devtools import command, run_repl, show_messages
+from examples._lm import example_lm, out_path
 from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_examples
 from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
-from examples._lm import example_lm, out_path
 from integrations.learn import (
     LearnedProgram,
     configure_learning,
-    find_registries,
     use_learned,
     wait_optimizations,
 )
-from pyreact.boot import bootstrap, handle_command, read_terminal_and_invoke
+from pyreact.boot import create_root
 from pyreact.components.message import Message
-from pyreact.core import component, hooks, use_turn
+from pyreact.core import component, hooks, use_imperative_handle, use_turn
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
 SMOKE = {"args": ["--demo"]}
@@ -60,15 +60,27 @@ def StoreRouter():
     # name="supervisor" -> module key ("ChainOfThought", "RouteSpecialistSig", "supervisor"):
     # the handle :optimize / :inspect use. program=: the learned program the
     # LearnedProgram above provides (None until :optimize swaps one in).
-    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor",
-                        program=use_learned("supervisor"))
+    program = use_learned("supervisor")
+    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor", program=program)
     call = use_call(router)
+    routes = hooks.use_ref({})  # turn id -> route, read through the "router" ref
 
     def route():
         if turn is not None and turn.text.strip():
-            call.run(message=turn.text, specialists=SPECIALISTS)
+            call.run(message=turn.text, specialists=SPECIALISTS, tag=turn.id)
 
     hooks.use_effect(route, [turn and turn.id])
+
+    def record():
+        if call.result is not None and call.tag:
+            routes.current[call.tag] = normalize(call.result.name)
+
+    hooks.use_effect(record, [call.ver])
+    # what outside code (the --demo script) may ask this component
+    use_imperative_handle("router", lambda: SimpleNamespace(
+        route_of=routes.current.get,
+        program=getattr(program, "_pyreact_result_path", None) or program,
+    ), [id(program)])
 
     if call.loading:
         return [Message(key="status", text="roteando…", sender="system", message_type="info")]
@@ -115,26 +127,18 @@ AFTER = ("comprar e saber o frete", "shipping")
 
 
 def demo(lm) -> None:
-    app = bootstrap(make_root(lm))
-    routes = []
-    app.event_bus.subscribe(
-        lambda ev: routes.append(normalize((ev.payload.get("outputs") or {}).get("name"))),
-        ["llm.end"])
+    with create_root(make_root(lm), session_id="store") as root:
+        show_messages(root)
 
-    def say(text):
-        print(f"\n>> {text}", flush=True)
-        n = len(routes)
-        app.invoke(text, wait=True, timeout=300)
-        got = routes[-1] if len(routes) > n else None
-        print(f"[router] -> {got}")
-        return got
+        def say(text):
+            print(f"\n>> {text}", flush=True)
+            tid = root.send(text, wait=True, timeout=300)
+            return root.ref("router").route_of(tid)
 
-    def cmd(line):
-        print(f">> {line}", flush=True)
-        name, _, args = line[1:].partition(" ")
-        handle_command(app, name, args)
+        def cmd(line):  # what typing it at the prompt does
+            print(f">> {line}", flush=True)
+            command(root, line)
 
-    try:
         configure()
         for message, gold in DEMO:
             got = say(message)
@@ -143,14 +147,12 @@ def demo(lm) -> None:
         cmd(":modules")
         cmd(":optimize supervisor")
         wait_optimizations(timeout=900)
-        app.wait_idle(timeout=30)
-        for path, reg in find_registries(app):  # the swap is the provider's new src
-            print(f"[learn] {path}: {reg.programs}")
+        root.wait_idle(timeout=30)
+        # the swap is the provider's new src: the router re-rendered with it
+        print(f"[learn] router program: {root.ref('router').program}")
         say(AFTER[0])
         cmd(":inspect supervisor")
         cmd(":events optimize.* 10")
-    finally:
-        app.shutdown()
 
 
 RULE_HINTS = {
@@ -171,13 +173,10 @@ def main() -> None:
         demo(lm)
         return
     configure()
-    app = bootstrap(make_root(lm, args.program))
     print("Loja (router). Rate answers with :feedback +/- [name=<route>], then "
           ":optimize supervisor. :help lists all commands.")
-    try:
-        asyncio.run(read_terminal_and_invoke(app, prompt=">> "))
-    finally:
-        app.shutdown()
+    with create_root(make_root(lm, args.program), session_id="store") as root:
+        run_repl(root, prompt=">> ")
 
 
 if __name__ == "__main__":

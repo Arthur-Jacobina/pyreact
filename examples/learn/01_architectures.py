@@ -24,10 +24,12 @@ import random
 import sys
 import time
 
-from integrations import DSPyProvider, use_agent_call
+from examples._devtools import collect, show_messages, trace
 from examples._lm import OFFLINE, example_lm
+from integrations import DSPyProvider, use_agent_call
 from integrations.learn import explain
-from pyreact.boot import bootstrap
+from pyreact.boot import create_root
+from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_turn
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -68,9 +70,15 @@ def Solver(arch: str = "predict", turn: int = 0):
 
     def ask():
         if turn:
-            call.run(context=CONTEXT, question=QUESTION)
+            call.run(context=CONTEXT, question=QUESTION, tag=arch)  # tag: which arch asked
 
     hooks.use_effect(ask, [turn])
+    if call.loading:
+        return [Message(key="thinking", text=f"{arch}: thinking...", sender="system",
+                        message_type="info")]
+    if call.ver and call.tag == arch and (call.result is not None or call.error is not None):
+        text = call.result.answer if call.error is None else f"error: {call.error}"
+        return [Message(key=f"answer-{call.ver}", text=f"{arch}: {text}", sender="assistant")]
     return []
 
 
@@ -89,37 +97,29 @@ def main(archs: list[str]) -> None:
     def Root():
         return [DSPyProvider(key="dspy", models=models, children=[App(key="app")])]
 
-    app = bootstrap(Root)
-    ends, iters = {}, {}
-
-    # The trace you debug with: llm.end carries latency, usage and outputs.
-    def on_event(ev):
+    def rlm_step(ev):
         p = ev.payload
-        if ev.kind in ("llm.end", "llm.error"):
-            ends[p["call_id"]] = p
-        elif ev.kind == "rlm.iteration":
-            print(f"   rlm step {p['iteration']}/{p['max_iterations']} "
-                  f"(sub-LM calls so far: {p['sub_llm_calls']})", flush=True)
-            iters[p["call_id"]] = p["iteration"]
+        return (f"   rlm step {p['iteration']}/{p['max_iterations']} "
+                f"(sub-LM calls so far: {p['sub_llm_calls']})")
 
-    app.event_bus.subscribe(on_event, ["llm.*", "rlm.*"])
     print(f"context: {len(CONTEXT.splitlines())} order lines, {len(CONTEXT)} chars; "
           f"true answer = {TRUTH}\n")
     rows = []
-    try:
+    with create_root(Root, session_id="archs") as root:
+        show_messages(root)  # the Solver's answers
+        # The trace you debug with: llm.end carries latency, usage and outputs.
+        ends = collect(root, ["llm.end", "llm.error"])
+        trace(root, ["rlm.iteration"], rlm_step)
         for arch in archs:
             print(f"-> arch={arch}", flush=True)
             n = len(ends)
             t0 = time.time()
-            app.invoke(arch, wait=True, timeout=900)
-            new = list(ends.values())[n:]
-            p = new[-1] if new else {}
+            root.send(arch, wait=True, timeout=900)
+            p = ends[-1].payload if len(ends) > n else {}
             answer = (p.get("outputs") or {}).get("answer", p.get("error", "?"))
             rows.append((arch, str(answer).strip(), str(answer).strip() == str(TRUTH),
                          time.time() - t0, (p.get("usage") or {}).get("lm_calls"),
                          p.get("iterations"), p.get("call_id")))
-    finally:
-        app.shutdown()
 
     print(f"\n{'arch':<8} {'answer':<10} {'ok':<4} {'latency':>8} {'LM calls':>9} {'REPL steps':>11}")
     for arch, ans, ok, lat, calls, steps, _cid in rows:
