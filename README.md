@@ -37,7 +37,7 @@ Key pieces:
   - `Context(value=..., children=[...])`: provider component.
   - `get()`/`set(value)`: read/update. `set` notifies subscribed `HookContext`s via `schedule_rerender`.
 - Agents read with `hooks.use_context(Context)`. Subscriptions are tracked so unmount cleans them up.
-- **Services are an escape hatch.** Each session also owns a services dict (`input_bus`, `event_bus`, `nav_service`, `turns`, `session`, `refs`, plus what libraries add) reachable with `hooks.get_service(key, factory)`. That is a low-level service locator for library authors implementing hooks, not part of the app-facing API: components use the hooks that wrap it (`use_input`, `use_on_turn`, `use_event` / `use_emit`, `use_navigate` / `use_location`, context, and a `ref=` prop + `use_imperative_handle`). Examples never call it (enforced by a test).
+- **Services are an escape hatch.** Each session also owns a services dict (`input_bus`, `event_bus`, `nav_service`, `turns`, `session`, `refs`, plus what libraries add) reachable with `hooks.get_service(key, factory)`. That is a low-level service locator for library authors implementing hooks, not part of the app-facing API: components use the hooks that wrap it (`use_input`, `use_on_turn`, `use_event` / `use_emit`, `use_navigate` / `use_location`, context, and a `ref=` prop + `use_imperative_handle`; see [Hooks reference](#hooks-reference)). Examples never call it (enforced by a test).
 - Every component has a stable address, `hooks.path` (e.g. `App/Chat[chat]`: `Name[key]`, or `Name[#index]` when unkeyed), used for durable state and traces. **Providers are transparent**: context providers, `DSPyProvider`, `ToolProvider`, `HarnessProvider`, `Durable` and any `@component(transparent=True)` add no segment to their descendants' paths, so wrapping a tree in another provider never changes the paths below it. `hooks.full_path` keeps every node. `use_path()` (from `pyreact.core`) returns the calling component's path during render or in its effects, so output components (like `Message`) can tag what they publish without touching the render stack.
 
 ### 6) Reconciler/scheduler ↔ Agent commit loop
@@ -90,6 +90,45 @@ Key pieces:
 2. State changes or context updates call `schedule_rerender`.
 3. The loop `run_renders` renders contexts, reconciles children, then runs effects.
 4. On unmount, `HookContext.unmount()` runs effect cleanups, removes context subscriptions, and unmounts the subtree.
+
+## Hooks reference
+
+If you know React, you know pyreact: every public hook, with its React counterpart where there is one. Core hooks are called as `hooks.use_*` (methods of the component's `HookContext`) or imported from `pyreact.core`; library hooks come from their package. Call them at the top level of a component, in the same order every render.
+
+| Area | Hook | Purpose | React |
+|---|---|---|---|
+| state | `hooks.use_state(initial)` | `(value, set_value)`; rerenders when the value changes | `useState` |
+| state | `hooks.use_reducer(reducer, initial, init_fn=None, deps=None)` | `(state, dispatch)`; re-init when `deps` change | `useReducer` |
+| state | `hooks.use_memo(factory, deps)` / `hooks.use_callback(fn, deps)` | memoized value / function | `useMemo` / `useCallback` |
+| effects | `hooks.use_effect(fn, deps)` | side effect after commit (sync or async), returns an optional cleanup | `useEffect` |
+| context | `hooks.use_context(Ctx)` | nearest provider's value (`create_context`); rerenders on change | `useContext` |
+| context | `use_path()` / `hooks.path` | the component's stable tree path (`App/Chat[chat]`) | `useId`-ish |
+| refs | `hooks.use_ref(initial)` | mutable `Ref` (`.current`) that persists, no rerender | `useRef` |
+| refs | `use_imperative_handle(ref, factory, deps=None, *, name=None)` | expose a handle through a `ref=` prop (`Ref`, callback, or a name in the session's `"refs"` registry) | `useImperativeHandle` |
+| turns | `use_turn(policy=None, *, since_mount=False)` | latest `Turn`; rerenders on each input; per-subtree turn policy | - |
+| turns | `use_on_turn(fn, **use_turn_kwargs)` | run `fn(turn)` once per input (async = part of the turn) | - |
+| input | `use_input(types=None)` | latest raw input event (`text`/`submit`/...) with a `seq`; rerenders on each | `onChange` |
+| events | `use_event(kinds, fn)` | subscribe to the session `EventBus` while mounted (latest `fn` via a ref) | `addEventListener` in `useEffect` |
+| events | `use_emit()` | stable `emit(kind, payload)`: publish with the component path as source and the current turn id | `dispatchEvent` |
+| routing | `use_route()` / `use_navigate()` | `(route, navigate)` / `navigate(path, params=..., query=...)` | `useNavigate` |
+| routing | `use_location()` / `use_route_params()` / `use_query_params()` / `use_fragment()` | current location and its parts | `useLocation` / `useParams` / `useSearchParams` |
+| routing | `use_routes_catalog()` | the routes declared under the router (for LLM routing) | - |
+| tools | `use_tool(fn, name=..., deps=...)` / `use_tools()` | a tool local to the component / the `ToolProvider` registry | - |
+| harness | `use_harness()` | the harness (middleware) in effect for this component | - |
+| harness | `use_middleware(mw)` / `use_guard(fn)` / `use_verify(check)` | middleware / guard / verifier for this subtree | - |
+| dspy | `use_module(sig, arch=..., name=...)` / `use_predict` / `use_chain_of_thought` | memoized DSPy program (any architecture) | `useMemo` |
+| dspy | `use_call(module)` / `use_agent_call(sig, arch=...)` | call a program as an effect: `run` / `result` / `ver` / `loading` / `error` | `useQuery`-ish |
+| dspy | `use_stream(module)` | `use_call` that rerenders with partial text | - |
+| dspy | `use_agent(sig, tools=...)` / `use_rlm(...)` | ReAct agent over tools / recursive LM agent | - |
+| dspy | `use_dspy_env()`, `use_dspy_module`, `use_dspy_call`, `use_dspy_agent` | `DSPyProvider` env and the older tuple-returning API | - |
+| durable | `use_persistent_state(initial, key=)` / `use_persistent_reducer(...)` | `use_state` / `use_reducer` restored from the `Durable` log | - |
+| durable | `use_conversation(key="history")` / `use_durable()` / `use_durable_lm(lm)` | persisted transcript / the log (label, checkout, fork) / LM replay | - |
+| sandbox | `use_sandbox(spec=None, *, key=, scope=, ref=None, ...)` | sandbox handle (effect with cleanup); `ref=` exposes it | - |
+| sandbox | `use_sandbox_env()` / `use_durable_snapshot_store()` | nearest `SandboxProvider` env / sandbox records in the `Durable` log | - |
+| learn | `use_traced(module, key)` / `use_trace_recorder(path=None)` | calls recorded as `module.call` events / the dataset recorder | - |
+| learn | `use_module_version(module_key)` | how many times a program was hot-swapped (rerenders on swap) | HMR |
+
+`hooks.get_service(key, factory)` is deliberately not in this table: it is the low-level escape hatch the hooks above are built on (see [Context/Provider](#5-contextprovider--shared-agent-stateservices)).
 
 ## Harness: guards, verification, recovery, telemetry
 
