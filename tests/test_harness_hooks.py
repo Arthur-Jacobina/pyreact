@@ -224,3 +224,33 @@ def test_entries_match_on_session_and_path_prefix():
     e = _Entry(mw=None, path="Root", session_id=None, seq=1, root=lambda: root)
     b = Boundary(kind="llm", name="x", component="Root/A")
     assert e.covers(b, root) and not e.covers(b, other)  # same path, another tree
+
+
+def test_a_call_fired_from_a_child_effect_belongs_to_the_hook_owner():
+    calls.clear()
+    seen = []
+
+    async def spy(b, call_next):
+        seen.append(b.component)
+        return await call_next(b)
+
+    @component
+    def Child(fire):
+        use_guard(lambda b: "child guard", kinds="llm", name="child")
+        hooks.use_effect(lambda: fire(), [])
+        return []
+
+    @component
+    def Parent():
+        call = use_call(use_module("question -> answer", name="parent"))
+        calls["parent"] = call
+        return [Child(key="c", fire=lambda: call.run(question="q"))]
+
+    @component
+    def Root():
+        return [DSPyProvider(key="d", lm=EchoLM(), children=[
+            HarnessProvider(key="h", middleware=[spy], children=[Parent(key="p")])])]
+
+    _mount(Root)
+    assert calls["parent"].error is None  # the child's guard does not apply
+    assert seen and seen[0].endswith("/Parent[p]")
