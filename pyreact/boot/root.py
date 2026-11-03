@@ -50,15 +50,19 @@ from pyreact.core.refs import REFS_SERVICE
 
 from .session import Session
 from .snapshots import SnapshotStore, load_snapshot
-from .stateful import SuspendError
 
 if TYPE_CHECKING:  # pragma: no cover
     from .app_runner import AppRunner
 
-__all__ = ["Root", "create_root", "hydrate_root", "acreate_root", "ahydrate_root"]
+__all__ = ["Root", "SuspendError", "create_root", "hydrate_root", "acreate_root",
+           "ahydrate_root"]
 
 # Upper bound on waiting for async effect cleanups during a suspend.
 CLEANUP_TIMEOUT = 30.0
+
+
+class SuspendError(RuntimeError):
+    """A suspend could not complete; the session is left open and running."""
 
 
 def _new_runner(app: Callable) -> "AppRunner":
@@ -224,7 +228,7 @@ class Root:
 
         If 3-4 fail nothing is unmounted: effects re-run, held turns start,
         a cut turn is re-queued, ``session.suspend.failed`` is published and
-        :class:`~pyreact.boot.stateful.SuspendError` raised.
+        :class:`SuspendError` raised.
         """
         if self.runner._on_loop_thread():
             raise RuntimeError("Root.suspend() blocks; use 'await root.asuspend()' on the loop")
@@ -291,22 +295,16 @@ class Root:
 
 
 # ---------------------------------------------------------------------------
-# The suspend / hydrate machinery (Root and the deprecated Session.suspend /
-# AppRunner.resume wrappers share it)
+# The suspend / hydrate machinery (Root and the runner's idle_policy="suspend"
+# / auto_resume share it)
 # ---------------------------------------------------------------------------
 async def suspend_session(sess: Session, *, on_active: str, timeout: Optional[float],
                           reason: str = "suspend",
-                          save: Optional[Callable[[Snapshot, Dict[str, Any]], Any]] = None,
-                          before_hide: Optional[Callable[[], Any]] = None,
-                          payload: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
-                          ) -> tuple:
+                          save: Optional[Callable[[Snapshot], Any]] = None) -> tuple:
     """Suspend ``sess`` (see :meth:`Root.suspend`); returns ``(snapshot, ref)``.
 
-    ``save(snapshot)`` persists it (its return value is the ``ref``; with
-    ``before_hide`` it also gets that coroutine's result: ``save(snapshot,
-    extra)``). ``before_hide()`` (async) runs once the active turn has
-    settled, before the tree is hidden (legacy participants); ``payload(extra)``
-    adds fields to ``session.suspended``. Must run on the runner loop."""
+    ``save(snapshot)`` persists it (its return value is the ``ref``).
+    Must run on the runner loop."""
     if on_active not in ("wait", "interrupt"):
         raise ValueError(f"on_active must be 'wait' or 'interrupt', got {on_active!r}")
     sess._check_open()
@@ -318,12 +316,9 @@ async def suspend_session(sess: Session, *, on_active: str, timeout: Optional[fl
     sess.turns.hold()
     t0 = time.time()
     hidden = False
-    extra: Dict[str, Any] = {}
     try:
         await sess._settle_active(on_active, timeout)
         await sess._drain()
-        if before_hide is not None:
-            extra = await before_hide() or {}
         tasks = hide_tree(sess.root, "suspend")
         hidden = True
         if tasks:
@@ -337,7 +332,7 @@ async def suspend_session(sess: Session, *, on_active: str, timeout: Optional[fl
         ref = None
         if save is not None:
             try:
-                ref = save(snap, extra) if before_hide is not None else save(snap)
+                ref = save(snap)
             except Exception as exc:
                 raise SuspendError(f"could not save the snapshot: "
                                    f"{type(exc).__name__}: {exc}") from exc
@@ -363,7 +358,6 @@ async def suspend_session(sess: Session, *, on_active: str, timeout: Optional[fl
         "turn_seq": int(snap["turns"].get("next_index", 1)) - 1,
         "slices": sum(len(v) for v in snap["slices"].values()),
         "carried_turns": [t["id"] for t in snap["turns"].get("carry", [])],
-        **(payload(extra) if payload is not None else {}),
         "duration": round(time.time() - t0, 4)})
     sess.runner._close_on_loop(sess.id, "suspend")
     return snap, ref
@@ -431,13 +425,8 @@ def _resolve_snapshot(session_id: str, snapshot: SnapshotSource,
 async def _hydrate_on_loop(runner: "AppRunner", session_id: str, app: Callable,
                            snapshot: Snapshot, *, turn_policy: Optional[str],
                            resume_turns: bool, consume_from: Optional[SnapshotStore],
-                           wait: bool, legacy: Any = None) -> Session:
-    """Open ``session_id`` hydrated from ``snapshot`` (see :func:`hydrate_root`).
-
-    ``legacy`` (the deprecated ``AppRunner.resume``): an object with async
-    ``before_mount(sess)`` / ``after_hydrate(sess)`` and ``payload(sess) ->
-    dict`` (extra ``session.resumed`` fields); a snapshot whose ``slices`` is
-    ``None`` mounts without hydration (a manifest from before use_dehydrate)."""
+                           wait: bool) -> Session:
+    """Open ``session_id`` hydrated from ``snapshot`` (see :func:`hydrate_root`)."""
     from pyreact.core.turns import POLICIES
 
     t0 = time.time()
@@ -450,15 +439,10 @@ async def _hydrate_on_loop(runner: "AppRunner", session_id: str, app: Callable,
             policy = runner._turn_policy
         sess = runner._new_session(session_id, app, policy)
     sess.resumed_from = snapshot
-    sess._resume_turns = bool(resume_turns)
     runner._opened(sess, resumed=True)
     carried = sess.turns.hydrate(snapshot.get("turns"))
-    if legacy is not None:
-        await legacy.before_mount(sess)
-    slices = snapshot.get("slices")
-    if legacy is None and slices is None:
-        slices = {}
-    sess._mount(slices=slices if isinstance(slices, dict) else None)
+    slices = snapshot.get("slices") or {}
+    sess._mount(slices=slices)
     # first render + async hydrates (which may mount more hydrating children)
     state = hydration_of(sess.root)
     while True:
@@ -469,8 +453,6 @@ async def _hydrate_on_loop(runner: "AppRunner", session_id: str, app: Callable,
         await asyncio.wait(pending)
     await sess._drain()
     mismatches = finish_hydration(sess.root)
-    if legacy is not None:
-        await legacy.after_hydrate(sess)
     if resume_turns:  # once hydration completed: the tree is as suspended
         for t in carried:
             sess.turns.enqueue(t)
@@ -487,11 +469,10 @@ async def _hydrate_on_loop(runner: "AppRunner", session_id: str, app: Callable,
         except Exception as exc:
             runtime.report_error(exc, sess.root, "hydrate")
     sess.event_bus.publish("session.resumed", {
-        "session_id": session_id, "snapshot": legacy is None,
+        "session_id": session_id,
         "created_at": snapshot.get("created_at"),
-        "slices": sum(len(v) for v in (slices or {}).values()),
+        "slices": sum(len(v) for v in slices.values()),
         "mismatches": len(mismatches), "turns": list(sess._resumed_turns),
-        **(legacy.payload(sess) if legacy is not None else {}),
         "duration": round(time.time() - t0, 4)})
     if wait:
         for tid in list(sess._resumed_turns):

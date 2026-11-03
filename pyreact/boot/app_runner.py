@@ -4,7 +4,7 @@ import inspect
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from pyreact.core.hook import HookContext
 from pyreact.core import runtime
@@ -13,29 +13,11 @@ from pyreact.core.runtime import run_renders
 from pyreact.core.turns import POLICIES, TurnManager
 from pyreact.web.console import MessageBuffer
 from pyreact.observability import install_session_error_events
-from .session import DEFAULT_SESSION_ID, Session, _deprecated
-from .stateful import (
-    ManifestError,
-    ManifestStore,
-    MemoryManifestStore,
-    SuspendError,
-    check_manifest,
-    load_manifest,
-)
+from .root import SuspendError
+from .session import DEFAULT_SESSION_ID, Session
+from .snapshots import MemorySnapshots, SnapshotStore
 
 IDLE_POLICIES = ("close", "suspend")
-
-
-def _accepts_arg(fn: Callable[..., Any]) -> bool:
-    """True if ``fn`` can be called with one positional argument."""
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return True
-    for p in sig.parameters.values():
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL):
-            return True
-    return False
 
 
 class AppRunner:
@@ -71,8 +53,7 @@ class AppRunner:
         turn_policy: str = "queue",
         session_id: str = DEFAULT_SESSION_ID,
         default_session: bool = True,
-        participants: Iterable[Callable[..., Any]] = (),
-        manifest_store: Optional[ManifestStore] = None,
+        snapshot_store: Optional[SnapshotStore] = None,
         idle_policy: str = "close",
         auto_resume: Optional[bool] = None,
     ):
@@ -82,25 +63,22 @@ class AppRunner:
         ``session_id``: id of the default session. ``default_session=False`` starts the loop without mounting
         anything; use :meth:`open_session`.
 
-        ``participants``: factories of checkpoint participants added to every
-        session when it opens (see :meth:`add_participant`); registered
-        before the default session opens.
-
-        Stateful sessions (see ``pyreact.boot.stateful``):
-        ``manifest_store`` is where :meth:`Session.suspend` writes manifests
-        and :meth:`resume` reads them (default: in memory).
+        Stateful sessions (the root machinery, ``pyreact.boot.root``):
         ``idle_policy="suspend"`` makes idle reaping
-        (:meth:`close_idle_sessions`) suspend sessions instead of closing
-        them; ``auto_resume`` (default: on with that policy) makes
-        ``open_session(id)`` resume a session that has a manifest.
+        (:meth:`close_idle_sessions`) suspend sessions (as ``Root.suspend``:
+        hide, dehydrate, unmount) into ``snapshot_store`` (a
+        :class:`~pyreact.boot.snapshots.SnapshotStore`; default: in memory)
+        instead of closing them; ``auto_resume`` (default: on with that
+        policy) makes ``open_session(id)`` hydrate a session that has a
+        snapshot there (as ``hydrate_root``; the snapshot is consumed).
         """
         if turn_policy not in POLICIES:
             raise ValueError(f"turn_policy must be 'queue' or 'interrupt', got {turn_policy!r}")
         if idle_policy not in IDLE_POLICIES:
             raise ValueError(f"idle_policy must be one of {IDLE_POLICIES}, got {idle_policy!r}")
         self._turn_policy = turn_policy
-        self.manifest_store: ManifestStore = (
-            manifest_store if manifest_store is not None else MemoryManifestStore())
+        self.snapshot_store: SnapshotStore = (
+            snapshot_store if snapshot_store is not None else MemorySnapshots())
         self.idle_policy = idle_policy
         self.auto_resume = (idle_policy == "suspend") if auto_resume is None else bool(auto_resume)
         self._app_component_fn = app_component_fn
@@ -111,12 +89,6 @@ class AppRunner:
         self._default: Optional[Session] = None
         self._session_hooks: List[Dict[str, Optional[Callable[[Session], Any]]]] = []
         self._hooks_lock = threading.Lock()
-        participants = list(participants)
-        if participants:
-            _deprecated("AppRunner(participants=...)",
-                        "create_root / hydrate_root (libraries dehydrate their own state)")
-        for factory in participants:
-            self._add_participant(factory)
 
         self._fps: int = max(1, int(fps))
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -225,7 +197,7 @@ class AppRunner:
 
         ``open`` runs on the runner loop *before the session's first render*
         and before ``session.opened`` is published: subscribe to its
-        ``event_bus``, add participants, seed services.
+        ``event_bus``, seed services.
         ``close`` runs after the tree unmounted (``session.close_reason`` is
         set). A failing hook is reported, never fatal. ``replay=True`` also
         calls ``open`` now for the sessions already open (from the calling
@@ -246,25 +218,6 @@ class AppRunner:
                     pass
 
         return _remove
-
-    def add_participant(self, factory: Callable[..., Any]) -> Callable[[], None]:
-        """Deprecated: libraries dehydrate their own state (``use_dehydrate``);
-        suspend with ``root.suspend()``.
-
-        Add a checkpoint participant to every session that opens from now
-        on. ``factory(session)`` (or ``factory()``) returns the participant
-        (a class works). Returns a function that stops adding it."""
-        _deprecated("AppRunner.add_participant()",
-                    "create_root / hydrate_root (libraries dehydrate their own state)")
-        return self._add_participant(factory)
-
-    def _add_participant(self, factory: Callable[..., Any]) -> Callable[[], None]:
-        wants_session = _accepts_arg(factory)
-
-        def _add(sess: Session) -> None:
-            sess.participants.add(factory(sess) if wants_session else factory())
-
-        return self.on_session(open=_add)
 
     def _call_hook(self, fn: Callable[[Session], Any], sess: Session) -> None:
         try:
@@ -314,12 +267,9 @@ class AppRunner:
         if self.auto_resume:
             cur = self._sessions.get(session_id)
             if cur is None or cur.closed:
-                manifest = self.manifest_store.load(session_id)
-                if manifest is not None:
-                    return await self._aresume_on_loop(
-                        session_id, check_manifest(manifest), app, turn_policy,
-                        resume_turns=True, wait=False, consume=True,
-                        store=self.manifest_store)
+                snap = self.snapshot_store.load(session_id)
+                if snap is not None:
+                    return await self._ahydrate_on_loop(session_id, snap, app, turn_policy)
         sess, created = self._open_on_loop(session_id, app, turn_policy)
         if created:
             # Commit the first render (and its effects, e.g. input
@@ -343,8 +293,9 @@ class AppRunner:
         runner's own loop thread (e.g. from an effect) it returns immediately
         without waiting for the first render (and never auto-resumes).
 
-        With ``auto_resume``, a session that is not open but has a manifest
-        in ``manifest_store`` is resumed (:meth:`resume`) instead.
+        With ``auto_resume``, a session that is not open but has a snapshot
+        in ``snapshot_store`` is hydrated from it instead (as ``hydrate_root``:
+        carried turns re-run; the snapshot is consumed).
         """
         sid = session_id or uuid.uuid4().hex
         if self._on_loop_thread():
@@ -409,9 +360,10 @@ class AppRunner:
         also protects a session (e.g. one with a connected socket). Returns the
         ids closed. Blocking; see :meth:`aclose_idle_sessions`.
 
-        With ``idle_policy="suspend"`` idle sessions are suspended
-        (``reason="idle"``) instead; one that fails to suspend stays open
-        (the error is reported) and is not in the result.
+        With ``idle_policy="suspend"`` idle sessions are suspended into
+        ``snapshot_store`` (``session.suspending {reason: "idle"}``) instead;
+        one that fails to suspend stays open (the error is reported) and is
+        not in the result.
         """
         closed = []
         for sid in self._idle_session_ids(ttl, keep):
@@ -419,7 +371,7 @@ class AppRunner:
                 sess = self.get_session(sid)
                 try:
                     if sess is not None and not sess.closed:
-                        self._submit(sess._suspend_on_loop("wait", None, None, "idle")).result()
+                        self._submit(self._idle_suspend_on_loop(sess)).result()
                         closed.append(sid)
                 except (SuspendError, RuntimeError) as exc:
                     runtime.report_error(exc, None, "idle-suspend")
@@ -438,7 +390,7 @@ class AppRunner:
                 try:
                     if sess is not None and not sess.closed:
                         await asyncio.wrap_future(self._submit(
-                            sess._suspend_on_loop("wait", None, None, "idle")))
+                            self._idle_suspend_on_loop(sess)))
                         closed.append(sid)
                 except (SuspendError, RuntimeError) as exc:
                     runtime.report_error(exc, None, "idle-suspend")
@@ -447,167 +399,26 @@ class AppRunner:
         return closed
 
     # -------------------------------
-    # Suspend / resume (stateful sessions)
+    # Idle suspend / auto-resume (the root machinery)
     # -------------------------------
-    def suspend_session(self, session_id: str, **kw: Any) -> Dict[str, Any]:
-        """:meth:`Session.suspend` by id (``KeyError`` if not open)."""
-        sess = self.get_session(session_id)
-        if sess is None or sess.closed:
-            raise KeyError(f"no open session {session_id!r}")
-        return sess.suspend(**kw)
+    async def _idle_suspend_on_loop(self, sess: Session) -> None:
+        from .root import suspend_session
 
-    async def asuspend_session(self, session_id: str, **kw: Any) -> Dict[str, Any]:
-        """Async :meth:`suspend_session`."""
-        sess = self.get_session(session_id)
-        if sess is None or sess.closed:
-            raise KeyError(f"no open session {session_id!r}")
-        return await sess.asuspend(**kw)
+        await suspend_session(sess, on_active="wait", timeout=None, reason="idle",
+                              save=self.snapshot_store.save)
 
-    def _manifest_for(self, session_id: str, manifest: Any, store: Optional[ManifestStore]):
-        """-> (manifest dict, store it came from or None)."""
-        if manifest is None:
-            store = store if store is not None else self.manifest_store
-            found = store.load(session_id)
-            if found is None:
-                raise KeyError(f"no manifest for session {session_id!r} in {store!r}")
-            return check_manifest(found), store
-        if isinstance(manifest, dict):
-            return check_manifest(manifest), None
-        return load_manifest(manifest), None  # a path
-
-    async def _aresume_on_loop(self, session_id: str, manifest: Dict[str, Any], app,
-                               turn_policy, *, resume_turns: bool, wait: bool,
-                               consume: bool, store: Optional[ManifestStore] = None
-                               ) -> Session:
-        """The legacy manifest resume, on the root machinery
-        (``pyreact.boot.root._hydrate_on_loop``): the manifest's slices and
-        turns hydrate the tree; participants get their fragments before the
-        first render and ``resumed()`` once hydration completed."""
-        from pyreact.core.dehydrate import SNAPSHOT_FORMAT
+    async def _ahydrate_on_loop(self, session_id: str, snapshot: Dict[str, Any], app,
+                                turn_policy) -> Session:
+        from pyreact.core.dehydrate import check_snapshot
 
         from .root import _hydrate_on_loop
 
-        if manifest.get("session_id") != session_id:
-            raise ManifestError(f"manifest is for session {manifest.get('session_id')!r}, "
-                                f"not {session_id!r}")
-        fragments = manifest.get("participants") or {}
-        turns = dict(fragments.get("turns") or {})
-        turns.setdefault("policy", manifest.get("turn_policy"))
-        slices = manifest.get("slices")
-        snapshot = {"format": SNAPSHOT_FORMAT, "session_id": session_id,
-                    "created_at": manifest.get("created_at"),
-                    "slices": slices if isinstance(slices, dict) else None,
-                    "turns": turns, "versions": manifest.get("versions") or {}}
-        runner = self
-
-        class _Legacy:
-            restored: List[Any] = []
-
-            async def before_mount(self, sess: Session) -> None:
-                sess.resumed_from = manifest
-                if session_id == runner._default_id and runner._default is None:
-                    runner._default = sess
-                for name in fragments:
-                    if name not in sess.participants:
-                        sess.degrade(name, "no participant registered for this fragment")
-                for p in sess.participants:
-                    if p.name == "turns":  # the snapshot's turns (TurnManager.hydrate)
-                        self.restored.append(p)
-                        continue
-                    if p.name not in fragments:
-                        continue
-                    try:
-                        await p.resume(sess, fragments[p.name])
-                        self.restored.append(p)
-                    except Exception as exc:
-                        sess.degrade(p.name, "resume failed",
-                                     error=f"{type(exc).__name__}: {exc}")
-
-            async def after_hydrate(self, sess: Session) -> None:
-                for p in self.restored:
-                    fn = getattr(p, "resumed", None)
-                    if p.name == "turns" or not callable(fn):
-                        continue
-                    try:
-                        await fn(sess)
-                    except Exception as exc:
-                        sess.degrade(p.name, "resumed() failed",
-                                     error=f"{type(exc).__name__}: {exc}")
-
-            def payload(self, sess: Session) -> Dict[str, Any]:
-                bad = {d["participant"] for d in sess.degraded}
-                return {"turn_seq": manifest.get("turn_seq"),
-                        "suspended_at": manifest.get("suspended_at"),
-                        "participants": [p.name for p in self.restored if p.name not in bad],
-                        "degraded": [d["participant"] for d in sess.degraded]}
-
-        legacy = _Legacy()
-        legacy.restored = []
-        return await _hydrate_on_loop(
-            self, session_id, app, snapshot, turn_policy=turn_policy,
-            resume_turns=resume_turns, consume_from=store if consume else None,
-            wait=wait, legacy=legacy)
-
-    def resume(
-        self,
-        session_id: str,
-        manifest: Any = None,
-        *,
-        store: Optional[ManifestStore] = None,
-        app: Optional[Callable] = None,
-        turn_policy: Optional[str] = None,
-        resume_turns: bool = True,
-        consume: bool = True,
-        wait: bool = False,
-        timeout: Optional[float] = None,
-    ) -> Session:
-        """Deprecated (``DeprecationWarning``): use :func:`~pyreact.boot.root.hydrate_root`,
-        which needs no participants. A wrapper over the same machinery
-        (``pyreact.boot.root._hydrate_on_loop``), kept for one release; the
-        manifest's ``slices`` hydrate the tree's ``use_dehydrate`` hooks.
-
-        Re-open a suspended session (same id) from its manifest.
-
-        ``manifest``: a manifest dict, a path to one, or ``None`` to load it
-        from ``store`` (default: ``manifest_store``). Steps: the session is
-        created; ``open`` hooks run (participant factories register their
-        participants); ``session.opened`` (``resumed: true``); each
-        participant's ``resume(session, fragment)`` -- **before the first
-        render**; the tree mounts; optional ``resumed(session)`` hooks; then
-        with ``resume_turns`` the turns the suspend carried and those a
-        ``TurnStore`` saw cut short are queued again; ``session.resumed``.
-
-        Failure semantics: the resume never fails because of one participant.
-        A fragment nobody claims, or a participant that raises, is recorded
-        in ``session.degraded`` and published as ``session.resume.degraded``;
-        the session goes on with what was restored (e.g. a fresh sandbox).
-
-        ``consume`` (default) deletes the manifest from the store it was
-        loaded from once resumed (an old manifest must not be resumed twice).
-        ``wait=True`` blocks until the re-run turns end.
-        """
-        _deprecated("AppRunner.resume()", "hydrate_root(App, session_id=..., store=...)")
-        m, src = self._manifest_for(session_id, manifest, store)
-        if self._on_loop_thread():
-            raise RuntimeError("AppRunner.resume() blocks; use 'await app.aresume(...)' on the loop")
-        fut = self._submit(self._aresume_on_loop(
-            session_id, m, app, turn_policy, resume_turns=resume_turns, wait=wait,
-            consume=consume, store=src))
-        try:
-            return fut.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise TimeoutError(f"session {session_id!r} not resumed after {timeout}s") from None
-
-    async def aresume(self, session_id: str, manifest: Any = None, *,
-                      store: Optional[ManifestStore] = None, app: Optional[Callable] = None,
-                      turn_policy: Optional[str] = None, resume_turns: bool = True,
-                      consume: bool = True, wait: bool = False) -> Session:
-        """Async :meth:`resume` (deprecated: ``ahydrate_root``)."""
-        _deprecated("AppRunner.aresume()", "await ahydrate_root(App, session_id=..., store=...)")
-        m, src = self._manifest_for(session_id, manifest, store)
-        return await asyncio.wrap_future(self._submit(self._aresume_on_loop(
-            session_id, m, app, turn_policy, resume_turns=resume_turns, wait=wait,
-            consume=consume, store=src)))
+        sess = await _hydrate_on_loop(
+            self, session_id, app, check_snapshot(snapshot), turn_policy=turn_policy,
+            resume_turns=True, consume_from=self.snapshot_store, wait=False)
+        if session_id == self._default_id and self._default is None:
+            self._default = sess
+        return sess
 
     def _idle_session_ids(self, ttl, keep) -> List[str]:
         now = time.time()

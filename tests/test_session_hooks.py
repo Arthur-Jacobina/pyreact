@@ -1,9 +1,8 @@
-"""Session lifecycle hooks (AppRunner.on_session) and the participant registry."""
+"""Session lifecycle hooks (AppRunner.on_session)."""
 
 import pytest
 
 from pyreact.boot import AppRunner
-from pyreact.boot.stateful import Participants
 from pyreact.core import EventBus, component, hooks
 
 
@@ -90,53 +89,6 @@ def test_failing_hook_is_reported_not_fatal(runner, capsys):
     assert not s.closed
     assert app.close_session("z")
     assert "hook exploded" in capsys.readouterr().err
-
-
-class _P:
-    name = "p"
-
-    def __init__(self, session=None):
-        self.session = session
-
-    async def suspend(self, session):
-        return {}
-
-    async def resume(self, session, fragment):
-        return None
-
-
-def test_participants_factories_are_added_to_every_session(runner):
-    app = runner(participants=[_P, lambda: _NoArg()], default_session=True)
-    sess = app.default_session
-    assert sess.participants.names() == ["turns", "p", "noarg"]  # turns: built in
-    assert sess.participants.get("p").session is sess
-    other = app.open_session("o")
-    assert other.participants.get("p").session is other
-
-
-class _NoArg(_P):
-    name = "noarg"
-
-
-def test_participants_registry_validates():
-    ps = Participants()
-    p = ps.add(_P())
-    assert "p" in ps and len(ps) == 1 and list(ps) == [p]
-    with pytest.raises(ValueError):
-        ps.add(_P())
-    ps.add(_P(), replace=True)
-    with pytest.raises(TypeError):
-        ps.add(object())
-
-    class NoResume:
-        name = "x"
-
-        async def suspend(self, s):
-            return {}
-
-    with pytest.raises(TypeError):
-        ps.add(NoResume())
-    assert ps.remove("p") and not ps.remove("p")
 
 
 def test_otel_attach_app_follows_sessions_opened_later(runner):

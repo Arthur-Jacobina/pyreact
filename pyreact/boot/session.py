@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pyreact.core import runtime
@@ -42,16 +41,6 @@ from pyreact.core.turns import TurnManager
 from pyreact.input.bus import InputBus
 from pyreact.observability import Observer
 from pyreact.router.nav_service import NavService
-
-from .stateful import (
-    MANIFEST_FORMAT,
-    ManifestStore,
-    Participants,
-    SuspendError,
-    TurnsParticipant,
-    _jsonable,
-    versions,
-)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .app_runner import AppRunner
@@ -64,15 +53,6 @@ NAV_SERVICE = "nav_service"
 EVENT_BUS = "event_bus"
 TURNS = "turns"
 SESSION = "session"
-
-
-ADR_0001 = "docs/adr/0001-look-like-react.md"
-
-
-def _deprecated(old: str, new: str, stacklevel: int = 3) -> None:
-    warnings.warn(f"{old} is deprecated: use {new} -- the tree dehydrates itself "
-                  f"(use_dehydrate), no participants or manifests (see {ADR_0001})",
-                  DeprecationWarning, stacklevel=stacklevel)
 
 
 def session_of(ctx: Any) -> Optional["Session"]:
@@ -108,15 +88,13 @@ class Session:
             (also ``events`` / ``usage`` / ``timeline``).
         services: the session's services dict.
         created_at / last_active: wall-clock timestamps.
-        participants: checkpoint participants (see ``pyreact.boot.stateful``).
-
-        resumed_from: the manifest this session was resumed from (or None).
-        degraded: what could not be restored on resume (see :meth:`degrade`).
+        resumed_from: the snapshot this session was hydrated from (or None).
+        degraded: what could not be restored on hydration (see :meth:`degrade`).
 
     Lifecycle events on ``event_bus``: ``session.opened`` (before the first
     render), ``session.suspending`` / ``session.suspended`` /
-    ``session.suspend.failed`` (:meth:`suspend`), ``session.resumed`` and
-    ``session.resume.degraded`` (``AppRunner.resume``), ``session.closed``
+    ``session.suspend.failed`` (``Root.suspend``), ``session.resumed`` and
+    ``session.resume.degraded`` (``hydrate_root``), ``session.closed``
     (after the tree unmounted, ``{"reason"}``).
     """
 
@@ -146,14 +124,11 @@ class Session:
             SESSION: self,
         }
         self.observer = Observer().attach(self.event_bus)
-        self.participants = Participants()
-        self.participants.add(TurnsParticipant())
         self.suspending = False
         self.resumed_from: Optional[Dict[str, Any]] = None
         self.degraded: List[Dict[str, Any]] = []
         self._suspend_carry: list = []  # turns a suspend cut short
         self._resumed_turns: List[str] = []
-        self._resume_turns = True
         self._unsubs: list = []
         self.root: Optional[HookContext] = None
         self.created_at = self.last_active = time.time()
@@ -161,7 +136,7 @@ class Session:
         # Why the session was closed (set before its tree unmounts, so
         # cleanups can read it): "idle" (reaped after its TTL), "closed"
         # (close_session), "shutdown" (the runner stopped) or "suspend"
-        # (suspend(): its state lives on in a manifest). None while open.
+        # (Root.suspend(): its state lives on in a snapshot). None while open.
         self.close_reason: Optional[str] = None
 
         def _on_nav(url: str) -> None:
@@ -202,11 +177,11 @@ class Session:
             raise RuntimeError(f"session {self.id!r} is suspending")
 
     def degrade(self, participant: str, reason: str, **info: Any) -> None:
-        """Record that ``participant`` could not restore everything on
-        resume (the session goes on with what it has) and publish
-        ``session.resume.degraded {session_id, participant, reason, **info}``.
-        Participants call it themselves (e.g. a sandbox whose snapshot is gone
-        boots fresh); ``AppRunner.resume`` calls it when one raises."""
+        """Record that ``participant`` (a library, e.g. ``"sandbox"``) could
+        not restore everything on hydration (the session goes on with what it
+        has) and publish ``session.resume.degraded {session_id, participant,
+        reason, **info}``. Libraries call it themselves (e.g. a sandbox whose
+        snapshot is gone boots fresh)."""
         rec = {"participant": participant, "reason": reason, **info}
         self.degraded.append(rec)
         try:
@@ -290,106 +265,6 @@ class Session:
         res = await self.turns.wait(active.id)
         if aborted and res.get("status") == "interrupted":
             self._suspend_carry.append(active)
-
-    async def _suspend_on_loop(self, on_active: str, timeout: Optional[float],
-                               store: Optional[ManifestStore], reason: str) -> Dict[str, Any]:
-        """The legacy manifest suspend, on the root machinery
-        (:func:`pyreact.boot.root.suspend_session`): participants give their
-        fragments before the tree is hidden; the manifest carries the
-        snapshot's slices and turns."""
-        from .root import suspend_session
-
-        store = store if store is not None else self.runner.manifest_store
-        legacy = [p for p in self.participants if p.name != "turns"]
-
-        async def fragments() -> Dict[str, Any]:
-            out: Dict[str, Any] = {}
-            for p in legacy:
-                try:
-                    frag = await p.suspend(self)
-                except Exception as exc:
-                    raise SuspendError(f"participant {p.name!r} failed to suspend: "
-                                       f"{type(exc).__name__}: {exc}") from exc
-                out[p.name] = _jsonable(frag if frag is not None else {}, p.name)
-            return out
-
-        box: Dict[str, Any] = {}
-
-        def save(snap: Dict[str, Any], frags: Dict[str, Any]) -> str:
-            turns = snap.get("turns") or {}
-            app = self.app_component_fn
-            manifest = box["manifest"] = {
-                "format": MANIFEST_FORMAT,
-                "session_id": self.id,
-                "created_at": self.created_at,
-                "suspended_at": time.time(),
-                "reason": reason,
-                "turn_seq": int(turns.get("next_index", 1)) - 1,
-                "turn_policy": turns.get("policy", self.turns.policy),
-                "app": f"{getattr(app, '__module__', '?')}:{getattr(app, '__qualname__', app)}",
-                "participants": {"turns": {"next_index": turns.get("next_index", 1),
-                                           "carry": list(turns.get("carry") or [])},
-                                 **frags},
-                "slices": snap["slices"],
-                "versions": versions(self.participants),
-            }
-            return store.save(manifest)
-
-        _snap, ref = await suspend_session(
-            self, on_active=on_active, timeout=timeout, reason=reason, save=save,
-            before_hide=fragments,
-            payload=lambda frags: {"participants": ["turns", *frags]})
-        manifest = box["manifest"]
-        manifest["ref"] = ref
-        for p in self.participants:
-            fn = getattr(p, "suspended", None)
-            if callable(fn):
-                try:
-                    await fn(self)
-                except Exception as exc:
-                    runtime.report_error(exc, None, "suspend")
-        return manifest
-
-    def suspend(self, *, on_active: str = "wait", timeout: Optional[float] = None,
-                store: Optional[ManifestStore] = None, reason: str = "manual") -> Dict[str, Any]:
-        """Deprecated (``DeprecationWarning``): use :meth:`Root.suspend
-        <pyreact.boot.root.Root.suspend>` (``create_root`` / ``hydrate_root``),
-        which needs no participants. A wrapper over the same machinery
-        (``pyreact.boot.root.suspend_session``), kept for one release.
-
-        Suspend this agent: one explicit, observable operation.
-
-        1. ``session.suspending``; new input is refused, queued turns are held;
-        2. the active turn ends: ``on_active="wait"`` (default) lets it finish
-           (after ``timeout`` seconds it is interrupted), ``"interrupt"``
-           cancels it now -- an interrupted turn is *carried*: re-run on resume;
-        3. every participant's ``suspend(session)`` returns its fragment; the
-           tree is hidden (cleanups: ``"suspend"``) and dehydrated (its
-           ``use_dehydrate`` slices go in ``manifest["slices"]``);
-        4. the manifest is saved to ``store`` (default: the runner's
-           ``manifest_store``), ``session.suspended`` is published;
-        5. the tree unmounts (``close_reason == "suspend"``, ``session.closed``),
-           then participants' optional ``suspended(session)`` run.
-
-        Returns the manifest (plus ``"ref"``: where the store put it). If a
-        participant or the store fails, nothing is unmounted: the session
-        goes on (held turns start, a cut turn is re-queued),
-        ``session.suspend.failed`` is published and :class:`SuspendError`
-        raised. Do not call from inside one of this session's turns with
-        ``on_active="wait"`` (it would wait for itself).
-        """
-        _deprecated("Session.suspend()", "root.suspend()")
-        if self.runner._on_loop_thread():
-            raise RuntimeError("Session.suspend() blocks; use 'await session.asuspend()' on the loop")
-        return self.runner._submit(self._suspend_on_loop(on_active, timeout, store, reason)).result()
-
-    async def asuspend(self, *, on_active: str = "wait", timeout: Optional[float] = None,
-                       store: Optional[ManifestStore] = None,
-                       reason: str = "manual") -> Dict[str, Any]:
-        """Async :meth:`suspend` (deprecated: ``await root.asuspend()``)."""
-        _deprecated("Session.asuspend()", "await root.asuspend()")
-        fut = self.runner._submit(self._suspend_on_loop(on_active, timeout, store, reason))
-        return await asyncio.wrap_future(fut)
 
     async def _enqueue_turn(self, turn, wait: bool) -> Dict[str, Any]:
         self.turns.enqueue(turn)

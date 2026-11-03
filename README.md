@@ -622,27 +622,22 @@ turn_seq, carried_turns}`, `session.suspend.failed {error}`,
 `session.resumed {turns, mismatches}`, `hydration.mismatch`,
 `session.closed {reason}`.
 
-### Deprecated: participants, `session.suspend()`, `app.resume()`
+### Idle suspend on a runner
 
-Before roots, libraries plugged state into `Session.suspend()` /
-`AppRunner.resume()` as *participants* writing a `pyreact.manifest/1`:
+A runner hosting many sessions can suspend the idle ones instead of closing
+them, on the same machinery as `root.suspend()` / `hydrate_root`:
 
 ```python
-app = AppRunner(App, participants=[MyParticipant],        # DeprecationWarning
-                manifest_store=DirectoryManifestStore("runs/manifests"))
-manifest = app.open_session("agent-1").suspend()  # DeprecationWarning -> root.suspend()
-s = app.resume("agent-1")                         # DeprecationWarning -> hydrate_root(...)
+app = AppRunner(App, default_session=False, idle_policy="suspend",
+                snapshot_store=DirectorySnapshots("runs/state"))  # default: MemorySnapshots()
+app.close_idle_sessions(ttl=600)   # idle ones: hidden, dehydrated into snapshot_store, unmounted
+s = app.open_session("agent-1")    # auto_resume: hydrated from its snapshot (consumed)
 ```
 
-They are kept for one release as thin wrappers over the root machinery
-(same events; the manifest carries the tree's slices in
-`manifest["slices"]` and the turns in `participants.turns`), and
-`participants=` / `add_participant` / `session.suspend` / `app.resume` warn
-(`DeprecationWarning`, pointing to ADR 0001). The library
-participants (`DurableParticipant`, `CompiledModulesParticipant`,
-`SandboxParticipant`) have been removed: `Durable`, `DSPyProvider` /
-`LearnedProgram` and `use_sandbox` dehydrate themselves. `idle_policy="suspend"` / `auto_resume` keep working
-without warnings. Use roots in new code.
+`auto_resume` defaults to on with `idle_policy="suspend"`. The participant
+API that came before roots (`AppRunner(participants=...)`,
+`add_participant`, `session.suspend()`, `app.resume()`, manifest stores) has
+been removed (ADR 0001): the tree dehydrates itself (`use_dehydrate`).
 
 ## Running the examples
 
