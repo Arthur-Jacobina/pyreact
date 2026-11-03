@@ -120,12 +120,18 @@ Recovery middleware adds `retries`, `fallback`, `circuit` (state the call
 met), `timed_out`; `fallback_model` rewrites `model_key` / `model`
 (see [Error recovery](#error-recovery)).
 
+Set by verifiers (`pyreact.harness.verify`, any kind): `verdicts` (list of
+`{verifier, passed, score, threshold, feedback, attempt, action}`); before a
+re-run, `rollout_id` (re-sample, don't replay a cache) and `feedback` (condition
+the re-run on it). `llm` boundaries honor both (see below).
+
 ### Ordering and scope
 
 Process-wide middleware (`install(mw)`, returns an uninstall function) is
 outermost, then `HarnessProvider(middleware=[...])` from the root down, then
-the innermost provider's list in order. `@middleware(kinds=["llm", "tool.*"])`
-restricts one to some kinds.
+the innermost provider's list in order, then component hooks (`use_guard`,
+`use_verify`, `use_middleware`; `install(mw, innermost=True)` is that layer).
+`@middleware(kinds=["llm", "tool.*"])` restricts one to some kinds.
 
 - `llm` calls use the providers above the calling component (captured at
   render) plus the process-wide list *at call time*;
@@ -202,6 +208,89 @@ check.run(comment=text, tag=turn.id)
 if check.tag == turn.id and not check.loading:
     verdict = check.result.verdict
 ```
+
+### Guards & verification
+
+`pyreact.harness` (generic) and `integrations.harness` (the same, plus the
+DSPy-aware `llm_judge` / `check_metric`) are ready-made middleware. **Guards**
+run before a call and refuse it (`Blocked`) or rewrite its inputs;
+**verifiers** run after it and check the result, then raise, retry or flag.
+
+```python
+from integrations.harness import (budget, tool_allowlist, input_policy, PII,
+                                  verify, schema, assert_that, use_verify)
+
+HarnessProvider(middleware=[                       # a subtree, like any provider
+    input_policy(PII, redact=True),                # emails/phones never reach the LM
+    tool_allowlist(allow=["lookup_*"]),            # the agent sees "Error: ... not allowed"
+    budget(max_tokens_per_turn=20_000),            # later calls in the turn are blocked
+], children=[Shop()])
+
+@component
+def Clerk():                                       # this component and its subtree
+    use_verify([schema({"total": Annotated[float, Field(ge=0)]}),
+                assert_that(lambda p: p.answer.endswith("?"), "End with a question.")],
+               on_fail="retry_with_feedback", max_attempts=2)
+    agent = use_agent(OrderQuote, tools=[...])
+```
+
+| guard | blocks / does |
+|---|---|
+| `guard(fn, kinds=, name=)` | your predicate: `fn(b) -> None/True` allow, `False` or a reason string block (sync or async; also a decorator) |
+| `tool_allowlist(allow=, deny=)` | tools not matching the globs (`deny` wins); the reason lists the allowed tools |
+| `max_calls(per_turn=, kind="llm")` | calls beyond N per turn (retries of one call count once) |
+| `budget(max_tokens_per_turn=, max_cost_per_turn=)` | further calls once the turn's `usage`/`cost` attrs (added after each call) reach a limit; `.spent(turn_id)` |
+| `rate_limit(calls, per_seconds, wait=, key=)` | calls over a sliding window (or waits for a slot) |
+| `input_policy(regex \| {label: regex} \| fn, redact=)` | inputs matching a policy, or redacts them (`[EMAIL]`); `PII` patterns included |
+| `require_confirmation(kinds, ask=, when=, timeout=)` | human in the loop: `ask(b)` (sync or async) returns `True`, or `False`/a reason |
+
+| check (for `verify`) | passes when |
+|---|---|
+| `schema(Model \| {field: type} \| [fields])` | the result's fields validate (pydantic); feedback names each bad field |
+| `assert_that(pred, "message")` | `pred(result)` is truthy (raising counts as failing) |
+| `grounded_in(field, source_field, min_overlap=0.6)` | enough of the field's content words appear in the source input |
+| `llm_judge(criteria, lm=, threshold=0.7)` | an LM grades it (`integrations.harness`; nested `llm.judge` boundary) |
+
+**Your own check**: `check(b, result)` returns `None`/`True` (pass), `False` or
+a feedback string (fail), a score, or `(score, feedback)` (pass iff score ≥
+`threshold`). `verify([c1, c2])` runs several as one verifier.
+
+**`on_fail`**: `"raise"` (`VerificationFailed`: the call fails), `"retry"`
+(re-run with a new `rollout_id`), `"retry_with_feedback"`, `"flag"` (keep the
+result; the failed verdict is in `b.attrs["verdicts"]`). Retries exhausted:
+`on_exhausted="raise"` (default) or `"flag"`.
+
+**Retry with feedback**, like `dspy.Refine`: the verifier sets
+`b.attrs["feedback"]`, and an `llm` boundary re-runs the module with an extra
+input field `feedback` ("feedback on a previous attempt: fix these problems")
+added to every predictor call of that attempt, via a wrapped adapter. The
+module, its signature and your inputs are untouched; only that attempt's
+prompts change. For your own boundary kinds pass `inject=fn(b, feedback)`.
+
+**Hooks vs providers.** `HarnessProvider` scopes middleware to the subtree it
+wraps; `use_guard(fn | guard, kinds=)`, `use_verify(check, **options)` and
+`use_middleware(mw)` scope it to the calling component and its descendants
+(boundaries whose `component` is at or below it, same session), registered on
+first render and removed on unmount. Hook middleware is innermost. Plain
+functions are always called in their latest version (they can read props and
+state); stateful objects (`budget(...)`, `verify(...)`) are kept from the first
+render unless `deps=[...]` changes. A call belongs to the component that owns
+the call hook, even when another component's effect fires it.
+
+**Events** (on the session and global buses): `guard.blocked` `{guard, reason}`,
+`guard.redacted` `{guard, fields, count}`, `guard.confirmed`, `verify.passed`
+and `verify.failed` `{verifier, score, threshold, feedback, action}`, each
+with `kind, name, boundary_id, call_id, component, attempt`.
+
+**Learning from failures.** `verify(..., to_feedback=True)` publishes a
+`feedback` event (the same one `:feedback` sends) when a call *ends* failing,
+so `dataset_from_events(events, "clerk", require_feedback=True)` returns the
+rejected inputs with the verifier's feedback, and
+`integrations.harness.check_metric(check)` turns the same check into the
+metric GEPA optimizes against. Use `on_fail="flag"` (or `on_exhausted="flag"`)
+to keep those calls' outputs in the dataset.
+
+Example: `uv run python -m examples.harness.01_guarded_agent`.
 
 ### Error recovery
 
