@@ -28,14 +28,15 @@ LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offl
 
 from __future__ import annotations
 
-import asyncio
 from typing import Callable, List, Optional
 
 import dspy
 
+from examples._devtools import run_repl
 from examples._lm import example_models
 from integrations import DSPyProvider, use_agent, use_call, use_module
-from pyreact.boot import bootstrap, read_terminal_and_invoke
+from integrations.learn import use_learned
+from pyreact.boot import create_root
 from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_emit, use_turn
 from pyreact.tools import ToolProvider, use_tool
@@ -252,9 +253,12 @@ def SupervisorAgent(*, message: str, turn: int, on_route: Callable[[str, str, in
     """Classifier agent (no tools): picks a specialist for ``message``.
 
     ``name="supervisor"`` gives the module a stable key -- the handle that
-    optimizers, ``hot_swap`` and ``:optimize supervisor`` use.
+    optimizers and ``:optimize supervisor`` use. ``program=``: the learned
+    program a ``LearnedProgram(key="supervisor", src=...)`` above provides
+    (``None`` without one: the baseline); a new ``src`` is a re-render.
     """
-    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor")
+    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor",
+                        program=use_learned("supervisor"))
     call = use_call(router, model="fast")
 
     def route():
@@ -328,18 +332,13 @@ def Root(models=None):
     return [DSPyProvider(key="dspy", models=lms, children=[App(key="app")])]
 
 
-async def main() -> None:
-    app = bootstrap(Root)
-    try:
+def main() -> None:
+    with create_root(Root, session_id="store") as root:
         # Messages and errors are rendered from typed events (ConsoleSink);
         # here LLM and tool activity too. :events, :usage, :turns for more.
-        await read_terminal_and_invoke(
-            app, prompt="> ",
-            console_kinds=("message", "error", "llm.end", "llm.error", "tool.*"),
-        )
-    finally:
-        app.shutdown()
+        run_repl(root, prompt="> ",
+                 console_kinds=("message", "error", "llm.end", "llm.error", "tool.*"))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

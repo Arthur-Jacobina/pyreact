@@ -17,13 +17,15 @@ import os
 import sys
 from typing import Any, Dict, Iterable, List, Optional
 
+from examples._devtools import collect, show_messages
+from examples._lm import OFFLINE, example_models
 from examples.message import Message
 from integrations.dspy_integration import DSPyProvider
 from integrations.rlm import use_rlm
-from pyreact.core import use_event, use_turn
+from pyreact.boot import create_root
+from pyreact.core import use_turn
 from pyreact.core.core import component, hooks
 
-from examples._lm import OFFLINE, example_models
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
 SMOKE = {"args": []}
 
@@ -86,14 +88,10 @@ def RepoAgent(question: str = "", turn: int = 0, context: str = "",
     return []
 
 
-def make_app(models: Dict[str, Any], context: str, sink: Dict[str, Any], **agent_kw):
+def make_app(models: Dict[str, Any], context: str, on_answer=None, **agent_kw):
     @component
     def Home():
         turn = use_turn()  # a new turn per input, even when the text repeats
-
-        def on_answer(question, answer, error):
-            sink.setdefault("answers", []).append((question, answer, error))
-
         return [
             RepoAgent(key="rlm", question=turn.text if turn else "",
                       turn=turn.index if turn else 0, context=context,
@@ -102,26 +100,30 @@ def make_app(models: Dict[str, Any], context: str, sink: Dict[str, Any], **agent
 
     @component
     def App():
-        use_event(["llm.*", "rlm.*"], lambda ev: sink.setdefault("events", []).append(ev))
         return [DSPyProvider(key="dspy", models=models, children=[Home(key="home")])]
 
     return App
 
 
 def ask(question: str, *, models: Optional[Dict[str, Any]] = None,
-        timeout: float = 600, **agent_kw) -> Dict[str, Any]:
-    from pyreact.boot import bootstrap
-
+        timeout: float = 600, show: bool = False, **agent_kw) -> Dict[str, Any]:
+    """One question, one root. Returns ``{"context_chars", "answers": [(q, a,
+    error)], "events": [llm.* / rlm.* events]}``."""
     if models is None:
         models = example_models()
     context = repo_source()
-    sink: Dict[str, Any] = {"context_chars": len(context)}
-    app = bootstrap(make_app(models, context, sink, **agent_kw))
-    try:
-        app.invoke(question, wait=True, timeout=timeout)
-    finally:
-        app.shutdown()
-    return sink
+    out: Dict[str, Any] = {"context_chars": len(context), "answers": []}
+
+    def on_answer(q, answer, error):  # a callback prop, like onAnswer in React
+        out["answers"].append((q, answer, error))
+
+    with create_root(make_app(models, context, on_answer, **agent_kw),
+                     session_id="rlm") as root:
+        out["events"] = collect(root, ["llm.*", "rlm.*"])  # devtools: the RLM's trace
+        if show:
+            show_messages(root)
+        root.send(question, wait=True, timeout=timeout)
+    return out
 
 
 if __name__ == "__main__":
@@ -132,7 +134,7 @@ if __name__ == "__main__":
         "Which function schedules component rerenders, and which data structure "
         "prevents a component from being enqueued twice?"
     )
-    out = ask(q)
+    out = ask(q, show=True)
     print("context chars:", out["context_chars"])
     for ev in out.get("events", []):
         print(ev.kind, {k: v for k, v in ev.payload.items() if k != "error"} | (

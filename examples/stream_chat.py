@@ -1,8 +1,10 @@
 """Streaming multi-turn chat.
 
 - conversation memory is component state: a ``dspy.History`` in ``use_state``
-- the answer streams via ``use_stream`` (dspy.streamify + StreamListener)
-- the terminal prints tokens live by subscribing to ``llm.chunk`` events
+- the answer streams via ``use_stream`` (dspy.streamify + StreamListener);
+  the finished answer is a ``Message`` (output is components)
+- the live tokens are a devtools view: ``trace(root, ["llm.chunk"], ...)``
+  prints each ``llm.chunk`` event as it is published
 
 Run from the repo root:
 
@@ -13,16 +15,16 @@ OpenAI streams token by token; the ``claude -p`` dev LM doesn't stream, so the
 answer appears at once.
 """
 
-import asyncio
-
 import dotenv
 import dspy
 
-from integrations import DSPyProvider, use_chain_of_thought, use_stream
-from pyreact.boot import bootstrap, read_terminal_and_invoke
-from pyreact.core import EventBus, HookContext, component, hooks, use_on_turn
-
+from examples._devtools import run_repl, trace
 from examples._lm import example_lm
+from integrations import DSPyProvider, use_chain_of_thought, use_stream
+from pyreact.boot import create_root
+from pyreact.components.message import Message
+from pyreact.core import component, hooks, use_on_turn
+
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
 SMOKE = {"stdin": "hi\nand again\n:q\n"}
 
@@ -58,6 +60,12 @@ def Chat():
 
     hooks.use_effect(_remember, [stream.ver])
 
+    if stream.error is not None:
+        return [Message(key=f"error-{stream.ver}", text=f"Error: {stream.error}",
+                        sender="system", message_type="error")]
+    if stream.ver and stream.result is not None:  # a new key per answer: printed once
+        return [Message(key=f"answer-{stream.ver}", text=stream.result.answer,
+                        sender="assistant")]
     return []
 
 
@@ -71,42 +79,35 @@ def _default_lm():
     return example_lm()
 
 
-def _print_stream_events():
-    """Terminal 'renderer' for the stream: tokens live, then a newline."""
+def live_tokens():
+    """Devtools: the answer's tokens as they stream (OpenAI streams; the
+    ``claude -p`` dev LM doesn't, so nothing prints before the Message)."""
     streamed = set()
 
-    def on_event(ev):
+    def fmt(ev):
         p = ev.payload
         if ev.kind == "llm.chunk" and p.get("field") == "answer":
-            if p["call_id"] not in streamed:
-                streamed.add(p["call_id"])
-                print("\x1b[32m[ASSISTANT] ", end="")
-            print(p["chunk"], end="", flush=True)
-        elif ev.kind == "llm.end":
-            if p["call_id"] in streamed:
-                print("\x1b[0m")
-            else:  # LM didn't stream: print the final answer
-                print(f"\x1b[32m[ASSISTANT] {p['outputs'].get('answer')}\x1b[0m")
-        elif ev.kind == "llm.error":
-            print(f"\x1b[31m[ERROR] {p['error']}\x1b[0m")
+            first = p["call_id"] not in streamed
+            streamed.add(p["call_id"])
+            return ("\x1b[90m  ... " if first else "") + p["chunk"]
+        if ev.kind == "llm.end" and p["call_id"] in streamed:
+            return "\x1b[0m\n"
+        return None
 
-    HookContext.get_service("event_bus", EventBus).subscribe(on_event, ["llm.*"])
+    return fmt
 
 
-async def main():
+def main():
     lm = _default_lm()
 
     @component
     def Boot():
         return [Root(key="root", lm=lm)]
 
-    _print_stream_events()
-    app = bootstrap(Boot)
-    try:
-        await read_terminal_and_invoke(app, prompt="> ", wait=True)
-    finally:
-        app.shutdown()
+    with create_root(Boot, session_id="chat") as root:
+        trace(root, ["llm.chunk", "llm.end"], live_tokens(), end="")
+        run_repl(root, prompt="> ", console_kinds=("message", "error"))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
