@@ -106,6 +106,8 @@ class BoundaryMetrics:
             self.operation_duration.record(seconds, attrs)
         elif b.kind == "turn":
             attrs = {A.COMPONENT: b.component} if b.component else {}
+            if b.attrs.get("status"):
+                attrs[A.TURN_STATUS] = str(b.attrs["status"])
             if err_type:
                 attrs[A.ERROR_TYPE] = err_type
             self.turn_duration.record(seconds, attrs)

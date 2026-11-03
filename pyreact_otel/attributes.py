@@ -48,6 +48,9 @@ LM_CALLS = "pyreact.lm_calls"
 TOTAL_TOKENS = "pyreact.usage.total_tokens"
 COST = "pyreact.cost"
 CANCELLED = "pyreact.cancelled"
+TURN_STATUS = "pyreact.turn.status"  # done | interrupted | error | blocked
+TURN_INDEX = "pyreact.turn.index"
+TURN_SOURCE = "pyreact.turn.source"
 BLOCKED_REASON = "pyreact.blocked.reason"
 BLOCKED_BY = "pyreact.blocked.by"
 INPUTS = "pyreact.inputs"  # content: only with capture_content=True

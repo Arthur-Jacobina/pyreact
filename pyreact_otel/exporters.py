@@ -248,9 +248,11 @@ def langfuse_enricher(
         if info.blocked:
             out["langfuse.observation.level"] = "WARNING"
             out["langfuse.observation.status_message"] = f"blocked: {info.error.reason}"
-        elif info.error is not None and "error.type" in a:
+        elif "error.type" in a and not a.get("pyreact.cancelled"):
             out["langfuse.observation.level"] = "ERROR"
-            out["langfuse.observation.status_message"] = f"{type(info.error).__name__}: {info.error}"
+            out["langfuse.observation.status_message"] = (
+                f"{type(info.error).__name__}: {info.error}" if info.error is not None
+                else "turn ended with errors")
         if info.content:  # capture_content=True
             inp = info.content.get("pyreact.inputs")
             outp = info.content.get("pyreact.outputs")
@@ -306,13 +308,17 @@ def langfuse_exporter(
     release: Optional[str] = None,
     tags: Sequence[str] = (),
     ingestion_version: Optional[str] = "4",
-    timeout: Optional[float] = None,
+    timeout: Optional[float] = 30.0,
 ) -> ExporterConfig:
     """Langfuse over OTLP/HTTP: ``{host}/api/public/otel/v1/traces`` with Basic
     auth ``public_key:secret_key``. Defaults: ``LANGFUSE_PUBLIC_KEY``,
     ``LANGFUSE_SECRET_KEY``, ``LANGFUSE_HOST`` (or ``LANGFUSE_BASE_URL``,
     else Langfuse Cloud EU). Langfuse ingests traces only: metrics are not
-    exported unless you add a ``metric_readers=[...]`` to ``setup``."""
+    exported unless you add a ``metric_readers=[...]`` to ``setup``.
+
+    ``timeout`` (seconds per export) is 30 rather than the OTLP default 10:
+    a cold self-hosted Langfuse can take longer than 10 s to answer its
+    first OTLP request, and a timed-out batch is dropped."""
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
     public_key = public_key or os.getenv("LANGFUSE_PUBLIC_KEY")

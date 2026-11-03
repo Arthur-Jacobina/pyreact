@@ -287,12 +287,16 @@ def test_installed_process_wide_with_real_session_and_turn():
     finally:
         app.shutdown()
         uninstall()
-    # the runtime also runs each turn as a boundary: pick the LLM span
     spans = {s.name: s for s in exporter.get_finished_spans()}
-    s = spans["chat openai/gpt-4o-mini"]
+    s, t = spans["chat openai/gpt-4o-mini"], spans["pyreact.turn"]
     assert s.attributes["pyreact.component"] == "Agent"
     assert s.attributes["pyreact.session_id"] == "sess-1"
     assert s.attributes["pyreact.turn_id"].endswith("t1")
+    # the runtime runs each turn as a "turn" boundary: the root of the trace
+    assert t.parent is None and s.parent.span_id == t.context.span_id
+    assert t.attributes["pyreact.turn.status"] == "done"
+    assert t.attributes["pyreact.turn.index"] == 1
+    assert t.attributes["pyreact.session_id"] == "sess-1"
 
 
 def test_enrichers_see_the_trace_root_name(otel):
@@ -309,3 +313,20 @@ def test_enrichers_see_the_trace_root_name(otel):
     asyncio.run(through("turn", "StoreHome", {}, turn, harness=h))
     assert seen == {"turn": ("pyreact.turn StoreHome", True),
                     "llm": ("pyreact.turn StoreHome", False)}
+
+
+def test_turn_status_error_marks_the_span(otel):
+    names = []
+    h = otel(enrichers=[lambda info: names.append(info.trace_name)])
+
+    async def turn(b):  # what pyreact.core.turns does: errors in spawned work
+        b.attrs.update(status="error", duration=0.1)
+        return "error"
+
+    asyncio.run(through("turn", "turn", {"text": "x"}, turn, harness=h,
+                        component="Root", index=3, source="web"))
+    (t,) = otel.exporter.get_finished_spans()
+    assert t.status.status_code == StatusCode.ERROR and t.attributes["error.type"] == "TurnError"
+    assert t.attributes["pyreact.turn.status"] == "error"
+    assert t.attributes["pyreact.turn.index"] == 3 and t.attributes["pyreact.turn.source"] == "web"
+    assert names == ["pyreact.turn"]  # name "turn" + no component -> plain
