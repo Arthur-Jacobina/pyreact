@@ -13,9 +13,9 @@ State that survives the process:
   (``autosnapshot="turn"`` -> ``docker commit``), and on exit the container is
   destroyed (``on_close="destroy"``) — the snapshot is the state.
 
-So run it, let it exit, then ``--resume``: a new runner restores the sandbox
-from the snapshot (``sandbox.restored``) and the agent continues where it
-was — its files are still there.
+So run it, let it exit, then ``--resume``: a new root with the same
+``session_id`` restores the sandbox from the snapshot (``sandbox.restored``)
+and the agent continues where it was — its files are still there.
 
     uv run python -m examples.sandbox.01_coding_agent \\
         "What is the 30th Fibonacci number? Write fib.py that computes it."
@@ -40,17 +40,20 @@ import dspy
 
 import pyreact_sandbox as ps
 from integrations import DSPyProvider, use_agent
-from pyreact.boot import bootstrap
-from pyreact.core import component, hooks, use_emit, use_turn
+from pyreact.boot import create_root
+from pyreact.components.message import Message
+from pyreact.core import component, hooks, use_turn
 from pyreact_durable import Durable, use_conversation
 from pyreact_sandbox import SandboxProvider, SandboxSpec, sandbox_tools, use_sandbox
 from pyreact_sandbox.contrib.durable import use_durable_snapshot_store
 
+from examples._devtools import trace
 from examples._lm import example_lm
 
 # Offline smoke run (tests/test_examples_smoke.py): local driver, state in a temp dir.
 SMOKE = {"args": ["--demo", "--driver", "local", "--state", "{tmp}/state"], "timeout": 120}
 
+SESSION = "coder"
 LABELS = {"pyreact.example": "coding_agent"}
 SPEC = SandboxSpec(image="python:3.12-slim", cpu=1, memory="512m", network=False,
                    labels=LABELS)
@@ -77,7 +80,6 @@ def CodingAgent():
     tools = hooks.use_memo(lambda: sandbox_tools(sb, timeout=30), [id(sb)])
     agent = use_agent(Coder, tools=tools, max_iters=MAX_ITERS)
     turn = use_turn()
-    emit = use_emit()
 
     def ask():
         if turn is not None:
@@ -85,22 +87,24 @@ def CodingAgent():
 
     hooks.use_effect(ask, [turn and turn.id])
 
-    def answered():
-        if not agent.ver or turn is None:
-            return
-        if agent.error is not None:
-            emit("message", {"text": f"error: {agent.error!r}", "sender": "system"})
-            return
-        answer = agent.result.answer
-        conv.extend([{"role": "user", "content": turn.text},
-                     {"role": "assistant", "content": answer}])
-        emit("message", {"text": answer, "sender": "assistant"})
+    def remember():  # persist the Q/A pair once the agent settled
+        if agent.ver and turn is not None and agent.error is None:
+            conv.extend([{"role": "user", "content": turn.text},
+                         {"role": "assistant", "content": agent.result.answer}])
 
-    hooks.use_effect(answered, [agent.ver])
-    return []
+    hooks.use_effect(remember, [agent.ver])
+
+    if not agent.ver or turn is None:
+        return []
+    if agent.error is not None:
+        return [Message(key=f"error-{agent.ver}", text=f"error: {agent.error!r}",
+                        sender="system", message_type="error")]
+    return [Message(key=f"answer-{agent.ver}", text=agent.result.answer, sender="assistant")]
 
 
 def make_app(log_path: str, driver, lm):
+    """The tree: what it declares (log, LM, sandbox policies) is all there is."""
+
     @component
     def App():
         return [Durable(key="durable", log=log_path, children=[
@@ -110,27 +114,29 @@ def make_app(log_path: str, driver, lm):
             ]),
         ])]
 
-    return bootstrap(App)
+    return App
 
 
-def show(ev) -> None:
+def show(ev):
+    """Devtools: the agent's messages, tool calls and sandbox lifecycle."""
     p = ev.payload
     if ev.kind == "message":
-        print(f"\n{p.get('sender')}> {p.get('text')}", flush=True)
-    elif ev.kind == "tool.start":
-        print(f"  [tool] {p.get('tool')}({p.get('args')})", flush=True)
-    elif ev.kind == "sandbox.exec":
+        return f"\n{p.get('sender')}> {p.get('text')}"
+    if ev.kind == "tool.start":
+        return f"  [tool] {p.get('tool')}({p.get('args')})"
+    if ev.kind == "sandbox.exec":
         out = (p.get("stdout") or p.get("stderr") or p.get("error") or "").strip()
         code = p.get("exit_code")
-        print(f"  [sandbox.exec {p.get('op')}] {p.get('name')} -> "
-              f"{'' if code is None else f'exit {code} '}{out[:200]!r}", flush=True)
-    elif ev.kind in ("sandbox.created", "sandbox.restored", "sandbox.snapshot",
-                     "sandbox.destroyed", "sandbox.error"):
+        return (f"  [sandbox.exec {p.get('op')}] {p.get('name')} -> "
+                f"{'' if code is None else f'exit {code} '}{out[:200]!r}")
+    if ev.kind in ("sandbox.created", "sandbox.restored", "sandbox.snapshot",
+                   "sandbox.destroyed", "sandbox.error"):
         keep = {k: v for k, v in p.items() if k in ("sandbox_id", "mode", "snapshot", "duration",
                                                    "error", "policy", "image")}
         if "duration" in keep:
             keep["duration"] = round(keep["duration"], 2)
-        print(f"  [{ev.kind}] {keep}", flush=True)
+        return f"  [{ev.kind}] {keep}"
+    return None
 
 
 def driver_for(name: str, state: Path):
@@ -152,13 +158,14 @@ def cleanup(driver_name: str, state: Path) -> None:
 def run_once(question: str, *, state: Path, driver_name: str, lm) -> None:
     state.mkdir(parents=True, exist_ok=True)
     app = make_app(str(state / "agent.jsonl"), driver_for(driver_name, state), lm)
-    app.event_bus.subscribe(show, ["message", "tool.start", "sandbox.*"])
     print(f"\nuser> {question}", flush=True)
     calls0 = len(getattr(lm, "history", []) or [])
     try:
-        app.invoke(question, wait=True, timeout=600)
+        # same session id every run: the sandbox record is "<session id>/default"
+        with create_root(app, session_id=SESSION) as root:
+            trace(root, ["message", "tool.start", "sandbox.*"], show)
+            root.send(question, wait=True, timeout=600)
     finally:
-        app.shutdown()
         ps.wait_closed(120)  # autosnapshot + destroy finish before we exit
     calls = len(getattr(lm, "history", []) or []) - calls0
     print(f"  (LM calls this run: {calls})", flush=True)
@@ -193,7 +200,7 @@ def main() -> int:
     if args.demo:
         cleanup(args.driver, state)
         run_once(args.question or DEFAULT_Q1, state=state, driver_name=args.driver, lm=lm)
-        print("\n--- process 'restarts': new runner, same log ---")
+        print("\n--- process 'restarts': a new root, same session id and log ---")
         run_once(DEFAULT_Q2, state=state, driver_name=args.driver, lm=lm)
         cleanup(args.driver, state)
         if args.driver == "local":
