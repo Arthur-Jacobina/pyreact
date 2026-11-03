@@ -20,7 +20,14 @@ from pyreact.core.events import EventBus
 
 from ._base import Sink, component_path, current_turn_id, get_event_bus
 from .console import ConsoleSink, format_event, format_message
-from .errors import error_payload, install_error_events, make_error_handler
+from .errors import (
+    error_payload,
+    install_error_events,
+    install_session_error_events,
+    make_error_handler,
+    make_session_error_handler,
+    session_event_bus,
+)
 from .jsonl import JSONLSink, read_jsonl
 from .log import EventLog
 from .timeline import Turn, TurnTimeline
@@ -68,7 +75,10 @@ __all__ = [
     "format_message",
     "get_event_bus",
     "install_error_events",
+    "install_session_error_events",
     "make_error_handler",
+    "make_session_error_handler",
+    "session_event_bus",
     "normalize_usage",
     "read_jsonl",
 ]

@@ -1,8 +1,9 @@
 # hook.py ----------------------------------------------------
-from typing import Dict
+from typing import Dict, Optional
 from weakref import WeakSet
+from . import core as _core
 from .core import VNode
-from .runtime import schedule_rerender, report_error, spawn
+from .runtime import schedule_rerender, report_error, spawn, current_owner
 import inspect
 import warnings
 
@@ -18,20 +19,74 @@ def _deps_changed(old, new):
     return new is None or old != new
 
 
+def _resolve_service(services: dict, key, factory):
+    service = services.get(key)
+    if service is None:
+        service = factory()
+        services[key] = service
+    return service
+
+
+class _ServiceAccessor:
+    """Descriptor making ``get_service`` scope-aware.
+
+    - ``ctx.get_service(key, factory)`` (instance call, which is what
+      ``hooks.get_service`` resolves to) → services of ``ctx``'s *session
+      root* (the top-most ancestor). Each session root owns its own dict, so
+      two sessions never share an InputBus, NavService, EventBus, ...
+      Roots created without a services dict (headless) use the global one.
+    - ``HookContext.get_service(key, factory)`` (class call) → the
+      process-global fallback dict ``HookContext._services`` (e.g. the
+      stdout ``console_buffer``).
+    """
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            owner = objtype
+
+            def _global_get_service(key, factory):
+                return _resolve_service(owner._services, key, factory)
+
+            return _global_get_service
+
+        def _session_get_service(key, factory):
+            return _resolve_service(obj.session_services, key, factory)
+
+        return _session_get_service
+
+
 class HookContext:
+    # Process-global services (class-level ``HookContext.get_service`` calls).
     _services: Dict = {}
 
-    @classmethod
-    def get_service(cls, key, factory):
-        service = cls._services.get(key)
-        if service is None:
-            service = factory()
-            cls._services[key] = service
-        return service
+    get_service = _ServiceAccessor()
 
-    def __init__(self, name, component_fn, *, props=None, key=None, parent=None) -> None:
+    def __init__(
+        self,
+        name,
+        component_fn,
+        *,
+        props=None,
+        key=None,
+        parent=None,
+        index=None,
+        services: Optional[dict] = None,
+    ) -> None:
+        """``services``: only meaningful for a root (``parent is None``); the
+        dict that backs ``hooks.get_service`` for the whole tree (each
+        :class:`~pyreact.boot.session.Session` passes its own). A root created
+        without one (headless use) resolves services from the process-global
+        ``HookContext._services``."""
         self.name = name
         self.parent = parent
+        # Position among the parent's rendered children (used in ``path`` for
+        # unkeyed nodes; unkeyed children are reconciled by index too).
+        self.index = index
+        # Session root of this tree; parents never change after creation.
+        self._root: "HookContext" = parent._root if parent is not None else self
+        self._session_services: Optional[dict] = (
+            services if parent is None else None
+        )
         # Values provided to descendants by this node: {context_key: value}
         self._provided: dict = {}
         self.component_fn = component_fn
@@ -47,6 +102,18 @@ class HookContext:
         self._mounted: bool = (
             True  # Track mount lifecycle to avoid rerenders after unmount
         )
+
+    @property
+    def root(self) -> "HookContext":
+        """The session root (top-most ancestor) of this component."""
+        return self._root
+
+    @property
+    def session_services(self) -> dict:
+        """Services dict owned by this tree's session root (the process-global
+        dict for a root created without ``services``)."""
+        services = self._root._session_services
+        return HookContext._services if services is None else services
 
     def use_state(self, initial):
         idx = self.hook_idx
@@ -118,6 +185,29 @@ class HookContext:
         state, _r, _d = self.hooks[idx]
         self.hook_idx += 1
         return state, dispatch  # return the pair (state, dispatch)
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+    @property
+    def path(self) -> str:
+        """Stable tree path, e.g. ``App/ToolProvider[tools]/StoreHome[store]``.
+
+        Each segment is ``Name[key]`` (or ``Name[#index]`` when unkeyed); the
+        root is just its name. A stable address for a component (e.g. for
+        durable state or tracing).
+        """
+        cached = self.__dict__.get("_path")
+        if cached is None:
+            if self.key is not None:
+                seg = f"{self.name}[{str(self.key).replace('/', '%2F')}]"
+            elif self.index is not None:
+                seg = f"{self.name}[#{self.index}]"
+            else:
+                seg = self.name
+            cached = seg if self.parent is None else f"{self.parent.path}/{seg}"
+            self._path = cached
+        return cached
 
     def use_effect(self, effect_fn, deps):
         deps_key = _deps_key(deps)
@@ -211,12 +301,18 @@ class HookContext:
     def _call_cleanup(self, cleanup):
         if not cleanup:
             return
+        # Like effects, cleanups run "as" this component (hooks.* usable).
+        owner_token = current_owner.set(self)
+        stack_token = _core._context_stack.set(self)
         try:
             res = cleanup()
             if inspect.isawaitable(res):
                 spawn(res, owner=self, name=f"{self.name}:cleanup")
         except Exception as exc:
             report_error(exc, self, "cleanup")
+        finally:
+            _core._context_stack.reset(stack_token)
+            current_owner.reset(owner_token)
 
     def _run_cleanup_slot(self, slot):
         cleanup = slot[0] if isinstance(slot, tuple) else None
@@ -323,6 +419,7 @@ class HookContext:
                         props=vnode.props,
                         key=vnode.key,
                         parent=self,
+                        index=idx,
                     )
                 else:
                     matched.props = vnode.props
@@ -356,19 +453,29 @@ class HookContext:
                 break
             cln, _ = self.hooks[idx]
             self.hooks[idx] = (None, deps)
-            self._call_cleanup(cln)
+            # Attribute work done by the effect (spawned tasks, stdout) to
+            # this component and hence to its session, and make ``hooks.*``
+            # (e.g. ``hooks.get_service``) resolve to this component inside
+            # effects, their cleanups and async effect tasks.
+            owner_token = current_owner.set(self)
+            stack_token = _core._context_stack.set(self)
             try:
-                res = fx()
-            except Exception as exc:
-                report_error(exc, self, "effect")
-                continue
-            if inspect.isawaitable(res):
-                # Async effects run in the background so a slow effect (LLM
-                # call, tool, I/O) never blocks other renders. The stored
-                # cleanup cancels the task if it is still running when deps
-                # change or the component unmounts.
-                task = spawn(res, owner=self, name=f"{self.name}:effect[{idx}]")
-                res = self._make_task_cleanup(task)
+                self._call_cleanup(cln)
+                try:
+                    res = fx()
+                except Exception as exc:
+                    report_error(exc, self, "effect")
+                    continue
+                if inspect.isawaitable(res):
+                    # Async effects run in the background so a slow effect (LLM
+                    # call, tool, I/O) never blocks other renders. The stored
+                    # cleanup cancels the task if it is still running when deps
+                    # change or the component unmounts.
+                    task = spawn(res, owner=self, name=f"{self.name}:effect[{idx}]")
+                    res = self._make_task_cleanup(task)
+            finally:
+                _core._context_stack.reset(stack_token)
+                current_owner.reset(owner_token)
             self.hooks[idx] = ((res if callable(res) else None), deps)
 
         for ch in list(self.children):

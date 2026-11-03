@@ -19,7 +19,7 @@ from examples.tools import Root
 from integrations import claude_cli_lm
 from integrations.claude_cli_lm import ClaudeCLILM
 from pyreact.boot import bootstrap
-from pyreact.core import EventBus, HookContext, component
+from pyreact.core import component
 
 TIMEOUT = 300
 T0 = time.time()
@@ -35,8 +35,7 @@ def log(line: str) -> None:
 
 
 def start_app(policy: str):
-    # Services are process-global for now: start each app from a clean slate.
-    HookContext._services.clear()
+    # Each app's default session owns its services (bus, turns, ...).
     lm = ClaudeCLILM("haiku")
     models = {"default": lm, "fast": lm, "reasoning": lm}
 
@@ -46,7 +45,7 @@ def start_app(policy: str):
 
     app = bootstrap(Boot, turn_policy=policy)
     answers, ends = {}, {}
-    bus = HookContext.get_service("event_bus", EventBus)
+    bus = app.event_bus
 
     def on_event(ev):
         p = ev.payload
