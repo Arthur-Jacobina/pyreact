@@ -106,6 +106,31 @@ Rules:
   a valid last line missing only its newline is kept. A garbled line in the
   middle is skipped and reported too. Never fatal.
 
+### Backends: JSONL or SQLite
+
+The suffix picks the backend; the format and every API are identical:
+
+```python
+SessionLog.open("chat.jsonl")    # one JSON line per entry (default)
+SessionLog.open("chat.sqlite")   # same lines, one row each (.sqlite / .sqlite3 / .db)
+Durable(log="state.db", children=[...])
+```
+
+`SQLiteSessionLog` stores exactly the lines a `.jsonl` file would (header
+first) in a `lines(seq, line)` table, so tree semantics and migrations are
+shared. Each append is one committed `INSERT` (WAL; `synchronous=FULL` with
+`fsync=True`), so there are no torn lines; the single-writer guard is a `flock`
+on `<file>.lock`; `readonly=True` readers (e.g. the CLI) work while the app
+writes. Convert between backends with `fork_file`:
+
+```python
+SessionLog.open("chat.sqlite").fork_file("chat.jsonl")   # export
+SessionLog.open("chat.jsonl").fork_file("chat.db")       # import
+```
+
+Pick JSONL for greppable, diffable logs; SQLite when many sessions live in one
+process or files get large (no whole-file reads by other tools).
+
 ## Storage API (`pyreact_durable.log`)
 
 ```python

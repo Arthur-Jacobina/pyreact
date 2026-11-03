@@ -28,6 +28,10 @@ File layout::
 Durability: one ``os.write`` per entry on an ``O_APPEND`` descriptor (optional
 ``fsync``); an exclusive ``flock`` guards against two writers; a torn/garbled
 trailing line (crash mid-write) is dropped and reported, never fatal.
+
+Backends: ``SessionLog.open(path)`` picks JSONL or SQLite from the suffix
+(``.sqlite`` / ``.sqlite3`` / ``.db`` -> :class:`SQLiteSessionLog`, which stores
+the same lines one row each). Everything else is shared.
 """
 
 from __future__ import annotations
@@ -169,7 +173,8 @@ class SessionLog:
         - ``meta``: extra header fields when the file is created.
         """
         p = Path(path)
-        if not p.exists() or p.stat().st_size == 0:
+        cls = _backend_for(cls, p)
+        if cls._is_empty(p):
             if readonly or not create:
                 raise FileNotFoundError(str(p))
             return cls.create(p, meta=meta, fsync=fsync, lock=lock,
@@ -195,9 +200,13 @@ class SessionLog:
         parent_session: Optional[str] = None,
         auto_checkpoint: Optional[int] = None,
     ) -> "SessionLog":
-        """Create a new session file (fails if a non-empty one exists)."""
+        """Create a new session file (fails if a non-empty one exists).
+
+        The suffix picks the backend: ``.sqlite`` / ``.sqlite3`` / ``.db`` ->
+        :class:`SQLiteSessionLog`, anything else -> JSONL."""
         p = Path(path)
-        if p.exists() and p.stat().st_size > 0:
+        cls = _backend_for(cls, p)
+        if not cls._is_empty(p):
             raise SessionLogError(f"{p} already exists")
         p.parent.mkdir(parents=True, exist_ok=True)
         log = cls(p, fsync=fsync, auto_checkpoint=auto_checkpoint)
@@ -211,7 +220,7 @@ class SessionLog:
                 raise SessionLogError(f"meta key {k!r} is reserved")
             header[k] = v
         try:
-            if os.fstat(log._fd).st_size:  # lost a creation race
+            if not log._storage_empty():  # lost a creation race
                 raise SessionLogError(f"{p} already exists")
             log._write_line(_dumps(header))
         except BaseException:
@@ -219,6 +228,21 @@ class SessionLog:
             raise
         log.header = header
         return log
+
+    # -------------------------------------------------- storage hooks (JSONL)
+    @classmethod
+    def _is_empty(cls, p: Path) -> bool:
+        return not p.exists() or p.stat().st_size == 0
+
+    def _storage_empty(self) -> bool:
+        return os.fstat(self._fd).st_size == 0
+
+    def _read_lines(self) -> Tuple[bytes, List[bytes]]:
+        raw = self.path.read_bytes()
+        return raw, raw.split(b"\n")
+
+    def _reset_storage(self) -> None:
+        os.ftruncate(self._fd, 0)
 
     def _open_fd(self, lock: bool) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,8 +283,7 @@ class SessionLog:
 
     # ------------------------------------------------------------------ load
     def _load(self, migrations: Dict[int, Migration]) -> None:
-        raw = self.path.read_bytes()
-        lines = raw.split(b"\n")
+        raw, lines = self._read_lines()
         # ``lines[-1]`` is b"" iff the file ends with a newline.
         torn_tail = lines[-1] != b""
         parsed: List[Tuple[int, dict]] = []
@@ -296,7 +319,7 @@ class SessionLog:
         if not parsed or parsed[0][1].get("type") != "session":
             if not parsed and not self.readonly:
                 # Only garbage (crash while writing the header): start over.
-                os.ftruncate(self._fd, 0)
+                self._reset_storage()
                 header = {"type": "session", "version": FORMAT_VERSION,
                           "id": str(uuid.uuid4()), "timestamp": now_iso()}
                 self._write_line(_dumps(header))
@@ -696,3 +719,141 @@ class SessionLog:
                 "branch_points": len(self.branch_points()),
                 "labels": len(self._labels), "leaf": self._leaf}
 
+
+
+# ---------------------------------------------------------------------------
+# SQLite backend
+# ---------------------------------------------------------------------------
+SQLITE_SUFFIXES = (".sqlite", ".sqlite3", ".db")
+
+
+def _backend_for(cls: type, p: Path) -> type:
+    """``SessionLog.open/create`` pick the backend from the file suffix;
+    explicit subclasses are respected."""
+    if cls is SessionLog and p.suffix.lower() in SQLITE_SUFFIXES:
+        return SQLiteSessionLog
+    return cls
+
+
+class SQLiteSessionLog(SessionLog):
+    """The same session format, stored in SQLite: one row per JSON line.
+
+    Rows hold exactly the lines a ``.jsonl`` file would (header first), so the
+    tree semantics, migrations and every API are shared with the JSONL backend;
+    ``fork_file("x.jsonl")`` exports and ``fork_file("x.sqlite")`` imports.
+
+    - each append is one committed INSERT (WAL; ``synchronous=FULL`` with
+      ``fsync=True``, else ``NORMAL``), so there are no torn lines to repair
+    - single writer: an exclusive ``flock`` on ``<file>.lock``
+    - ``readonly=True`` opens ``mode=ro``; WAL lets it read while the app writes
+    """
+
+    _SCHEMA = "CREATE TABLE IF NOT EXISTS lines (seq INTEGER PRIMARY KEY AUTOINCREMENT, line TEXT NOT NULL)"
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        self._db = None
+        self._lock_fd: Optional[int] = None
+
+    # -- storage hooks ------------------------------------------------------
+    @classmethod
+    def _is_empty(cls, p: Path) -> bool:
+        if not p.exists() or p.stat().st_size == 0:
+            return True
+        import sqlite3
+
+        try:
+            con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+            try:
+                row = con.execute("SELECT count(*) FROM lines").fetchone()
+                return not row or row[0] == 0
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return True  # no table yet
+
+    def _storage_empty(self) -> bool:
+        return self._db.execute("SELECT count(*) FROM lines").fetchone()[0] == 0
+
+    def _connect(self, readonly: bool):
+        import sqlite3
+
+        if readonly:
+            return sqlite3.connect(f"file:{self.path}?mode=ro", uri=True,
+                                   check_same_thread=False)
+        con = sqlite3.connect(str(self.path), isolation_level=None,
+                              check_same_thread=False)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute(f"PRAGMA synchronous={'FULL' if self.fsync else 'NORMAL'}")
+        con.execute(self._SCHEMA)
+        return con
+
+    def _open_fd(self, lock: bool) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if lock and fcntl is not None:
+            lock_path = str(self.path) + ".lock"
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                raise SessionLocked(
+                    f"{self.path} is locked by another writer (single-writer guard); "
+                    "open it with readonly=True to inspect it"
+                ) from None
+            self._lock_fd = fd
+        self._db = self._connect(readonly=False)
+        self._fd = -1  # "open" marker for the shared code paths
+
+    def close(self) -> None:
+        with self._lock:
+            db, self._db = self._db, None
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            fd, self._lock_fd = self._lock_fd, None
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._fd = None
+
+    def _read_lines(self) -> Tuple[bytes, List[bytes]]:
+        con = self._db if self._db is not None else self._connect(readonly=True)
+        try:
+            rows = con.execute("SELECT line FROM lines ORDER BY seq").fetchall()
+        finally:
+            if con is not self._db:
+                con.close()
+        lines = [r[0].encode("utf-8") for r in rows] + [b""]  # "ends with newline"
+        return b"", lines
+
+    def _reset_storage(self) -> None:
+        self._db.execute("DELETE FROM lines")
+
+    def _repair_tail(self, raw: bytes, tail_bad) -> None:
+        # Rows are committed atomically, so only a hand-edited row can be bad.
+        if tail_bad:
+            self._db.execute("DELETE FROM lines WHERE seq = (SELECT max(seq) FROM lines)")
+
+    def _write_line(self, line: str) -> None:
+        if self._db is None:
+            raise SessionLogError("log is closed" if not self.readonly else "log is read-only")
+        self._db.execute("INSERT INTO lines(line) VALUES (?)", (line,))
+
+    def _rewrite(self) -> None:
+        db = self._db
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("DELETE FROM lines")
+            db.executemany(
+                "INSERT INTO lines(line) VALUES (?)",
+                [(_dumps(self.header),)] + [(_dumps(e),) for e in self.entries],
+            )
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
