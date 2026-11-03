@@ -246,6 +246,11 @@ uv run python -m examples.durable.01_counter
 uv run python -m examples.durable.04_llm_chat
 ```
 
+In your own code, `run_web(App)` serves an app (one session per browser tab);
+`make_web_app(App, **opts)` returns the same `(asgi_app, runner)` without
+serving it, so a web app can be mounted elsewhere or tested in-process with
+starlette's `TestClient` (see `examples/main_web.py --check`).
+
 ### Tests
 
 ```bash

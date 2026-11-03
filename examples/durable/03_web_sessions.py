@@ -24,7 +24,8 @@ shutdown never triggers it). Inside, ``use_conversation()`` is the persisted tra
     ls runs/web/
     uv run python -m pyreact_durable show runs/web/<session id>.sqlite
 
-``--check`` drives the app with starlette's TestClient: two sockets -> two
+``--check`` drives ``make_web_app(App)`` (the app ``run_web`` serves) with
+starlette's TestClient: two sockets -> two
 sessions with separate histories; then a *new server* and a socket asking for
 the first id -> its history is back (and the LM sees it); log files on disk.
 
@@ -41,7 +42,7 @@ import dspy
 
 from examples._lm import OFFLINE, example_lm
 from integrations import DSPyProvider, use_agent_call
-from pyreact.boot import bootstrap, run_web
+from pyreact.boot import make_web_app, run_web
 from pyreact.core import EventBus, component, hooks, use_on_turn
 from pyreact_durable import Durable, use_conversation
 
@@ -113,11 +114,8 @@ def check(logs: str, lm) -> None:
 
     from starlette.testclient import TestClient
 
-    from pyreact.web.server import create_fastapi_app
-
-    def server():
-        runner = bootstrap(make_app(logs, lm), default_session=False)
-        return TestClient(create_fastapi_app(runner)[0])
+    def server():  # the ASGI app run_web serves; its lifespan stops the runner
+        return TestClient(make_web_app(make_app(logs, lm))[0])
 
     def recv_until(ws, sender, text=None):
         got = []
