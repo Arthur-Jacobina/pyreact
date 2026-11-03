@@ -6,7 +6,7 @@ The "full" example (01-03 teach the pieces one at a time):
   session log through the ``Durable`` provider (``pyreact_durable``)
 - every LM call goes through ``durable_lm``: re-running a turn on the same
   branch replays the journaled answer instead of calling the model again
-- commands (handled by the agent itself, via ``Keystroke``):
+- commands (handled by the agent itself, once per turn with ``use_on_turn``):
 
     /label <name>        bookmark the current position
     /fork <label|id>     branch from a bookmark (next message starts a branch)
@@ -39,8 +39,7 @@ import dspy
 
 from integrations import DSPyProvider, use_call, use_predict
 from pyreact.boot import bootstrap, read_terminal_and_invoke
-from pyreact.components.keystroke import Keystroke
-from pyreact.core import EventBus, component, hooks
+from pyreact.core import EventBus, component, hooks, use_on_turn
 from pyreact_durable import (
     Durable,
     SessionLogError,
@@ -73,7 +72,6 @@ def DurableChat():
     events = hooks.get_service("event_bus", EventBus)
     chat = use_predict(ChatSig)
     call = use_call(chat)
-    pending, set_pending = hooks.use_state(None)  # (seq, question), in-memory
     hooks_path = hooks.path
 
     def say(text: str, sender: str = "assistant") -> None:
@@ -102,34 +100,29 @@ def DurableChat():
         except SessionLogError as exc:
             say(f"error: {exc}", "system")
 
-    def on_submit(text: str) -> None:
-        line = text.strip()
+    def on_turn(turn) -> None:  # once per input, even when the text repeats
+        line = turn.text.strip()
         if not line:
             return
         if line.startswith("/"):
             command(line)
         else:
-            set_pending(lambda p: ((p[0] + 1) if p else 1, line))
+            call.run(question=line, history=conv.as_dspy_history())
 
-    def _ask():
-        if pending is not None:
-            call.run(question=pending[1], history=conv.as_dspy_history())
-
-    hooks.use_effect(_ask, [pending])
+    use_on_turn(on_turn)
 
     def _remember():
-        if call.ver and call.result is not None and pending is not None:
+        if call.ver and call.result is not None:
             answer = call.result.answer
             # one state entry for the pair: a crash never leaves half a turn
-            conv.extend([{"role": "user", "content": pending[1]},
+            conv.extend([{"role": "user", "content": call.inputs["question"]},
                          {"role": "assistant", "content": answer}])
             say(answer)
         elif call.ver and call.error is not None:
             say(f"LM error: {call.error}", "system")
 
     hooks.use_effect(_remember, [call.ver])
-
-    return [Keystroke(key="input", on_submit=on_submit)]
+    return []
 
 
 @component

@@ -47,25 +47,37 @@ def parse_legacy_line(text: str) -> Optional[dict]:
 @component
 def Message(
     text: str,
-    trigger: Literal["change", "mount"] = "change",
+    trigger: Literal["change", "mount", "turn"] = "change",
     sender: Literal["user", "system", "assistant"] = "user",
     message_type: Literal["chat", "info", "warning", "error"] = "chat",
     legacy: Optional[bool] = None,
 ):
-    """Chat message. On commit (mount, or whenever ``text`` changes when
-    ``trigger="change"``) publishes::
+    """Chat message. On commit publishes::
 
         message  {"text", "sender", "message_type", "timestamp"}
 
     on the app ``EventBus`` (source = component path, turn_id = current turn
-    when known). ``legacy`` overrides the global legacy-bridge flag.
+    when known). When it publishes depends on ``trigger``:
+
+    - ``"change"`` (default): on mount and whenever ``text`` changes;
+    - ``"mount"``: once;
+    - ``"turn"``: on mount and whenever ``text`` *or the current turn*
+      changes, i.e. once per ``(turn, text)``: the same reply to two inputs
+      is published twice.
+
+    ``legacy`` overrides the global legacy-bridge flag.
     """
     from pyreact.observability._base import component_path, current_turn_id
 
     bus = hooks.get_service("event_bus", EventBus)
     console = hooks.get_service("console_buffer", MessageBuffer)
     ctx = _core._context_stack.get()
-    deps = [] if trigger == "mount" else [text]
+    if trigger == "mount":
+        deps = []
+    elif trigger == "turn":
+        deps = [text, current_turn_id()]
+    else:
+        deps = [text]
 
     def _send_message():
         payload = {
