@@ -29,8 +29,8 @@ from examples.tools import SPECIALISTS, RouteSpecialistSig, SupervisorAgent
 from integrations.dspy_integration import DSPyProvider, use_dspy_env
 from integrations.feedback import TracedModule, TraceRecorder, send_feedback
 from integrations.optimize import hot_swap, instructions_of, load_compiled, module_key_for
-from pyreact.components.keystroke import Keystroke
-from pyreact.core.core import component, hooks
+from pyreact.core import use_turn
+from pyreact.core.core import component
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
 SMOKE = {"args": []}
@@ -209,17 +209,14 @@ def make_router_app(models: Dict[str, Any], sink: Dict[str, Any]):
     @component
     def RouterHome():
         sink["env"] = use_dspy_env()
-        (turn, msg), set_msg = hooks.use_state((0, ""))
+        turn = use_turn()  # a new turn per input, even when the text repeats
 
         def on_route(name, message, ver):
             sink.setdefault("routes", []).append((message, name, ver))
 
-        def on_submit(line):
-            set_msg(lambda p: (p[0] + 1, line))
-
         return [
-            Keystroke(key="in", on_submit=on_submit),
-            SupervisorAgent(key="supervisor", message=msg, turn=turn, on_route=on_route),
+            SupervisorAgent(key="supervisor", message=turn.text if turn else "",
+                            turn=turn.index if turn else 0, on_route=on_route),
         ]
 
     @component

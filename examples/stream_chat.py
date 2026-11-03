@@ -20,8 +20,7 @@ import dspy
 
 from integrations import DSPyProvider, use_chain_of_thought, use_stream
 from pyreact.boot import bootstrap, read_terminal_and_invoke
-from pyreact.components.keystroke import Keystroke
-from pyreact.core import EventBus, HookContext, component, hooks
+from pyreact.core import EventBus, HookContext, component, hooks, use_on_turn
 
 from examples._lm import example_lm
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -40,30 +39,26 @@ class ChatSig(dspy.Signature):
 def Chat():
     # Multi-turn memory lives in component state (immutable updates).
     history, set_history = hooks.use_state(dspy.History(messages=[]))
-    pending, set_pending = hooks.use_state(None)  # (turn, question)
 
     chat = use_chain_of_thought(ChatSig)
     stream = use_stream(chat, listen=["answer"])
 
-    def on_submit(line: str):
-        if line.strip():
-            set_pending(lambda p: ((p[0] + 1) if p else 1, line.strip()))
+    def ask(turn):  # once per input, even if the same line is sent twice
+        if turn.text.strip():
+            stream.run(question=turn.text.strip(), history=history)
 
-    def _ask():
-        if pending is not None:
-            stream.run(question=pending[1], history=history)
-
-    hooks.use_effect(_ask, [pending])
+    use_on_turn(ask)
 
     def _remember():
         # ver bumps once per settled call: append the finished turn.
-        if stream.ver and stream.result is not None and pending is not None:
-            turn = {"question": pending[1], "answer": stream.result.answer}
-            set_history(lambda h: dspy.History(messages=[*h.messages, turn]))
+        if stream.ver and stream.result is not None:
+            # stream.inputs: the inputs of the call that just settled
+            pair = {"question": stream.inputs["question"], "answer": stream.result.answer}
+            set_history(lambda h: dspy.History(messages=[*h.messages, pair]))
 
     hooks.use_effect(_remember, [stream.ver])
 
-    return [Keystroke(key="input", on_submit=on_submit)]
+    return []
 
 
 @component

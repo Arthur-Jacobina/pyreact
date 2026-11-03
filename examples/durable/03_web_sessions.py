@@ -40,8 +40,7 @@ import dspy
 from examples._lm import OFFLINE, example_lm
 from integrations import DSPyProvider, use_agent_call
 from pyreact.boot import bootstrap, run_web
-from pyreact.components.keystroke import Keystroke
-from pyreact.core import EventBus, component, hooks
+from pyreact.core import EventBus, component, hooks, use_on_turn
 from pyreact_durable import Durable, use_conversation
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -61,7 +60,6 @@ def Chat():
     conv = use_conversation()  # this session's transcript, restored from its file
     events = hooks.get_service("event_bus", EventBus)
     call = use_agent_call(ChatSig)
-    question, set_question = hooks.use_state(None)  # (n, text): a new value per message
     latest = hooks.use_ref(conv)  # read by the long-lived nav listener below
     latest.current = conv
 
@@ -79,27 +77,22 @@ def Chat():
 
     hooks.use_effect(redraw_on_connect, [])
 
-    def ask():
-        if question is not None:
-            call.run(question=question[1], history=conv.as_dspy_history())
+    def ask(turn):  # once per input (a repeated question is a new turn)
+        if turn.text.strip():
+            call.run(question=turn.text.strip(), history=conv.as_dspy_history())
 
-    hooks.use_effect(ask, [question])
+    use_on_turn(ask)
 
     def remember():
-        if call.result is not None and question is not None:
-            conv.extend([{"role": "user", "content": question[1]},  # one entry per pair
+        if call.result is not None:  # call.inputs: what the settled call was asked
+            conv.extend([{"role": "user", "content": call.inputs["question"]},  # one entry per pair
                          {"role": "assistant", "content": call.result.answer}])
             say(call.result.answer)
         elif call.error is not None:
             say(f"LM error: {call.error}", "system")
 
     hooks.use_effect(remember, [call.ver])
-
-    def on_submit(text: str) -> None:
-        if text.strip():
-            set_question(lambda q: ((q[0] + 1) if q else 1, text.strip()))
-
-    return [Keystroke(key="input", on_submit=on_submit)]
+    return []
 
 
 def make_app(logs: str, lm):

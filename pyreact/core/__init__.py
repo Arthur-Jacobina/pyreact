@@ -7,6 +7,7 @@ from .message_buffer import MessageBuffer
 from .core import component, hooks
 from .events import Event, EventBus
 from .turns import Turn, TurnManager, use_turn
+from .turn_hooks import use_on_turn
 from . import runtime
 from . import harness
 from .harness import Blocked, Boundary, HarnessProvider, current_boundary, through, use_harness
@@ -26,6 +27,7 @@ __all__ = [
     "Turn",
     "TurnManager",
     "use_turn",
+    "use_on_turn",
     "runtime",
     "harness",
     "Blocked",

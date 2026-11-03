@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from examples.message import Message
 from integrations.dspy_integration import DSPyProvider
 from integrations.rlm import use_rlm
-from pyreact.components.keystroke import Keystroke
+from pyreact.core import use_turn
 from pyreact.core.core import component, hooks
 from pyreact.core.events import EventBus
 
@@ -90,14 +90,14 @@ def RepoAgent(question: str = "", turn: int = 0, context: str = "",
 def make_app(models: Dict[str, Any], context: str, sink: Dict[str, Any], **agent_kw):
     @component
     def Home():
-        (turn, q), set_q = hooks.use_state((0, ""))
+        turn = use_turn()  # a new turn per input, even when the text repeats
 
         def on_answer(question, answer, error):
             sink.setdefault("answers", []).append((question, answer, error))
 
         return [
-            Keystroke(key="in", on_submit=lambda line: set_q(lambda p: (p[0] + 1, line))),
-            RepoAgent(key="rlm", question=q, turn=turn, context=context,
+            RepoAgent(key="rlm", question=turn.text if turn else "",
+                      turn=turn.index if turn else 0, context=context,
                       on_answer=on_answer, **agent_kw),
         ]
 
