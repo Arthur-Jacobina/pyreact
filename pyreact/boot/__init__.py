@@ -8,16 +8,15 @@ from .terminal import (
 from .web import make_web_app, run_web
 from .app_runner import AppRunner
 from .session import Session, current_session, session_of, DEFAULT_SESSION_ID
-from .root import Root, acreate_root, ahydrate_root, create_root, hydrate_root
-from .snapshots import DirectorySnapshots, MemorySnapshots, SnapshotStore, load_snapshot
-from .stateful import (
-    DirectoryManifestStore,
-    ManifestError,
-    ManifestStore,
-    MemoryManifestStore,
+from .root import (
+    Root,
     SuspendError,
-    load_manifest,
+    acreate_root,
+    ahydrate_root,
+    create_root,
+    hydrate_root,
 )
+from .snapshots import DirectorySnapshots, MemorySnapshots, SnapshotStore, load_snapshot
 
 __all__ = [
     "run_web",
@@ -37,12 +36,7 @@ __all__ = [
     "current_session",
     "session_of",
     "DEFAULT_SESSION_ID",
-    "ManifestStore",
-    "MemoryManifestStore",
-    "DirectoryManifestStore",
-    "ManifestError",
     "SuspendError",
-    "load_manifest",
     "read_terminal_and_invoke",
     "register_command",
     "handle_command",

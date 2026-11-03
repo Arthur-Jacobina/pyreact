@@ -123,6 +123,15 @@ Additive first: new APIs land next to the old ones; participants and
 examples move to the new APIs; a test forbids `get_service` /
 `session.services` / `participants=` in examples.
 
+**Status:** done. The deprecated wrappers have been removed: the library
+participants (`DurableParticipant`, `CompiledModulesParticipant`,
+`SandboxParticipant`), then `AppRunner(participants=...)` /
+`add_participant`, `Session.suspend()`, `AppRunner.resume()` and the
+manifest stores (`pyreact.manifest/1`). Roots (`create_root` /
+`hydrate_root`, `root.suspend()`) and `use_dehydrate` are the only path;
+the runner's `idle_policy="suspend"` / `auto_resume` run on the same
+machinery (`snapshot_store=`).
+
 ## Consequences
 
 - One mental model: if you know React, you know where state lives, how it
