@@ -36,6 +36,7 @@ Key pieces:
   - `Context(value=..., children=[...])`: provider component.
   - `get()`/`set(value)`: read/update. `set` notifies subscribed `HookContext`s via `schedule_rerender`.
 - Agents read with `hooks.use_context(Context)`. Subscriptions are tracked so unmount cleans them up.
+- Every component has a stable address, `hooks.path` (e.g. `App/Chat[chat]`: `Name[key]`, or `Name[#index]` when unkeyed), used for durable state and traces. **Providers are transparent**: context providers, `DSPyProvider`, `ToolProvider`, `HarnessProvider`, `Durable` and any `@component(transparent=True)` add no segment to their descendants' paths, so wrapping a tree in another provider never changes the paths below it. `hooks.full_path` keeps every node.
 
 ### 6) Reconciler/scheduler ↔ Agent commit loop
 - React batches state updates and commits.

@@ -201,3 +201,36 @@ def test_async_effect_is_cancelled_when_deps_change():
 
     asyncio.run(main())
     assert events == [("cancelled", "a"), ("done", "b")]
+
+
+def test_providers_are_transparent_in_paths():
+    Ctx = create_context(name="P")
+    seen = {}
+
+    @component(transparent=True)
+    def MyProvider(children=None):
+        seen["provider"] = (hooks.path, hooks.full_path)
+        return list(children or [])
+
+    @component
+    def Leaf(tag):
+        seen[tag] = (hooks.path, hooks.full_path)
+        return []
+
+    @component
+    def Box(children=None):
+        return list(children or [])
+
+    @component
+    def App():
+        return [
+            Ctx(value=1, children=[MyProvider(key="mine", children=[Leaf(key="a", tag="a")])]),
+            Box(key="box", children=[Ctx(value=2, children=[Leaf(tag="b")])]),
+        ]
+
+    asyncio.run(_mount(App))
+    assert seen["a"] == ("App/Leaf[a]", "App/_Provider[#0]/MyProvider[mine]/Leaf[a]")
+    # a provider keeps a path of its own; only its descendants skip it
+    assert seen["provider"] == ("App/MyProvider[mine]", "App/_Provider[#0]/MyProvider[mine]")
+    # ordinary components still contribute a segment
+    assert seen["b"][0] == "App/Box[box]/Leaf[#0]"

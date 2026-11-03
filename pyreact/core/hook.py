@@ -189,24 +189,64 @@ class HookContext:
     # ------------------------------------------------------------------
     # Identity
     # ------------------------------------------------------------------
+    @staticmethod
+    def _segment_of(node: "HookContext") -> str:
+        if node.key is not None:
+            return f"{node.name}[{str(node.key).replace('/', '%2F')}]"
+        if node.index is not None:
+            return f"{node.name}[#{node.index}]"
+        return node.name
+
+    @property
+    def transparent(self) -> bool:
+        """True for provider-like components (``@component(transparent=True)``,
+        every ``create_context`` provider, ``DSPyProvider``, ``ToolProvider``,
+        ``HarnessProvider``...): they add no segment to descendants' paths."""
+        return self.parent is not None and bool(
+            getattr(self.component_fn, "_pyreact_transparent", False)
+        )
+
     @property
     def path(self) -> str:
-        """Stable tree path, e.g. ``App/ToolProvider[tools]/StoreHome[store]``.
+        """Stable tree path, e.g. ``App/StoreHome[store]/Chat[chat]``.
 
         Each segment is ``Name[key]`` (or ``Name[#index]`` when unkeyed); the
-        root is just its name. A stable address for a component (e.g. for
-        durable state or tracing).
+        root is just its name. A stable address for a component (durable
+        state, tracing).
+
+        Rule: **providers are transparent**. A transparent component (context
+        providers and the library's provider components) has a path of its
+        own (``App/DSPyProvider[dspy]``) but contributes no segment to its
+        descendants: ``Chat(key="chat")`` under ``App`` is ``App/Chat[chat]``
+        whether or not providers are wrapped around it, so adding/removing a
+        provider later does not orphan its state. Keep keys unique among
+        components that end up under the same visible parent. The old,
+        every-node path is :attr:`full_path`.
         """
         cached = self.__dict__.get("_path")
         if cached is None:
-            if self.key is not None:
-                seg = f"{self.name}[{str(self.key).replace('/', '%2F')}]"
-            elif self.index is not None:
-                seg = f"{self.name}[#{self.index}]"
-            else:
-                seg = self.name
-            cached = seg if self.parent is None else f"{self.parent.path}/{seg}"
+            seg = self._segment_of(self)
+            cached = seg if self.parent is None else f"{self.parent._child_prefix}/{seg}"
             self._path = cached
+        return cached
+
+    @property
+    def _child_prefix(self) -> str:
+        """Path prefix of this node's children (skips transparent nodes)."""
+        if self.transparent:
+            return self.parent._child_prefix
+        return self.path
+
+    @property
+    def full_path(self) -> str:
+        """Path including every node, providers too (the pre-``transparent``
+        addressing): e.g. ``App/DSPyProvider[dspy]/_Provider[#0]/Chat[chat]``.
+        For diagnostics and for migrating data stored under old paths."""
+        cached = self.__dict__.get("_full_path")
+        if cached is None:
+            seg = self._segment_of(self)
+            cached = seg if self.parent is None else f"{self.parent.full_path}/{seg}"
+            self._full_path = cached
         return cached
 
     def use_effect(self, effect_fn, deps):

@@ -136,8 +136,8 @@ def parent(keep: bool) -> int:
     log_path = str(tmp / "chat.jsonl")
     calls = 0
     # stable component address of the chat agent (its persistent state key)
-    chat_path = ("App/DurableChatApp[app]/Durable[durable]/LMLayer[lm]/DSPyProvider[dspy]/"
-                 "_Provider[#0]/DurableChat[chat]")
+    # (providers -- Durable, DSPyProvider -- add no path segment)
+    chat_path = "App/DurableChatApp[app]/LMLayer[lm]/DurableChat[chat]"
 
     # (a) remember across kill -9 ---------------------------------------
     c = Child(log_path)
