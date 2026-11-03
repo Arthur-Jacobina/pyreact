@@ -714,8 +714,9 @@ uv run pytest -m docker
 
 Same React analogy, one level up: the **architecture** is *how* a component
 thinks (a prop you can swap), an **optimizer** is a *build step* that produces
-a better program, **hot swap** ships it into the running app (HMR), and
-**events** are the trace you debug and learn from (`integrations.learn`).
+a better program, a **learned program is a prop** (hot swap = a re-render,
+like HMR), and **events** are the trace you debug and learn from
+(`integrations.learn`).
 
 ```python
 from integrations import use_agent_call
@@ -728,8 +729,40 @@ train, val = split(data, val=0.3)
 result = optimize(router, trainset=train, valset=val, metric=exact_match("name"),
                   optimizer="gepa", budget=40, lm=lm, reflection_lm=lm)  # or mipro, bootstrap...
 print(result.report(), result.diff())        # score before -> after, instructions/demos diff
-result.save("artifacts/router.json"); result.hot_swap(app, "supervisor")
+result.save("artifacts/router.json")
 ```
+
+### Learned programs are props (HMR = re-render)
+
+A learned program is declared in the tree, like any other prop or context.
+Changing it re-renders the components that use it; nothing outside the tree
+mutates a module cache.
+
+```python
+from integrations.learn import LearnedProgram, LearnedPrograms, use_learned
+
+@component
+def Router():
+    router = use_module(RouteSig, arch="cot", name="supervisor",
+                        program=use_learned("supervisor"))   # None -> the baseline
+    ...
+
+LearnedProgram(key="supervisor", src="artifacts/router.json", children=[Router()])
+# many at once, e.g. at the root, fed by state/props:
+LearnedPrograms(programs={"supervisor": "artifacts/router.json", "coder": result},
+                children=[...])
+```
+
+- `src`: a result file (`integrations.learn.load`), an `OptimizationResult`, a program, or
+  `None`. `watch=True` polls the file and re-renders when it changes (off by default).
+- `program=` on `use_module` / `use_agent` / `use_agent_call` / `use_call` / `use_stream`
+  applies the learned state (instructions, demos) onto the component's own module: a ReAct
+  agent keeps its live tools. Back to `None` restores the baseline.
+- **Hot swap** = the provider's `src` changes. From outside the tree,
+  `result.hot_swap(app, "supervisor")` (and `:optimize`) update the state of the provider that
+  declares the name — `{name: path}`, one JSON-able value — and its users re-render with the
+  new program. Apps without a provider keep the old behavior (the module in the `DSPyEnv` is
+  replaced). In the tree, `use_learned_registry().set(name, src)` does the same.
 
 - **Architectures**: `use_module(sig, arch=..., **kw)` + `use_call`, or `use_agent_call(...)`;
   every arch has the same `Call` shape, `llm.*` events and cancellation (RLM runs in a worker
@@ -765,8 +798,8 @@ send_feedback(turn_id, 0.0, "should be shipping", expected={"name": "shipping"})
 data = dataset_from_events("runs/store.jsonl", "supervisor", require_feedback=True)
 optimize(router, trainset=..., valset=..., metric=route_metric, optimizer="gepa").save(path)
 
-# serve again: load the artifact and hot-swap it at boot
-load(path).hot_swap(app, "supervisor")
+# serve again: the artifact is a prop of the tree
+LearnedProgram(key="supervisor", src=path, children=[StoreRouter()])
 ```
 
 `uv run python -m examples.learn.05_durable_learning_loop all` runs the three
@@ -789,8 +822,9 @@ feedback` shows what it learned from.
    `evaluate(program, val, metric, lm=lm)` returns per-example rows with feedback.
 6. **Did it improve?** `result.report()` (baseline → score, LM calls) and `result.diff()`;
    GEPA: a reused `log_dir` is never resumed silently (`resume=True` to continue).
-7. **Is the new program live?** after `result.hot_swap(app, key)` / `:optimize`, `:modules`
-   shows `compiled swaps=1`, and the next `:explain` shows the new instructions.
+7. **Is the new program live?** after a new `src` / `result.hot_swap(app, key)` / `:optimize`,
+   `:modules` shows `compiled swaps=1`, `find_registries(app)` shows the provider's
+   `{name: path}`, and the next `:explain` shows the new instructions.
 
 ## OpenTelemetry: Langfuse and any OTLP backend
 
