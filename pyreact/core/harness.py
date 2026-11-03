@@ -17,7 +17,9 @@ recovery and telemetry without touching component code::
     install(timing)                                          # process-wide (e.g. telemetry libs)
 
 Order: process-wide middleware is outermost, then providers from the root
-down, then the innermost provider's list in order. A middleware may
+down, then the innermost provider's list in order, then the *innermost*
+layer (``install(mw, innermost=True)``: component-scoped hooks such as
+``pyreact.harness.use_guard``). A middleware may
 short-circuit (return without calling ``call_next``), call it again (retry,
 with ``b.attempt`` bumped), transform ``b.inputs`` / the result, or raise
 (:class:`Blocked` for guards).
@@ -207,22 +209,32 @@ def _name(mw: Any) -> str:
 # Process-wide middleware (outermost)
 # ---------------------------------------------------------------------------
 _global: List[Middleware] = []
+# Process-wide too, but placed after every provider (closest to the call):
+# the layer component-scoped hooks (use_guard / use_verify) dispatch from.
+_inner: List[Middleware] = []
 _global_lock = threading.Lock()
 
 
-def install(mw: Middleware) -> Callable[[], None]:
-    """Add process-wide middleware (outermost). Returns an uninstall function."""
+def install(mw: Middleware, *, innermost: bool = False) -> Callable[[], None]:
+    """Add process-wide middleware. Returns an uninstall function.
+
+    By default it is outermost (before every provider); ``innermost=True``
+    puts it after the providers instead, closest to the call (used by
+    component-scoped hooks, which filter on ``b.component`` themselves).
+    """
     with _global_lock:
-        _global.append(mw)
+        (_inner if innermost else _global).append(mw)
     return lambda: uninstall(mw)
 
 
 def uninstall(mw: Middleware) -> None:
     with _global_lock:
-        try:
-            _global.remove(mw)
-        except ValueError:
-            pass
+        for layer in (_global, _inner):
+            try:
+                layer.remove(mw)
+                return
+            except ValueError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +261,8 @@ def use_harness() -> Harness:
 
 def resolve_harness(scoped: Optional[Harness] = None) -> Harness:
     with _global_lock:
-        outer = list(_global)
-    return Harness([*outer, *(scoped.middleware if scoped is not None else [])])
+        outer, inner = list(_global), list(_inner)
+    return Harness([*outer, *(scoped.middleware if scoped is not None else []), *inner])
 
 
 def _current_component() -> Any:
