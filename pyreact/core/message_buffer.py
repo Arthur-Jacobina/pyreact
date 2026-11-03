@@ -21,10 +21,15 @@ class MessageBuffer:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self) -> None:
+    DEFAULT_MAX_CHARS = 1_000_000
+
+    def __init__(self, max_chars: Optional[int] = None) -> None:
         if getattr(self, "_initialized", False):
+            if max_chars is not None:
+                self.max_chars = max_chars
             return
 
+        self.max_chars: int = max_chars or self.DEFAULT_MAX_CHARS
         self._chunks: Deque[str] = deque()
         self._length: int = 0
         self._subs: List[Callable[[str], None]] = []
@@ -38,6 +43,9 @@ class MessageBuffer:
         with self._lock:
             self._chunks.append(text)
             self._length += len(text)
+            # Ring buffer: drop oldest chunks so long-running apps stay bounded
+            while self._length > self.max_chars and len(self._chunks) > 1:
+                self._length -= len(self._chunks.popleft())
 
         for cb in list(self._subs):
             try:

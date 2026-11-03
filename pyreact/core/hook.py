@@ -2,9 +2,20 @@
 from typing import Dict
 from weakref import WeakSet
 from .core import VNode
-from .runtime import schedule_rerender
-import asyncio
+from .runtime import schedule_rerender, report_error, spawn
+import inspect
 import warnings
+
+_MISSING = object()
+
+
+def _deps_key(deps):
+    # None -> "run/recompute on every render" (React semantics); [] -> () once.
+    return None if deps is None else tuple(deps)
+
+
+def _deps_changed(old, new):
+    return new is None or old != new
 
 
 class HookContext:
@@ -18,8 +29,11 @@ class HookContext:
             cls._services[key] = service
         return service
 
-    def __init__(self, name, component_fn, *, props=None, key=None) -> None:
+    def __init__(self, name, component_fn, *, props=None, key=None, parent=None) -> None:
         self.name = name
+        self.parent = parent
+        # Values provided to descendants by this node: {context_key: value}
+        self._provided: dict = {}
         self.component_fn = component_fn
         self.props = props or {}
         self.key = key
@@ -106,7 +120,7 @@ class HookContext:
         return state, dispatch  # return the pair (state, dispatch)
 
     def use_effect(self, effect_fn, deps):
-        deps_key = None if deps is None else tuple(deps)  # [] → () (immutable object)
+        deps_key = _deps_key(deps)
         idx = self.hook_idx
 
         if idx >= len(self.hooks):  # first mount
@@ -115,21 +129,21 @@ class HookContext:
             self._effect_slots.add(idx)
         else:  # updates
             old_cleanup, old_deps = self.hooks[idx]
-            if deps_key is not None and old_deps != deps_key:  # deps changed
+            if _deps_changed(old_deps, deps_key):  # deps changed (or no deps)
                 self.effects.append((effect_fn, deps_key, idx))
                 self.hooks[idx] = (old_cleanup, deps_key)
 
         self.hook_idx += 1
 
     def use_callback(self, fn, deps=None):
-        deps_key = None if deps is None else tuple(deps)  # [] -> () (immutable object)
+        deps_key = _deps_key(deps)
         idx = self.hook_idx
 
         if idx >= len(self.hooks):  # first time
             self.hooks.append((fn, deps_key))
         else:
             cached_fn, old_deps = self.hooks[idx]
-            if deps_key is not None and old_deps != deps_key:
+            if _deps_changed(old_deps, deps_key):
                 self.hooks[idx] = (fn, deps_key)  # deps changed -> new fn
             else:
                 fn = cached_fn  # use memo
@@ -138,23 +152,38 @@ class HookContext:
         return fn
 
     def use_memo(self, factory, deps=None):
-        deps_key = None if deps is None else tuple(deps)  # [] → () (immutable object)
+        deps_key = _deps_key(deps)
         idx = self.hook_idx
 
         if idx >= len(self.hooks):  # first time
             self.hooks.append((factory(), deps_key))
         else:
             value, old_key = self.hooks[idx]
-            if deps_key is not None and old_key != deps_key:
+            if _deps_changed(old_key, deps_key):
                 value = factory()  # deps changed -> new value
                 self.hooks[idx] = (value, deps_key)
 
         self.hook_idx += 1
         return self.hooks[idx][0]
 
-    def use_context(self, ctx_like):
-        ctx = getattr(ctx_like, "_ctx", ctx_like)
+    def provide(self, ctx_like, value):
+        """Expose ``value`` for ``ctx_like`` to this node's descendants."""
+        key = getattr(ctx_like, "_ctx", ctx_like)
+        self._provided[key] = value
 
+    def _lookup_context(self, ctx_like):
+        key = getattr(ctx_like, "_ctx", ctx_like)
+        node = self.parent
+        while node is not None:
+            value = node._provided.get(key, _MISSING)
+            if value is not _MISSING:
+                return value
+            node = node.parent
+        # No provider above us: fall back to the context's global value.
+        getter = getattr(ctx_like, "get", None) or getattr(key, "get")
+        return getter()
+
+    def use_context(self, ctx_like):
         subscribe = getattr(ctx_like, "_subscribe", None)
         if subscribe is not None:
             subscribe(self)
@@ -166,27 +195,32 @@ class HookContext:
                 self._ctx_subs.append(subs_set)
 
         idx = self.hook_idx
-        value = ctx.get()
+        # Resolve against the nearest provider among our ancestors. This is
+        # independent of render order / task, so an isolated rerender of a
+        # deep child sees the same value as a full rerender.
+        value = self._lookup_context(ctx_like)
 
         if idx >= len(self.hooks):
             self.hooks.append(value)
-        elif self.hooks[idx] != value:
+        else:
             self.hooks[idx] = value
-            schedule_rerender(self, reason="use_context value changed")
 
         self.hook_idx += 1
         return value
 
+    def _call_cleanup(self, cleanup):
+        if not cleanup:
+            return
+        try:
+            res = cleanup()
+            if inspect.isawaitable(res):
+                spawn(res, owner=self, name=f"{self.name}:cleanup")
+        except Exception as exc:
+            report_error(exc, self, "cleanup")
+
     def _run_cleanup_slot(self, slot):
         cleanup = slot[0] if isinstance(slot, tuple) else None
-        if cleanup:
-            try:
-                if asyncio.iscoroutinefunction(cleanup):
-                    asyncio.create_task(cleanup())
-                else:
-                    cleanup()
-            except Exception:
-                pass
+        self._call_cleanup(cleanup)
 
     def unmount(self):
         for idx in list(getattr(self, "_effect_slots", set())):
@@ -237,8 +271,13 @@ class HookContext:
             old_children = self.children
             self.children = []
 
-            # 2. execute component function
-            output = self.component_fn(__internal=True, **self.props)
+            # 2. execute component function. On failure keep the previous
+            #    subtree mounted (last good render) instead of leaking it.
+            try:
+                output = self.component_fn(__internal=True, **self.props)
+            except BaseException:
+                self.children = old_children
+                raise
             vnodes = output if isinstance(output, list) else [output]
 
             # 3. reconciliation – reuse or create child contexts
@@ -283,6 +322,7 @@ class HookContext:
                         vnode.component_fn,
                         props=vnode.props,
                         key=vnode.key,
+                        parent=self,
                     )
                 else:
                     matched.props = vnode.props
@@ -294,9 +334,13 @@ class HookContext:
                 if orphan not in self.children:
                     orphan.unmount()
 
-            # 7. recursively render current children
+            # 7. recursively render current children; a failing child must
+            #    not take down its siblings (per-component error boundary).
             for child in self.children:
-                child.render()
+                try:
+                    child.render()
+                except Exception as exc:
+                    report_error(exc, child, "render")
         finally:
             try:
                 exit_render(_depth_token)
@@ -306,20 +350,44 @@ class HookContext:
             core._context_stack.reset(token)
 
     async def run_effects(self):
-        for fx, deps, idx in self.effects:
+        effects, self.effects = self.effects, []
+        for fx, deps, idx in effects:
+            if not self._mounted or idx >= len(self.hooks):
+                break
             cln, _ = self.hooks[idx]
-            if cln:
-                if asyncio.iscoroutinefunction(cln):
-                    await cln()
-                else:
-                    cln()
-            res = fx()
-            if asyncio.iscoroutine(res):
-                res = await res
+            self.hooks[idx] = (None, deps)
+            self._call_cleanup(cln)
+            try:
+                res = fx()
+            except Exception as exc:
+                report_error(exc, self, "effect")
+                continue
+            if inspect.isawaitable(res):
+                # Async effects run in the background so a slow effect (LLM
+                # call, tool, I/O) never blocks other renders. The stored
+                # cleanup cancels the task if it is still running when deps
+                # change or the component unmounts.
+                task = spawn(res, owner=self, name=f"{self.name}:effect[{idx}]")
+                res = self._make_task_cleanup(task)
             self.hooks[idx] = ((res if callable(res) else None), deps)
 
-        for ch in self.children:
-            await ch.run_effects()
+        for ch in list(self.children):
+            try:
+                await ch.run_effects()
+            except Exception as exc:
+                report_error(exc, ch, "effect")
+
+    def _make_task_cleanup(self, task):
+        def _cleanup():
+            if not task.done():
+                task.cancel()
+                return None
+            if task.cancelled() or task.exception() is not None:
+                return None
+            inner = task.result()
+            return inner() if callable(inner) else None
+
+        return _cleanup
 
     # FOR DEBUGGING
     def render_tree(self, indent=0):
