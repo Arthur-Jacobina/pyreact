@@ -59,13 +59,13 @@ Key pieces:
 - Agents can drive navigation imperatively (e.g., after an effect completes) by calling `navigate(...)` from `use_navigate`.
 
 ### 9) Turns ↔ Conversation steps
-- Every submitted input (`AppRunner.invoke`, terminal, web) becomes a `Turn(id, index, text, source, ts)`; `invoke`/`ainvoke` return the turn id and InputBus events carry `turn_id`.
+- Every submitted input (`root.send` / `AppRunner.invoke`, terminal, web) becomes a `Turn(id, index, text, source, ts)`; `send`/`asend` (`invoke`/`ainvoke`) return the turn id and InputBus events carry `turn_id`.
 - The `TurnManager` service (`"turns"`, `pyreact/core/turns.py`) publishes `turn.start` / `turn.end` (`{"status": "done"|"interrupted"|"error"|"blocked", "duration"}`) on the `EventBus`. A turn ends when there are no queued renders and no pending tasks spawned during it (`runtime.spawn(..., turn=...)` tags tasks; default: the current turn; `turn=None` opts out).
-- Policy: `bootstrap(App, turn_policy="queue")` (default; inputs are answered one at a time, in order) or `"interrupt"` (a new input cancels the in-flight turn). A component overrides it for its own (and its descendants') work with `use_turn(policy="interrupt"|"queue")`.
+- Policy: `create_root(App, turn_policy="queue")` (default; inputs are answered one at a time, in order) or `"interrupt"` (a new input cancels the in-flight turn). A component overrides it for its own (and its descendants') work with `use_turn(policy="interrupt"|"queue")`.
 - `use_turn()` (from `pyreact.core`) returns the latest turn and rerenders on each new one, so a repeated identical message still triggers effects keyed on the turn. `Keystroke(on_submit=fn)` calls `fn(text)` or `fn(text, turn)`.
 - **Handle each input once**: `use_state` drops a value equal to the current one, so don't store the submitted text to trigger work (two identical inputs would look like one). Key the work on the turn instead: `use_on_turn(lambda turn: call.run(question=turn.text))` calls the handler once per turn after commit (async handlers are part of the turn), and `Message(..., trigger="turn")` publishes once per `(turn, text)` (the default `trigger="change"` dedupes on text).
 - **Conditionally mounted components**: a component mounted *during* a turn gets that in-flight turn from `use_turn()` (right for a child mounted to answer it). A component that should only react to *later* inputs (a page shown by a navigation, a panel opened by a command) uses `use_turn(since_mount=True)` / `use_on_turn(fn, since_mount=True)`, which skip the turn that mounted it.
-- `app.invoke(text, wait=True)` blocks until that turn ends; `app.wait_turn(turn_id)` waits for an earlier one.
+- `root.send(text, wait=True)` blocks until that turn ends; `root.wait_turn(turn_id)` waits for an earlier one.
 - Turn ids are `t1`, `t2`, ... per session (non-default sessions prefix them with `<session id>/`). A process restart starts again at `t1`; to keep ids unique across restarts, configure the session's `TurnManager` with `id_factory=lambda i: f"t-{run_id}-{i}"` or call `turns.advance_to(n)` (`pyreact_durable.Durable` does the latter from its log).
 
 ### 10) Durable memory ↔ Persistence at the border
@@ -429,10 +429,13 @@ ErrorBoundary(
 can be re-run with the same id and text:
 
 ```python
-app = bootstrap(App)                        # App mounts Durable(log=...) + durable_lm
-app.resume_pending(wait=True)               # {session_id: [turn ids]}
-session.resume_turn("t7")                   # one turn (also an interrupted one)
+root = create_root(App, session_id="chat")  # App mounts Durable(log=...) + durable_lm
+root.session.resume_pending(wait=True)      # [turn ids]; root.session: the low-level side
+root.session.resume_turn("chat/t7")         # one turn (also an interrupted one)
 ```
+
+(`examples/harness/02_resilient_agent.py` does this after a `kill -9`. A
+suspended root needs none of it: `hydrate_root` re-runs the turn it carried.)
 
 The core only defines the hook: a `TurnStore` (`on_turn_start`,
 `on_turn_end`, `pending()`, optional `get(turn_id)`) set with
@@ -661,8 +664,11 @@ In your own app, pass any `dspy.LM` to `DSPyProvider(lm=...)` or
 
 ### 2. Run the Project
 
-Run from the repository root (examples are a package). In the terminal every
-line is a turn; `:help` lists the dev commands (`:events`, `:usage`, `:turns`,
+Run from the repository root (examples are a package). Every example talks to
+its tree through a root (`create_root(App)`, `root.send(...)`, `root.ref(name)`)
+and prints its output from `Message` components; `examples/_devtools.py` is the
+terminal loop (`run_repl(root)`) and the one place that traces events. In the
+terminal every line is a turn; `:help` lists the dev commands (`:events`, `:usage`, `:turns`,
 `:route`, `:nav`, `:q`). Only `:` starts a terminal command: `/word` lines (and
 unknown `:word` commands) are app input, so apps can own their slash commands.
 

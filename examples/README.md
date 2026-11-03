@@ -3,6 +3,16 @@
 Every example is a short, runnable program that teaches one idea. Run them
 from the repository root with `uv run python -m examples.<name>`.
 
+**They read like React apps** ([ADR 0001](../docs/adr/0001-look-like-react.md)):
+the tree is the source of truth; outside code only talks to its **root**
+(`create_root(App)`, `root.send(text)`, `root.ref(name)`, `root.suspend()`,
+`hydrate_root(App, ...)`); components use hooks, never the service locator;
+output is `Message` components; side effects live in effects; a learned program is a `LearnedProgram(src=...)` prop. The shared
+[`_devtools.py`](_devtools.py) is the terminal loop (`run_repl(root)`, `:`
+commands included) and the one place that subscribes to events
+(`trace(root, kinds)`, `collect(root, kinds)`). `tests/test_examples_react_style.py`
+enforces it.
+
 **LM switch.** All examples get their model from `examples/_lm.py`:
 
 | `PYREACT_EXAMPLE_LM` | Model | Notes |
@@ -18,7 +28,7 @@ from the repository root with `uv run python -m examples.<name>`.
 
 | Read | Example | Idea |
 |---|---|---|
-| 1 | `message` | An agent's output is an *event* (`Message`), not a print |
+| 1 | `message` | An agent's output is a `Message` component (an event), not a print; `create_root` + `run_repl` |
 | 2 | `log` | Write your own output component: an effect that publishes an event |
 | 3 | `qa_guardrail` | Composition with `children`: a checker agent decides whether its children run |
 | 4 | `router_app` | Pages are routes; an LLM turns free text into a navigation |
@@ -31,9 +41,9 @@ from the repository root with `uv run python -m examples.<name>`.
 
 | Example | Idea | LLM |
 |---|---|---|
-| `durable.01_counter` | `use_persistent_state` / `use_persistent_reducer`: run it twice, the count is still there | no |
+| `durable.01_counter` | `use_persistent_state` / `use_persistent_reducer`: run it twice, the count (a `Message`) is still there | no |
 | `durable.02_branches_sqlite` | SQLite backend; branches as a feature (`/label`, `/checkout`, `/fork`, `/tree`) | no |
-| `durable.03_web_sessions` | Each browser tab has its own durable log (`Durable(log_factory=...)`) | yes |
+| `durable.03_web_sessions` | Each browser tab has its own durable log (`Durable(log_factory=...)`); the transcript is rendered, so a reload shows it again | yes |
 | `durable.04_llm_chat` | Everything: conversation, branches, `durable_lm` replay after a crash | yes |
 
 Inspect any log while the app runs: `uv run python -m pyreact_durable show <file>`.
@@ -42,7 +52,7 @@ Inspect any log while the app runs: `uv run python -m pyreact_durable show <file
 
 | Example | Idea | LLM |
 |---|---|---|
-| `harness.02_resilient_agent` | Flaky tool + flaky/slow model, simulated deterministically: `retry` with backoff and `Retry-After`, `timeout`, `circuit_breaker` opening and closing, `fallback_model`, an `ErrorBoundary` fallback message, then `kill -9` mid-turn and `resume_pending()` with `durable_lm` replay | yes (6 calls) |
+| `harness.02_resilient_agent` | Flaky tool + flaky/slow model, simulated deterministically: `retry` with backoff and `Retry-After`, `timeout`, `circuit_breaker` opening and closing, `fallback_model`, an `ErrorBoundary` fallback message, then `kill -9` mid-turn and the same root (`session_id`) resuming the turn with `durable_lm` replay | yes (6 calls) |
 
 See [Error recovery](../README.md#error-recovery) in the main README.
 
@@ -50,13 +60,13 @@ See [Error recovery](../README.md#error-recovery) in the main README.
 
 | Example | Idea | LLM |
 |---|---|---|
-| `sandbox.01_coding_agent` | A ReAct agent writes and runs code in a Docker sandbox (`sandbox_tools`); `--resume` restores the sandbox after a restart (`--driver local` = no Docker, not isolated) | yes |
+| `sandbox.01_coding_agent` | A ReAct agent writes and runs code in a Docker sandbox (`sandbox_tools`); `--resume` (a new root, same `session_id`) restores the sandbox after a restart (`--driver local` = no Docker, not isolated) | yes |
 
 ## Stateful agents (`examples/stateful/`)
 
 | Example | Idea | LLM |
 |---|---|---|
-| `stateful.01_suspend_resume` | A coding agent (sandbox tools, durable conversation, a learned prompt) is **suspended mid-turn** into one manifest; a **new process** resumes it: the conversation, the sandbox files, the learned prompt and the cut turn come back, and the turn's answered LLM calls are replayed from the log (`--demo` runs both processes; `--driver local` = no Docker) | yes (≤ 15 calls) |
+| `stateful.01_suspend_resume` | A coding agent (sandbox tools, durable conversation, a `LearnedProgram` prompt) is **suspended mid-turn** (`root.suspend(on_active="interrupt")`) into a snapshot; a **new process** `hydrate_root`s it: the conversation, the sandbox files, the learned prompt and the cut turn come back, and the turn's answered LLM calls are replayed from the log (`--demo` runs both processes; `--driver local` = no Docker) | yes (≤ 15 calls) |
 
 See [Stateful agents](../README.md#stateful-agents-roots-use_dehydrate-activity) in the main README.
 
@@ -66,16 +76,16 @@ See [Stateful agents](../README.md#stateful-agents-roots-use_dehydrate-activity)
 |---|---|
 | `learn.01_architectures` | The architecture is a prop: `predict`, `cot`, `rlm` on the same signature |
 | `learn.02_optimizers` | Optimizers are build steps: bootstrap vs mipro vs gepa on one dataset and metric |
-| `learn.03_live_feedback_loop` | Rate answers (`:feedback`), `:optimize`, hot-swap into the running app |
+| `learn.03_live_feedback_loop` | Rate answers (`:feedback`), `:optimize`: the result becomes the `LearnedProgram`'s new `src` in the running app (a re-render) |
 | `learn.04_custom_architecture_and_optimizer` | Register your own architecture and optimizer |
 | `learn.05_durable_learning_loop` | The whole loop across restarts: serve → journal → learn with GEPA → serve better |
-| `optimize_router` | The GEPA run behind `artifacts/router_gepa.json`, plus a live hot-swap demo |
+| `optimize_router` | The GEPA run behind `artifacts/router_gepa.json`, plus a live hot swap: `root.ref("learned").swap(program)` re-renders `LearnedProgram(src=...)` |
 
 ## Guards & verification (`examples/harness/`)
 
 | Example | Idea | LLM |
 |---|---|---|
-| `harness.01_guarded_agent` | A tool agent wrapped by guards (PII redaction, tool allowlist, per-turn token budget) and a schema/assert verifier that retries with feedback; prints every decision | yes (≤ 10 calls) |
+| `harness.01_guarded_agent` | A tool agent wrapped by guards (PII redaction, tool allowlist, per-turn token budget) and a schema/assert verifier that retries with feedback; traces every decision | yes (≤ 10 calls) |
 
 ## Paths through the examples
 
