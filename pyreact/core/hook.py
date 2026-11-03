@@ -55,6 +55,18 @@ class _ServiceAccessor:
         return _session_get_service
 
 
+class Ref:
+    """Mutable box returned by :meth:`HookContext.use_ref`: ``ref.current``."""
+
+    __slots__ = ("current",)
+
+    def __init__(self, current=None) -> None:
+        self.current = current
+
+    def __repr__(self) -> str:
+        return f"Ref({self.current!r})"
+
+
 class HookContext:
     # Process-global services (class-level ``HookContext.get_service`` calls).
     _services: Dict = {}
@@ -135,6 +147,18 @@ class HookContext:
 
         self.hook_idx += 1
         return self.hooks[idx], set_state
+
+    def use_ref(self, initial=None) -> Ref:
+        """A :class:`Ref` whose ``.current`` starts as ``initial`` and then
+        persists for the component's lifetime (React ``useRef``): the same
+        object every render; mutating ``.current`` does not rerender. For
+        "latest value" boxes read by callbacks/effects, handles, counters.
+        """
+        idx = self.hook_idx
+        if idx >= len(self.hooks):
+            self.hooks.append(Ref(initial))
+        self.hook_idx += 1
+        return self.hooks[idx]
 
     def use_reducer(self, reducer, initial, *, init_fn=None, deps=None):
         """

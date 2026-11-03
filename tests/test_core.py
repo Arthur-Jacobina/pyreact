@@ -234,3 +234,32 @@ def test_providers_are_transparent_in_paths():
     assert seen["provider"] == ("App/MyProvider[mine]", "App/_Provider[#0]/MyProvider[mine]")
     # ordinary components still contribute a segment
     assert seen["b"][0] == "App/Box[box]/Leaf[#0]"
+
+
+def test_use_ref_is_stable_and_does_not_rerender():
+    from pyreact.core import Ref
+
+    refs, renders = [], []
+    bump = {}
+
+    @component
+    def App():
+        ref = hooks.use_ref(0)
+        n, set_n = hooks.use_state(0)
+        bump["set"] = set_n
+        bump["ref"] = ref
+        refs.append(ref)
+        renders.append(ref.current)
+        return []
+
+    async def main():
+        await _mount(App)
+        bump["ref"].current = 41  # mutation alone: no rerender
+        await _flush()
+        assert len(renders) == 1
+        bump["set"](1)
+        await _flush()
+
+    asyncio.run(main())
+    assert isinstance(refs[0], Ref) and refs[0] is refs[1]
+    assert renders == [0, 41]  # initial ignored after mount
