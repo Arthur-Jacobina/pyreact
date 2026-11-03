@@ -1,4 +1,6 @@
-"""Durable chat: memory that survives restarts, with branches you can switch.
+"""04 - Everything together: an LLM chat with durable, branchable memory.
+
+The "full" example (01-03 teach the pieces one at a time):
 
 - the transcript is ``use_conversation()`` — persisted in a pi-style JSONL
   session log through the ``Durable`` provider (``pyreact_durable``)
@@ -16,11 +18,14 @@
 Run from the repo root (Ctrl+C / ``:q`` to quit; kill it any way you like,
 then start it again — it remembers):
 
-    uv run python -m examples.durable_chat [--log artifacts/durable_chat.jsonl]
+    uv run python -m examples.durable.04_llm_chat [--log runs/durable/chat.jsonl]
 
 Inspect the file from another terminal:
 
-    uv run python -m pyreact_durable show artifacts/durable_chat.jsonl
+    uv run python -m pyreact_durable show runs/durable/chat.jsonl
+    uv run python -m pyreact_durable events runs/durable/chat.jsonl --kind llm.*
+
+End-to-end check (kill -9, branches, LM replay): ``uv run python scripts/e2e_durable.py``.
 
 LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
 """
@@ -46,10 +51,11 @@ from pyreact_durable import (
 from pyreact_durable.__main__ import render_tree
 
 from examples._lm import example_lm
+
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
 SMOKE = {"args": ["--log", "{tmp}/chat.jsonl"], "stdin": "my name is Ada\n/label base\nwhat is my name?\n/history\n/tree\n:q\n"}
 
-DEFAULT_LOG = "artifacts/durable_chat.jsonl"
+DEFAULT_LOG = "runs/durable/chat.jsonl"
 
 
 class ChatSig(dspy.Signature):

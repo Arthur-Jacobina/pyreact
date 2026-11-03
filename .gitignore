@@ -217,3 +217,6 @@ secrets.json
 
 # NiceGUI specific
 nicegui.log
+
+# example run logs (durable session logs, sqlite + lock files)
+runs/

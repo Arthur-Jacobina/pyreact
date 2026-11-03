@@ -65,7 +65,7 @@ Key pieces:
 - `Durable(log="chat.jsonl", children=[...])` provides a pi-style append-only JSONL session log (a tree: branches, labels, checkpoints) and journals `EventBus` events into it.
 - `use_persistent_state(initial, key=...)`, `use_persistent_reducer`, `use_conversation()` are `use_state`-like hooks restored from the log; `use_durable()` exposes it for `label` / `checkout` / `fork_file`.
 - `durable_lm(lm, log)` journals LM calls so re-running a turn after a crash replays the answer instead of calling the model again.
-- Inspect files with `python -m pyreact_durable show chat.jsonl`; try `uv run python -m examples.durable_chat`.
+- Inspect files with `python -m pyreact_durable show chat.jsonl`; examples (short to full) in [`examples/durable/`](examples/durable/): `01_counter` (hello world), `02_branches_sqlite` (SQLite, labels/checkout/fork), `03_web_sessions` (one log per browser tab), `04_llm_chat` (LLM + branches + LM replay).
 
 ### Lifecycle overview
 1. A root agent (component) is wrapped in a `HookContext` by the runner.
@@ -130,8 +130,9 @@ uv run python -m examples.main_terminal
 # Tool-calling multi-agent store (terminal)
 uv run python -m examples.main_tools
 
-# Chat with durable, branchable memory (see pyreact_durable/README.md)
-uv run python -m examples.durable_chat
+# Durable memory, smallest first (see pyreact_durable/README.md)
+uv run python -m examples.durable.01_counter
+uv run python -m examples.durable.04_llm_chat
 ```
 
 ### Tests
