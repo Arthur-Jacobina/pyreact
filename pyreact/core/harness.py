@@ -266,10 +266,13 @@ def resolve_harness(scoped: Optional[Harness] = None) -> Harness:
 
 
 def _current_component() -> Any:
-    from .core import _context_stack
+    # The owner first (like runtime.current_component): a task spawned for a
+    # component (e.g. a use_call fired from *another* component's effect)
+    # belongs to that component, even though it inherited the effect's
+    # render-context var.
     from . import runtime
 
-    return _context_stack.get() or runtime.current_owner.get()
+    return runtime.current_component()
 
 
 def _scoped_from(ctx: Any) -> Optional[Harness]:
