@@ -165,18 +165,18 @@ def _render_result(result, loading, error):
 
 
 @component
-def CatalogAgent(question: str):
+def CatalogAgent(question: str, turn: int = 0):
     call, result, loading, error = use_dspy_agent(
         CatalogSig,
         tools=["list_products", "search_products", "lookup_price"],
         model="reasoning",
     )
-    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question])
+    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
     return _render_result(result, loading, error)
 
 
 @component
-def ShippingAgent(question: str):
+def ShippingAgent(question: str, turn: int = 0):
     # A local tool (cf. use_callback) alongside the provider tools.
     free_shipping = use_tool(
         lambda total: total >= 100,
@@ -187,16 +187,16 @@ def ShippingAgent(question: str):
     call, result, loading, error = use_dspy_agent(
         ShippingSig, tools=["estimate_shipping", free_shipping], model="reasoning"
     )
-    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question])
+    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
     return _render_result(result, loading, error)
 
 
 @component
-def OrderAgent(question: str):
+def OrderAgent(question: str, turn: int = 0):
     call, result, loading, error = use_dspy_agent(
         OrderSig, tools=["check_stock", "place_order"], model="reasoning"
     )
-    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question])
+    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
     return _render_result(result, loading, error)
 
 
@@ -208,7 +208,7 @@ SPECIALIST_COMPONENTS = {
 
 
 @component
-def SupervisorAgent(*, message: str, on_route: Callable[[str, str, int], None]):
+def SupervisorAgent(*, message: str, turn: int, on_route: Callable[[str, str, int], None]):
     # Classifier agent (no tools) that picks a specialist, like RouterAgent.
     choose_mod = use_dspy_module(RouteSpecialistSig, dspy.ChainOfThought, name="supervisor")
     call_llm, llm_result, llm_loading, _error = use_dspy_call(choose_mod, model="fast")
@@ -218,7 +218,7 @@ def SupervisorAgent(*, message: str, on_route: Callable[[str, str, int], None]):
             return
         call_llm(message=message, specialists=SPECIALISTS)
 
-    hooks.use_effect(_decide, [message])
+    hooks.use_effect(_decide, [message, turn])
 
     def _emit():
         if llm_result is None or llm_result[0] is None:
@@ -235,19 +235,21 @@ def SupervisorAgent(*, message: str, on_route: Callable[[str, str, int], None]):
 
 @component
 def StoreHome():
-    last_message, set_last_message = hooks.use_state("")
-    active, set_active = hooks.use_state(None)  # (name, question)
+    # (turn, text): the turn counter makes a repeated identical message a new
+    # turn instead of a no-op state update.
+    (turn, last_message), set_last_message = hooks.use_state((0, ""))
+    active, set_active = hooks.use_state(None)  # (name, question, ver)
     handled_ver, set_handled_ver = hooks.use_state(-1)
 
     def on_enter(line: str):
         if line.strip():
-            set_last_message(line)
+            set_last_message(lambda prev: (prev[0] + 1, line))
 
     def on_route(name: str, message: str, ver: int):
         if ver == handled_ver or name not in SPECIALIST_COMPONENTS:
             return
         set_handled_ver(ver)
-        set_active((name, message))
+        set_active((name, message, ver))
 
     children = [
         Message(
@@ -257,11 +259,11 @@ def StoreHome():
             message_type="info",
         ),
         Keystroke(key="store_input", on_submit=on_enter),
-        SupervisorAgent(key="supervisor", message=last_message, on_route=on_route),
+        SupervisorAgent(key="supervisor", message=last_message, turn=turn, on_route=on_route),
     ]
 
     if active is not None:
-        name, question = active
+        name, question, ver = active
         Specialist = SPECIALIST_COMPONENTS[name]
         children.append(
             Message(
@@ -271,7 +273,7 @@ def StoreHome():
                 message_type="info",
             )
         )
-        children.append(Specialist(key=f"specialist-{name}", question=question))
+        children.append(Specialist(key=f"specialist-{name}", question=question, turn=ver))
 
     return children
 

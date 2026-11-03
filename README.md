@@ -104,12 +104,23 @@ python -c "import os; print('API Key configured:', bool(os.getenv('OPENAI_API_KE
 
 After configuring the API key, run the project:
 
-```bash
-# For web version
-python main_web.py
+Run from the repository root (examples are a package):
 
-# For terminal version
-python main_terminal.py
+```bash
+# Web version
+uv run python -m examples.main_web
+
+# Terminal version
+uv run python -m examples.main_terminal
+
+# Tool-calling multi-agent store (terminal)
+uv run python -m examples.main_tools
+```
+
+### Tests
+
+```bash
+uv run pytest
 ```
 
 ## Troubleshooting

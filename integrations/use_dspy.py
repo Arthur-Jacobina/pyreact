@@ -4,6 +4,7 @@ from typing import Optional, Any
 import inspect
 import dspy
 from pyreact.core.core import hooks
+from pyreact.core.runtime import spawn
 from integrations.dspy_integration import use_dspy_env
 
 
@@ -11,8 +12,10 @@ def use_dspy_call(
     module, *, model: Optional[str] = None, lm: Optional[Any] = None
 ) -> tuple[Callable[..., None], tuple, bool, Optional[Exception]]:
     """
-    Policy: replace (the last call wins).
-    Returns (run, result, loading, error). Forces an update after each success via 'ver'.
+    Policy: replace (the last call wins; the previous in-flight call is cancelled).
+    Returns (run, result, loading, error) where ``result`` is ``(prediction, ver)``.
+    ``ver`` increases only when a call settles (success or error), so effects
+    that depend on ``result`` fire exactly once per completed call.
     """
 
     def reducer(state, action):
@@ -22,21 +25,21 @@ def use_dspy_call(
                 "status": "loading",
                 "result": state["result"],
                 "error": None,
-                "ver": state["ver"] + 1,
+                "ver": state["ver"],
             }
         if typ == "success":
             return {
                 "status": "idle",
                 "result": action["result"],
                 "error": None,
-                "ver": state["ver"],
+                "ver": state["ver"] + 1,
             }
         if typ == "error":
             return {
                 "status": "idle",
                 "result": None,
                 "error": action["error"],
-                "ver": state["ver"],
+                "ver": state["ver"] + 1,
             }
         return state
 
@@ -49,6 +52,9 @@ def use_dspy_call(
     def _mount_cleanup():
         def _un():
             alive_ref["alive"] = False
+            t = task_ref["task"]
+            if t is not None and not t.done():
+                t.cancel()
 
         return _un
 
@@ -117,8 +123,11 @@ def use_dspy_call(
                 dispatch({"type": "error", "error": e})
 
     def _run(**inputs):
+        prev = task_ref["task"]
+        if prev is not None and not prev.done():
+            prev.cancel()  # superseded: don't keep paying for a stale LLM call
         dispatch({"type": "start"})
-        t = asyncio.create_task(_do_call(inputs))
+        t = spawn(_do_call(inputs), name="dspy_call")
         task_ref["task"] = t
 
     run = hooks.use_callback(_run, deps=[id(module)])
