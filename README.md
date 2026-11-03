@@ -628,7 +628,7 @@ Before roots, libraries plugged state into `Session.suspend()` /
 `AppRunner.resume()` as *participants* writing a `pyreact.manifest/1`:
 
 ```python
-app = AppRunner(App, participants=[SandboxParticipant],   # DeprecationWarning
+app = AppRunner(App, participants=[MyParticipant],        # DeprecationWarning
                 manifest_store=DirectoryManifestStore("runs/manifests"))
 manifest = app.open_session("agent-1").suspend()  # DeprecationWarning -> root.suspend()
 s = app.resume("agent-1")                         # DeprecationWarning -> hydrate_root(...)
@@ -638,10 +638,10 @@ They are kept for one release as thin wrappers over the root machinery
 (same events; the manifest carries the tree's slices in
 `manifest["slices"]` and the turns in `participants.turns`), and
 `participants=` / `add_participant` / `session.suspend` / `app.resume` warn
-(`DeprecationWarning`, pointing to ADR 0001). `DurableParticipant` and
-`CompiledModulesParticipant` have been removed (`Durable`, `DSPyProvider` and
-`LearnedProgram` dehydrate themselves); `SandboxParticipant(mode=...)` still overrides
-the suspend policy. `idle_policy="suspend"` / `auto_resume` keep working
+(`DeprecationWarning`, pointing to ADR 0001). The library
+participants (`DurableParticipant`, `CompiledModulesParticipant`,
+`SandboxParticipant`) have been removed: `Durable`, `DSPyProvider` /
+`LearnedProgram` and `use_sandbox` dehydrate themselves. `idle_policy="suspend"` / `auto_resume` keep working
 without warnings. Use roots in new code.
 
 ## Running the examples

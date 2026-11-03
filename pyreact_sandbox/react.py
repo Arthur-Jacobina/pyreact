@@ -105,11 +105,6 @@ __all__ = [
 ON_CLOSE = ("destroy", "suspend", "snapshot", "keep")
 _PREVIEW = 400
 
-# Deprecated session services (pyreact_sandbox.stateful.SandboxParticipant,
-# kept for one release): handles now dehydrate through use_dehydrate.
-HANDLES_SERVICE = "pyreact_sandbox.handles"  # {store key: SandboxHandle} of the session
-RESTORE_SERVICE = "pyreact_sandbox.restore"  # {store key: record} from a legacy manifest
-
 # How long a dehydrate waits for the suspend close (snapshot / pause) of a handle.
 SUSPEND_CLOSE_TIMEOUT = 600.0
 
@@ -273,8 +268,6 @@ class SandboxHandle:
         self.restore_record: Optional[Dict[str, Any]] = None
         # where that slice was (path, key): for hydration.mismatch reports
         self.restore_origin: Optional[tuple] = None
-        # close policy forced for a suspend (deprecated SandboxParticipant)
-        self.suspend_policy: Optional[str] = None
         self.closed_policy: Optional[str] = None  # the policy close applied
         self.close_future: Optional[concurrent.futures.Future] = None
         self._create_lock: Optional[asyncio.Lock] = None
@@ -348,7 +341,7 @@ class SandboxHandle:
             return sb
 
     def _degrade(self, reason: str, **info: Any) -> None:
-        """A snapshot (or legacy manifest) said how to bring this sandbox
+        """A snapshot said how to bring this sandbox
         back and it could not be done: a ``hydration.mismatch`` (on the
         slice it came from) and ``session.resume.degraded``."""
         fn = getattr(self.session, "degrade", None)
@@ -391,8 +384,6 @@ class SandboxHandle:
 
     def suspend_close_policy(self) -> str:
         """The close policy a suspend applies (see :func:`resolve_policy`)."""
-        if self.suspend_policy is not None:
-            return self.suspend_policy
         return resolve_policy(self.on_close, "suspend")
 
     async def adehydrate(self, timeout: float = SUSPEND_CLOSE_TIMEOUT) -> Optional[Dict[str, Any]]:
@@ -917,8 +908,7 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
     - ``ref``: also expose the handle through
       :func:`~pyreact.core.use_imperative_handle` -- a ``Ref`` /
       callback, or a name: ``use_sandbox(ref="sandbox")`` registers it in
-      the session's refs registry (``root.ref("sandbox")``) instead of
-      reaching into ``session.services[HANDLES_SERVICE]``.
+      the session's refs registry (``root.ref("sandbox")``).
 
     The record key in the store is ``"<session id>/<key>"``.
 
@@ -964,9 +954,6 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
         eff_spec = env.spec
     drv = get_driver(driver) if driver is not None else env.driver
 
-    registry = hooks.get_service(HANDLES_SERVICE, dict)
-    restore = hooks.get_service(RESTORE_SERVICE, dict)
-
     def make() -> SandboxHandle:
         try:
             loop = asyncio.get_running_loop()
@@ -978,14 +965,12 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
             on_close=on_close or env.on_close,
             autosnapshot=autosnapshot if autosnapshot is not None else env.autosnapshot,
             bus=bus, owner=ctx, source=path, home_loop=loop, session=session)
-        legacy = restore.pop(h.store_key, None)  # a deprecated SandboxParticipant
         if owns_slice:
             rec, origin = hydrated, (path, slice_key)
         else:
             rec, origin = env.restore.pop(k, None), (env.path, "sandboxes")
-        h.restore_record = rec or legacy
+        h.restore_record = rec
         h.restore_origin = origin if rec else None
-        registry[h.store_key] = h  # deprecated: for a SandboxParticipant
         return h
 
     local = hooks.use_ref(None)

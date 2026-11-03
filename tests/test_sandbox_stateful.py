@@ -10,10 +10,10 @@ import warnings
 
 import pytest
 
-from pyreact.boot import AppRunner, DirectoryManifestStore, DirectorySnapshots
+from pyreact.boot import DirectorySnapshots
 from pyreact.boot import create_root, hydrate_root
 from pyreact.core import HydrationWarning, component, hooks, use_turn
-from pyreact_sandbox import LocalDriver, SandboxParticipant, SandboxSpec
+from pyreact_sandbox import LocalDriver, SandboxSpec
 from pyreact_sandbox.react import SandboxProvider, resolve_policy, use_sandbox, wait_closed
 
 SLICE = "App/SandboxProvider[sbx]"
@@ -185,45 +185,3 @@ def test_live_dehydrate_keeps_the_sandbox_running(env):
     assert rec["sandbox_id"] in drv.list_sync()
     root.send("read", wait=True, timeout=10)
     assert _texts(root) == ["alpha"]
-
-
-# ---------------------------------------------------------------------------
-# Deprecated: SandboxParticipant keeps working for one release
-# ---------------------------------------------------------------------------
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-@pytest.mark.parametrize("mode", ["snapshot", "suspend"])
-def test_deprecated_participant_still_round_trips(tmp_path, mode):
-    with pytest.warns(DeprecationWarning, match="SandboxParticipant is deprecated"):
-        SandboxParticipant(mode=mode)
-    drv = LocalDriver(root=tmp_path / "sbx")
-
-    def runner():
-        return AppRunner(make_app(drv), default_session=False,
-                         participants=[lambda s: SandboxParticipant(s, mode=mode)],
-                         manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
-
-    app = runner()
-    try:
-        s = app.open_session("agent")
-        s.invoke("write alpha", wait=True, timeout=10)
-        m = s.suspend()
-        [rec] = m["participants"]["sandbox"]["sandboxes"]
-        assert m["participants"]["sandbox"]["mode"] == mode and rec["driver"] == "local"
-    finally:
-        app.shutdown()
-        wait_closed(10)
-    app2 = runner()
-    try:
-        r = app2.resume("agent")
-        texts = []
-        r.event_bus.subscribe(lambda ev: texts.append(ev.payload["text"]), ["message"])
-        r.invoke("read", wait=True, timeout=10)
-        assert texts == ["alpha"] and r.degraded == []
-    finally:
-        app2.shutdown()
-        wait_closed(10)
-
-
-def test_participant_validates_mode():
-    with pytest.raises(ValueError):
-        SandboxParticipant(mode="freeze")
