@@ -7,7 +7,8 @@ Two decoupled libraries meet only at the border of the flow:
   know it is being recorded.
 - ``integrations.learn`` reads that journal later, offline, as a dataset;
   GEPA turns the user's feedback into a better prompt; the optimized program is
-  saved as an artifact and hot-swapped into the next run.
+  saved as an artifact and the next run declares it as a prop:
+  ``LearnedProgram(key="supervisor", src=artifact)``.
 
 Phases (each one is a separate process in real life)::
 
@@ -18,7 +19,7 @@ Phases (each one is a separate process in real life)::
     # 2. learn: journal -> dataset -> GEPA -> artifacts/learn/router_from_journal.json
     uv run python -m examples.learn.05_durable_learning_loop learn
 
-    # 3. serve again with the optimized program (loaded + hot-swapped at boot)
+    # 3. serve again with the optimized program (LearnedProgram(src=...) at boot)
     uv run python -m examples.learn.05_durable_learning_loop serve --program artifacts/learn/router_from_journal.json
 
     # or all three in a row, then compare accuracy
@@ -44,7 +45,13 @@ from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
 from examples._lm import example_lm
 from integrations.feedback import send_feedback
-from integrations.learn import build_module, dataset_from_events, load, optimize
+from integrations.learn import (
+    LearnedProgram,
+    build_module,
+    dataset_from_events,
+    optimize,
+    use_learned,
+)
 from pyreact.boot import bootstrap
 from pyreact.core import component, hooks, use_turn
 from pyreact_durable import Durable, SessionLog
@@ -54,7 +61,7 @@ SMOKE = {"args": ["all", "--log", "{tmp}/store.jsonl", "--out", "{tmp}/router.js
 
 LOG = "runs/store_router.jsonl"
 ARTIFACT = "artifacts/learn/router_from_journal.json"  # default --out
-KEY = "supervisor"  # module name -> the handle hot_swap / datasets use
+KEY = "supervisor"  # module name + learned program name -> the handle datasets use
 
 
 # ---------------------------------------------------------------- the app
@@ -63,7 +70,8 @@ def StoreRouter(results):
     """Routes each turn's message to a specialist. Knows nothing about
     journaling, datasets or optimizers."""
     turn = use_turn()
-    router = use_module(RouteSpecialistSig, arch="cot", name=KEY)
+    # program=: the learned program the LearnedProgram above provides (None: baseline)
+    router = use_module(RouteSpecialistSig, arch="cot", name=KEY, program=use_learned(KEY))
     call = use_call(router)
 
     def route():
@@ -80,7 +88,7 @@ def StoreRouter(results):
     return []
 
 
-def make_app(lm, log_path: str, results: dict):
+def make_app(lm, log_path: str, results: dict, program: Optional[str] = None):
     @component
     def App():
         # The ONLY durable-specific line: wrap the tree, pick what to journal.
@@ -93,7 +101,12 @@ def make_app(lm, log_path: str, results: dict):
                     DSPyProvider(
                         key="dspy",
                         lm=lm,
-                        children=[StoreRouter(key="router", results=results)],
+                        children=[
+                            # the learned program is a prop: a saved artifact, or None
+                            LearnedProgram(key=KEY, src=program, children=[
+                                StoreRouter(key="router", results=results),
+                            ]),
+                        ],
                     )
                 ],
             )
@@ -113,16 +126,15 @@ def serve(
 ) -> float:
     """Chat through ``rows`` (message, gold route); optionally rate answers.
 
-    Returns accuracy. With ``program``, the saved optimization result is
-    loaded and hot-swapped into the running app before the first message.
+    Returns accuracy. With ``program``, the tree declares the saved
+    optimization result as its learned program from the first render.
     """
     lm = lm or example_lm()
     results: dict = {}
-    app = bootstrap(make_app(lm, log_path, results))
+    app = bootstrap(make_app(lm, log_path, results, program))
     try:
         if program:
-            swapped = load(program).hot_swap(app, KEY)
-            print(f"  hot-swapped {program} into {len(swapped)} module(s)")
+            print(f"  serving with LearnedProgram(key={KEY!r}, src={program!r})")
         correct = 0
         for message, gold in rows:
             tid = app.invoke(message, wait=True, timeout=180)
@@ -184,7 +196,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("phase", choices=["serve", "learn", "all"])
     ap.add_argument("--log", default=LOG)
-    ap.add_argument("--program", default=None, help="optimized artifact to hot-swap")
+    ap.add_argument("--program", default=None, help="optimized artifact (LearnedProgram src)")
     ap.add_argument("--out", default=ARTIFACT)
     ap.add_argument("--budget", type=int, default=24)
     args = ap.parse_args()
