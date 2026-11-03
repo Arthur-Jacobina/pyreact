@@ -22,8 +22,7 @@ from integrations.learn import (
     use_learned_registry,
 )
 from integrations.learn.hmr import hot_swap_into, resolve_module
-from integrations.stateful import CompiledModulesParticipant
-from pyreact.boot import AppRunner, DirectoryManifestStore, create_root, hydrate_root
+from pyreact.boot import create_root, hydrate_root
 from pyreact.core import HydrationWarning, component, hooks, use_imperative_handle
 
 DSPY = "App/DSPyProvider[dspy]"
@@ -199,32 +198,3 @@ def test_learned_program_with_a_lost_file_falls_back_to_the_prop(roots, tmp_path
     assert (m["path"], m["key"], m["reason"]) == (
         "App/LearnedProgram[qa]", "programs", "result missing")
 
-
-# ---------------------------------------------------------------------------
-# Deprecated: CompiledModulesParticipant keeps working for one release
-# ---------------------------------------------------------------------------
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_deprecated_participant_still_round_trips(tmp_path):
-    with pytest.warns(DeprecationWarning, match="CompiledModulesParticipant is deprecated"):
-        CompiledModulesParticipant()
-
-    def make():
-        return AppRunner(App, default_session=False,
-                         participants=[lambda s: CompiledModulesParticipant(s)],
-                         manifest_store=DirectoryManifestStore(tmp_path / "m"))
-
-    app = make()
-    try:
-        s = app.open_session("old")
-        _swap(s, "qa", "LEARNED QA")
-        m = s.suspend()
-        assert m["participants"]["dspy.compiled"] == {}
-        assert [e["key_str"] for e in m["slices"][DSPY]["compiled"]] == ["Predict:QA:qa"]
-    finally:
-        app.shutdown()
-    app2 = make()
-    try:
-        r = app2.resume("old")
-        assert r.services["seen"][0][0] == "LEARNED QA" and r.degraded == []
-    finally:
-        app2.shutdown()

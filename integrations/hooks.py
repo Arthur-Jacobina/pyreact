@@ -40,19 +40,11 @@ from pyreact.tools import Tool, resolve_tools, use_tools
 from . import telemetry as tm
 from .dspy_integration import DSPyEnv
 
-# Deprecated session service filled by integrations.stateful.CompiledModulesParticipant
-# from a legacy manifest: {module key tuple: dspy state}. Hydration now goes
-# through the DSPyProvider's own slice (env.restore).
-RESTORE_SERVICE = "dspy.compiled.restore"
-
-
-def _apply_restored(restore: Dict[Any, Any], env: Optional[DSPyEnv], key: Any, mod: Any) -> Any:
-    """Load the learned state hydrated for ``key`` (the provider's slice, or a
-    legacy manifest) into the freshly built ``mod`` and mark it compiled (so
-    the next suspend keeps it)."""
+def _apply_restored(env: Optional[DSPyEnv], key: Any, mod: Any) -> Any:
+    """Load the learned state hydrated for ``key`` (the DSPyProvider's
+    ``"compiled"`` slice, ``env.restore``) into the freshly built ``mod`` and
+    mark it compiled (so the next suspend keeps it)."""
     state = env.restore.pop(key, None) if env is not None and env.restore else None
-    legacy = restore.pop(key, None) if restore else None
-    state = state if state is not None else legacy
     if state is None:
         return mod
     try:
@@ -298,9 +290,8 @@ def use_module(
         except Exception:
             pass
         env.caches[key] = mod
-        return _apply_restored(restore, env, key, mod)
+        return _apply_restored(env, key, mod)
 
-    restore = hooks.get_service(RESTORE_SERVICE, dict)
     mod = hooks.use_memo(_factory, deps=[key, deps_key, id(env.caches), kw_sig])
     _use_program(env, key, mod, program)
 
@@ -1158,9 +1149,8 @@ def use_agent(
         react._pyreact_signature = signature
         if env is not None:
             env.caches[key] = react
-        return _apply_restored(restore, env, key, react)
+        return _apply_restored(env, key, react)
 
-    restore = hooks.get_service(RESTORE_SERVICE, dict)
     # Rebuild only when signature, tool set, limits, or name change.
     react = hooks.use_memo(_build, deps=[key, tools_key, max_iters])
     _use_program(env, key, react, program)
