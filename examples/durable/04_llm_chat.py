@@ -48,7 +48,6 @@ from pyreact_durable import (
     use_durable,
     use_durable_lm,
 )
-from pyreact_durable.__main__ import render_tree
 
 from examples._lm import example_lm
 
@@ -96,7 +95,7 @@ def DurableChat():
                 lines = [f"{m['role']}: {m['content']}" for m in conv.messages]
                 say("\n".join(lines) if lines else "(empty)", "system")
             elif cmd == "tree":
-                say("\n".join(render_tree(log)), "system")
+                say(log.render(), "system")
             else:
                 say("commands: /label <name>, /fork <label>, /checkout <label|id>, "
                     "/history, /tree", "system")

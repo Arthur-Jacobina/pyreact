@@ -43,7 +43,6 @@ from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.keystroke import Keystroke
 from pyreact.core import EventBus, component, hooks
 from pyreact_durable import Durable, SessionLogError, use_durable, use_persistent_state
-from pyreact_durable.__main__ import render_tree
 
 # Offline smoke run (tests/test_examples_smoke.py).
 SMOKE = {"args": ["--log", "{tmp}/state.sqlite"],
@@ -76,7 +75,7 @@ def ShoppingList():
                 with log.fork_file(path, at=arg) as new:
                     say(f"forked {len(new.entries)} entries into {path} (--log {path})")
             elif cmd == "/tree":
-                say("\n".join(render_tree(log, width=40)))
+                say(log.render(width=40))
             else:
                 say("add <item> | /label <name> | /checkout <label> | /fork <label> | /tree")
         except SessionLogError as exc:  # unknown label, file already exists, ...

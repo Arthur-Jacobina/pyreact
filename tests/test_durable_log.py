@@ -255,3 +255,24 @@ def test_cli_roundtrip(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "[one]" in out and "<- leaf" in out
     assert main(["checkout", str(p), "nope"]) == 2
+
+
+def test_render_tree_is_public(tmp_path):
+    import pyreact_durable
+    from pyreact_durable import render_tree
+    from pyreact_durable.__main__ import render_tree as cli_render_tree
+
+    assert cli_render_tree is render_tree  # the CLI uses the public one
+    assert "render_tree" in pyreact_durable.__all__
+    with SessionLog.open(tmp_path / "r.jsonl") as log:
+        log.set_state("App/Chat[chat]", "n", 1)
+        log.label("base")
+        log.set_state("App/Chat[chat]", "n", 2)
+        log.checkout("base")
+        log.set_state("App/Chat[chat]", "n", 3)
+        text = log.render(width=40)
+        assert text == "\n".join(render_tree(log, width=40))
+    lines = text.splitlines()
+    assert lines[0].startswith("session ") and "1 branch point(s)" in lines[0]
+    assert any("[base]" in ln and "⑂2" in ln for ln in lines)
+    assert sum("<- leaf" in ln for ln in lines) == 1
