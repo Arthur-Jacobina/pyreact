@@ -290,6 +290,33 @@ again, so commit results atomically at the end of the turn. Proven by
 `tests/test_resume_turns.py` (SIGKILL mid-turn, then resume) and
 `examples/harness/02_resilient_agent.py`.
 
+## Suspend / resume a whole agent (`pyreact_durable.stateful`)
+
+`DurableParticipant` takes part in pyreact's stateful sessions
+(`session.suspend()` / `app.resume(session_id)`, see "Stateful agents" in the
+main README). Its manifest fragment says where each mounted `Durable` log is
+and where its leaf was:
+
+```json
+"durable": {"logs": [{"path": "/abs/runs/agent.jsonl", "log_id": "0f3c…", "leaf": "a1b2c3d4",
+                      "entries": 42, "version": 1, "pending_turns": []}]}
+```
+
+```python
+app = AppRunner(App, participants=[DurableParticipant],
+                manifest_store=DirectoryManifestStore("runs/manifests"))
+m = app.open_session("agent").suspend()     # ... later, another process:
+app.resume("agent")                          # state, conversation, turn ids as they were
+```
+
+On resume, before the first render, it checks each log still exists and is
+the same log (header id); the `Durable` provider then checks the log out at
+the recorded leaf, so persistent state restores exactly as suspended even if
+something appended to the file meanwhile. Turns the suspend cut short re-run
+with their recorded LLM calls replayed by `durable_lm`. A missing or
+replaced log, or a vanished leaf, is reported as `session.resume.degraded`
+(`participant: "durable"`) and the provider opens the file as usual.
+
 ## CLI
 
 ```bash
