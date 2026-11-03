@@ -74,6 +74,13 @@ Key pieces:
 - `durable_lm(lm, log)` journals LM calls so re-running a turn after a crash replays the answer instead of calling the model again.
 - Inspect files with `python -m pyreact_durable show chat.jsonl`; examples (short to full) in [`examples/durable/`](examples/durable/): `01_counter` (hello world), `02_branches_sqlite` (SQLite, labels/checkout/fork), `03_web_sessions` (one log per browser tab), `04_llm_chat` (LLM + branches + LM replay).
 
+### 11) Sandboxes ↔ Where agents act (at the border)
+- Agents that run code, install packages or keep files between turns get a sandbox from a separate library, [`pyreact_sandbox`](pyreact_sandbox/README.md); `pyreact` never imports it. **Docker first**; E2B / Modal / Daytona / in-house are drop-in drivers (`register_driver`).
+- `SandboxProvider(driver="docker", spec=SandboxSpec(image=..., memory=..., setup=[...]), children=[...])` picks the vendor and defaults; `use_sandbox()` gives a component its handle (`await sb.exec(...)`, `run_python`, `write_file` / `read_file`, `snapshot` / `restore`, `suspend` / `resume`). It is an effect with cleanup: created on mount, closed per `on_close="destroy"|"suspend"|"snapshot"` (or by the session's `close_reason`).
+- Every exec is a harness boundary of kind `sandbox.exec` (guards, retries, telemetry) and publishes `sandbox.*` events.
+- Stateful across restarts: a `SnapshotStore` (memory, file, or the `pyreact_durable` log) records the sandbox; a new runner reattaches it or restores its snapshot (`autosnapshot="turn"`).
+- `sandbox_tools(sb)` → `run_shell` / `run_python` / `read_file` / `write_file` for `use_agent`; `SandboxInterpreter(sb)` runs RLM's REPL in the sandbox instead of Deno. Example: [`examples/sandbox/01_coding_agent.py`](examples/sandbox/01_coding_agent.py).
+
 ### Lifecycle overview
 1. A root agent (component) is wrapped in a `HookContext` by the runner.
 2. State changes or context updates call `schedule_rerender`.
@@ -96,6 +103,7 @@ empty pipeline adds ~2.5 µs per boundary).
 | `turn` | `"turn"` | `{"text": ...}` | `TurnManager` (start → settle of every turn) |
 | `llm` | module label (`name=` or e.g. `Predict(question -> answer)`) | the module's inputs | `invoke_module`, so `use_call` / `use_stream` / `use_agent` / `use_agent_call` / RLM runs |
 | `tool` | tool name | named arguments | ReAct tools (`to_dspy_tool`, `call_tool`), RLM REPL tools (`call_tool_sync`) |
+| `sandbox.exec` | command (`python3`, `ls`...), `python`, `write_file`, `read_file` | `{op, sandbox, cmd\|code\|path, timeout, env, cwd}` | [`pyreact_sandbox`](pyreact_sandbox/README.md) handles (`use_sandbox`, `sandbox_tools`, `SandboxInterpreter`) |
 
 Any dotted kind works for your own boundaries (`sandbox.exec`, `llm.judge`):
 `await through("sandbox.exec", "python", {"code": code}, run)`.
@@ -446,6 +454,10 @@ uv run python -m examples.log
 # Durable memory, smallest first (see pyreact_durable/README.md)
 uv run python -m examples.durable.01_counter
 uv run python -m examples.durable.04_llm_chat
+
+# Sandboxes: a coding agent in Docker; --resume restores it after a restart
+uv run python -m examples.sandbox.01_coding_agent "What is the 30th Fibonacci number?"
+uv run python -m examples.sandbox.01_coding_agent --resume
 ```
 
 In your own code, `run_web(App)` serves an app (one session per browser tab);
@@ -461,6 +473,8 @@ uv run pytest
 uv run python -m scripts.e2e_turns
 # Durable memory: kill -9 + restart, branches, LM replay (real LLM)
 uv run python scripts/e2e_durable.py
+# Sandbox integration tests need Docker (skipped without it)
+uv run pytest -m docker
 ```
 
 ## Learning: architectures & optimizers
