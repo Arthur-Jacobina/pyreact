@@ -358,9 +358,8 @@ def child(mode: str, log_path: str) -> None:
         root.send("What's the weather in Porto?")
         time.sleep(300)  # never returns: the parent kills us mid-turn
         return
-    # Re-run the turn the log saw start but never end. TODO(api): there is no
-    # Root.resume_pending() yet; the session is the root's low-level side.
-    resumed = root.session.resume_pending(wait=True, timeout=300)
+    # Re-run the turn the log saw start but never end.
+    resumed = root.resume_pending(wait=True, timeout=300)
     print(f"    | resumed: {resumed}; durable_lm: {dlm.stats}", flush=True)
     root.unmount()
     slog.close()

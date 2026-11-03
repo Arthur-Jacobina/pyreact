@@ -17,7 +17,8 @@ with it); pass ``runner=`` to host many roots on one loop.
 Outside code talks to the tree only through the root (ADR 0001): input with
 :meth:`Root.send`, imperative handles with :meth:`Root.ref` (named refs,
 ``use_imperative_handle(ref, factory, name=...)``), lifecycle with
-:meth:`Root.suspend` / :meth:`Root.dehydrate` / :meth:`Root.unmount`.
+:meth:`Root.suspend` / :meth:`Root.dehydrate` / :meth:`Root.unmount`,
+crash recovery with :meth:`Root.resume_pending`.
 :attr:`Root.events` is the session's event log, for devtools.
 """
 
@@ -138,6 +139,21 @@ class Root:
 
     async def await_idle(self, timeout: Optional[float] = None) -> None:
         await self.session.await_idle(timeout=timeout)
+
+    def resume_pending(self, *, wait: bool = False,
+                       timeout: Optional[float] = None) -> List[str]:
+        """Re-run the turns this root's ``TurnStore`` saw start but never end
+        (crash recovery without a snapshot: e.g. a ``Durable`` log from a
+        process that died mid-turn). Same ids and text, ``resumed=True``,
+        oldest first, queued like new input. Returns their ids (``[]``
+        without a store or with nothing pending); ``wait=True`` blocks until
+        they end (``TimeoutError`` after ``timeout`` s).
+
+        Waits for the tree to be idle first, so a store attached on mount
+        (by an effect) is in place. :func:`hydrate_root` already resumes
+        pending turns; this is for a root made with :func:`create_root`."""
+        self.session.wait_idle(timeout=timeout)
+        return self.session.resume_pending(wait=wait, timeout=timeout)
 
     # ------------------------------------------------------------------ refs
     def ref(self, name: str) -> Any:
