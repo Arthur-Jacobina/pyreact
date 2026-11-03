@@ -558,6 +558,9 @@ class TurnManager:
 # ----------------------------------------------------------------------
 # hooks
 # ----------------------------------------------------------------------
+_NOT_HIDDEN = object()
+
+
 def get_turn_manager() -> TurnManager:
     from .core import hooks
 
@@ -589,17 +592,31 @@ def use_turn(
         if ctx is not None:
             ctx._turn_policy = policy
 
+    from .hook import use_cleanup_reason
+
     tm = get_turn_manager()
     at_mount = hooks.use_ref(tm.latest)  # latest turn when we mounted
+    # latest turn when an Activity hid us (turns started while hidden are
+    # not delivered when we become visible again)
+    hidden_at = hooks.use_ref(_NOT_HIDDEN)
     turn, set_turn = hooks.use_state(None if since_mount else tm.latest)
 
     def _subscribe():
         un = tm.subscribe(set_turn)
         latest = tm.latest
+        mark, hidden_at.current = hidden_at.current, _NOT_HIDDEN
+        missed = mark is not _NOT_HIDDEN and latest is not mark
         # catch a turn that started before we subscribed
-        if latest is not None and not (since_mount and latest is at_mount.current):
+        if (latest is not None and not missed
+                and not (since_mount and latest is at_mount.current)):
             set_turn(latest)
-        return un
+
+        def _unsubscribe():
+            un()
+            if use_cleanup_reason() in ("hidden", "suspend"):
+                hidden_at.current = tm.latest
+
+        return _unsubscribe
 
     hooks.use_effect(_subscribe, [id(tm)])
     return turn

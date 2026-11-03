@@ -1,5 +1,6 @@
 # hook.py ----------------------------------------------------
-from typing import Dict, Optional
+from contextvars import ContextVar
+from typing import Any, Dict, List, Optional
 from weakref import WeakSet
 from . import core as _core
 from .core import VNode
@@ -8,6 +9,42 @@ import inspect
 import warnings
 
 _MISSING = object()
+
+# Why the cleanup currently running runs (see ``use_cleanup_reason``).
+CLEANUP_REASONS = ("unmount", "deps", "hidden", "suspend")
+_cleanup_reason: ContextVar = ContextVar("pyreact_cleanup_reason", default=None)
+
+
+def use_cleanup_reason() -> Optional[str]:
+    """Why the effect cleanup that is running now runs, else ``None``:
+
+    - ``"unmount"``: the component leaves the tree;
+    - ``"deps"``: the effect's deps changed (it runs again right after);
+    - ``"hidden"``: an ``Activity(mode="hidden")`` above it hid its subtree
+      (state is kept; the effect re-runs when it becomes visible);
+    - ``"suspend"``: the root is suspending (``root.suspend()``): the state is
+      about to be dehydrated, e.g. pause / snapshot a sandbox instead of
+      destroying it.
+
+    A cleanup that takes one positional argument also receives the reason.
+    """
+    return _cleanup_reason.get()
+
+
+def _wants_reason(fn) -> bool:
+    """True if ``fn`` has a required positional parameter (gets the reason)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+        for p in params
+    )
+
+
+def _invoke_cleanup(fn, reason):
+    return fn(reason) if _wants_reason(fn) else fn()
 
 
 def _deps_key(deps):
@@ -124,11 +161,38 @@ class HookContext:
         self._mounted: bool = (
             True  # Track mount lifecycle to avoid rerenders after unmount
         )
+        # Latest function of every effect slot (re-run when revealed).
+        self._effect_fns: dict = {}
+        # Visibility (Activity): a node with ``_hides_children`` hides its
+        # descendants (state kept, effects cleaned up and not run); the root
+        # can hide itself too (``_self_hidden``, root.suspend()).
+        # ``_applied_hidden`` is the state the last commit applied.
+        self._hides_children: bool = False
+        self._self_hidden: bool = False
+        self._applied_hidden: bool = False
+        self._hide_reason: str = "hidden"
 
     @property
     def root(self) -> "HookContext":
         """The session root (top-most ancestor) of this component."""
         return self._root
+
+    @property
+    def is_hidden(self) -> bool:
+        """True while an ``Activity(mode="hidden")`` above this component
+        (or a suspending root) hides it: its effects do not run."""
+        if self._self_hidden:
+            return True
+        node = self.parent
+        while node is not None:
+            if node._hides_children or node._self_hidden:
+                return True
+            node = node.parent
+        return False
+
+    def use_cleanup_reason(self) -> Optional[str]:
+        """Same as :func:`use_cleanup_reason` (``hooks.use_cleanup_reason()``)."""
+        return use_cleanup_reason()
 
     @property
     def session_services(self) -> dict:
@@ -287,6 +351,7 @@ class HookContext:
         deps_key = _deps_key(deps)
         idx = self.hook_idx
 
+        self._effect_fns[idx] = effect_fn
         if idx >= len(self.hooks):  # first mount
             self.hooks.append((None, deps_key))
             self.effects.append((effect_fn, deps_key, idx))
@@ -372,30 +437,97 @@ class HookContext:
         self.hook_idx += 1
         return value
 
-    def _call_cleanup(self, cleanup):
+    def _call_cleanup(self, cleanup, reason: str = "unmount"):
+        """Run one effect cleanup (``reason``: see :func:`use_cleanup_reason`).
+        Returns the task of an async cleanup (else ``None``)."""
         if not cleanup:
-            return
+            return None
         # Like effects, cleanups run "as" this component (hooks.* usable).
         owner_token = current_owner.set(self)
         stack_token = _core._context_stack.set(self)
+        reason_token = _cleanup_reason.set(reason)
         try:
-            res = cleanup()
+            res = _invoke_cleanup(cleanup, reason)
             if inspect.isawaitable(res):
-                spawn(res, owner=self, name=f"{self.name}:cleanup")
+                return spawn(res, owner=self, name=f"{self.name}:cleanup")
         except Exception as exc:
             report_error(exc, self, "cleanup")
         finally:
+            _cleanup_reason.reset(reason_token)
             _core._context_stack.reset(stack_token)
             current_owner.reset(owner_token)
+        return None
 
-    def _run_cleanup_slot(self, slot):
+    def _run_cleanup_slot(self, slot, reason: str = "unmount"):
         cleanup = slot[0] if isinstance(slot, tuple) else None
-        self._call_cleanup(cleanup)
+        return self._call_cleanup(cleanup, reason)
 
-    def unmount(self):
-        for idx in list(getattr(self, "_effect_slots", set())):
+    def _cleanup_effects(self, reason: str) -> List[Any]:
+        """Run (and drop) the cleanups of this node's mounted effects; the
+        slots stay (state is kept). Returns async cleanup tasks."""
+        tasks = []
+        for idx in sorted(self._effect_slots):
             if idx < len(self.hooks):
-                self._run_cleanup_slot(self.hooks[idx])
+                slot = self.hooks[idx]
+                if isinstance(slot, tuple) and slot[0]:
+                    self.hooks[idx] = (None, slot[1])
+                    task = self._call_cleanup(slot[0], reason)
+                    if task is not None:
+                        tasks.append(task)
+        return tasks
+
+    def _requeue_effects(self) -> None:
+        """Schedule every effect of this node to run at the next commit
+        (on reveal: effects of a hidden subtree re-run)."""
+        self.effects = [
+            (self._effect_fns[idx], self.hooks[idx][1], idx)
+            for idx in sorted(self._effect_slots)
+            if idx in self._effect_fns and idx < len(self.hooks)
+        ]
+
+    def _descendants(self, *, stop_at_hidden: bool = False):
+        for child in list(self.children):
+            yield child
+            if stop_at_hidden and child._hides_children:
+                continue
+            yield from child._descendants(stop_at_hidden=stop_at_hidden)
+
+    def _hide_subtree(self, reason: str, *, include_self: bool = False) -> List[Any]:
+        """Run the cleanups of the effects of every descendant (and of this
+        node with ``include_self``) with ``reason``; returns async cleanup
+        tasks. Hook state is kept."""
+        tasks = self._cleanup_effects(reason) if include_self else []
+        for node in self._descendants():
+            tasks.extend(node._cleanup_effects(reason))
+        return tasks
+
+    def _reveal_subtree(self, *, include_self: bool = False) -> None:
+        if include_self:
+            self._requeue_effects()
+        for node in self._descendants(stop_at_hidden=True):
+            node._requeue_effects()
+
+    def _apply_visibility(self) -> None:
+        """Commit a change of ``_hides_children`` / ``_self_hidden``: hide
+        runs the subtree's effect cleanups, reveal re-runs its effects."""
+        hidden = self._hides_children or self._self_hidden
+        if hidden == self._applied_hidden:
+            return
+        self._applied_hidden = hidden
+        if hidden:
+            self._hid_self = self._self_hidden
+            self._hide_tasks = self._hide_subtree(
+                self._hide_reason, include_self=self._self_hidden)
+        else:
+            self._reveal_subtree(include_self=getattr(self, "_hid_self", False))
+            self._hid_self = False
+
+    def unmount(self, reason: str = "unmount"):
+        """Unmount this subtree: run effect cleanups (with ``reason``, see
+        :func:`use_cleanup_reason`), drop context subscriptions and state."""
+        for idx in sorted(getattr(self, "_effect_slots", set())):
+            if idx < len(self.hooks):
+                self._run_cleanup_slot(self.hooks[idx], reason)
 
         # 2. Remove Context subscriptions
         for ws in getattr(self, "_ctx_subs", []):
@@ -406,12 +538,13 @@ class HookContext:
 
         # 3. Unmount children recursively
         for child in self.children:
-            child.unmount()
+            child.unmount(reason)
 
         # 4. GC
         self.children.clear()
         self.hooks.clear()
         self.effects.clear()
+        self._effect_fns.clear()
         if hasattr(self, "_effect_slots"):
             self._effect_slots.clear()
         # mark as unmounted to skip future rerenders
@@ -521,7 +654,13 @@ class HookContext:
             core._context_stack.reset(token)
 
     async def run_effects(self):
+        if (self._hides_children or self._self_hidden) != self._applied_hidden:
+            self._apply_visibility()
         effects, self.effects = self.effects, []
+        if effects and self.is_hidden:
+            # Hidden (Activity): state is kept but effects don't run; they
+            # all re-run when the subtree becomes visible again.
+            effects = []
         for fx, deps, idx in effects:
             if not self._mounted or idx >= len(self.hooks):
                 break
@@ -534,7 +673,7 @@ class HookContext:
             owner_token = current_owner.set(self)
             stack_token = _core._context_stack.set(self)
             try:
-                self._call_cleanup(cln)
+                self._call_cleanup(cln, "deps")
                 try:
                     res = fx()
                 except Exception as exc:
@@ -559,14 +698,14 @@ class HookContext:
                 report_error(exc, ch, "effect")
 
     def _make_task_cleanup(self, task):
-        def _cleanup():
+        def _cleanup(reason):
             if not task.done():
                 task.cancel()
                 return None
             if task.cancelled() or task.exception() is not None:
                 return None
             inner = task.result()
-            return inner() if callable(inner) else None
+            return _invoke_cleanup(inner, reason) if callable(inner) else None
 
         return _cleanup
 
