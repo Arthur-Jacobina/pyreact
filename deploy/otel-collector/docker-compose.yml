@@ -1,0 +1,16 @@
+# A single OpenTelemetry Collector (~50 MB RAM) for checking pyreact_otel
+# against a generic OTLP endpoint (the path every non-Langfuse vendor uses).
+#   docker compose -f deploy/otel-collector/docker-compose.yml up -d
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4320 uv run python -m scripts.e2e_otel_collector
+#   docker compose -f deploy/otel-collector/docker-compose.yml down
+name: pyreact-otel-collector
+services:
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.145.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    user: "0:0"  # write the file exporter output into the bind mount
+    ports:
+      - 127.0.0.1:${COLLECTOR_PORT:-4320}:4318
+    volumes:
+      - ./config.yaml:/etc/otelcol/config.yaml:ro
+      - ./out:/out

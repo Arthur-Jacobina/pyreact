@@ -1,0 +1,19 @@
+# OTLP/HTTP in, debug log + JSON file out: the vendor-neutral check for pyreact_otel.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  debug:
+    verbosity: basic
+  file:
+    path: /out/otlp.jsonl   # one OTLP/JSON export request per line (traces and metrics)
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug, file]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug, file]

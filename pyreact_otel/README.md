@@ -37,7 +37,9 @@ token usage and cost, the tools they call are *tool* observations, and app
 events are *event* observations. All turns of a pyreact session land in one
 Langfuse **session**. A local Langfuse for development is in
 [`deploy/langfuse/`](../deploy/langfuse/README.md), with an end-to-end check
-in `scripts/e2e_otel_langfuse.py`.
+in `scripts/e2e_otel_langfuse.py`. For any OTLP backend there is a
+one-container collector in [`deploy/otel-collector/`](../deploy/otel-collector/README.md)
+and `scripts/e2e_otel_collector.py`.
 
 Options for `exporter="langfuse"`: `public_key`, `secret_key`, `host`,
 `environment` (or `LANGFUSE_TRACING_ENVIRONMENT`), `release`, `tags`,
