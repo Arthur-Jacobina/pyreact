@@ -24,7 +24,7 @@ import random
 import sys
 import time
 
-from examples._devtools import collect, show_messages, trace
+from examples._devtools import collect, trace
 from examples._lm import OFFLINE, example_lm
 from integrations import DSPyProvider, use_agent_call
 from integrations.learn import explain
@@ -106,7 +106,7 @@ def main(archs: list[str]) -> None:
           f"true answer = {TRUTH}\n")
     rows = []
     with create_root(Root, session_id="archs") as root:
-        show_messages(root)  # the Solver's answers
+        root.render_to("console")  # the Solver's answers
         # The trace you debug with: llm.end carries latency, usage and outputs.
         ends = collect(root, ["llm.end", "llm.error"])
         trace(root, ["rlm.iteration"], rlm_step)

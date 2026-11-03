@@ -35,7 +35,7 @@ from __future__ import annotations
 import argparse
 from types import SimpleNamespace
 
-from examples._devtools import command, run_repl, show_messages
+from examples._devtools import command, run_repl
 from examples._lm import example_lm, out_path
 from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_examples
 from examples.tools import SPECIALISTS, RouteSpecialistSig
@@ -128,7 +128,7 @@ AFTER = ("comprar e saber o frete", "shipping")
 
 def demo(lm) -> None:
     with create_root(make_root(lm), session_id="store") as root:
-        show_messages(root)
+        root.render_to("console")
 
         def say(text):
             print(f"\n>> {text}", flush=True)

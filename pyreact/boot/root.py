@@ -19,6 +19,7 @@ Outside code talks to the tree only through the root (ADR 0001): input with
 ``use_imperative_handle(ref, factory, name=...)``), lifecycle with
 :meth:`Root.suspend` / :meth:`Root.dehydrate` / :meth:`Root.unmount`,
 crash recovery with :meth:`Root.resume_pending`.
+:meth:`Root.render_to` renders the tree's ``message`` output to a sink;
 :attr:`Root.events` is the session's event log, for devtools.
 """
 
@@ -31,7 +32,7 @@ import threading
 import time
 import uuid
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Union
 
 from pyreact.core import runtime
 from pyreact.core.activity import hide_tree, reveal_tree
@@ -109,6 +110,35 @@ class Root:
     def event_bus(self):
         """The session's EventBus (subscribe for devtools; not for rendering)."""
         return self.session.event_bus
+
+    # ---------------------------------------------------------------- output
+    def render_to(self, sink: Any = "console", *, kinds: Optional[Iterable[str]] = None,
+                  replay: bool = True) -> Callable[[], None]:
+        """Render this root's output -- ``message`` events (what ``Message``
+        components publish) and ``error`` events -- to ``sink``; returns the
+        unsubscribe.
+
+        ``sink``: ``"console"`` (a :class:`~pyreact.observability.ConsoleSink`
+        on stdout), a sink object (``Sink`` subclass: it applies its own
+        ``kinds`` filter) or any callable ``fn(event)``. ``kinds`` overrides
+        what is rendered (default ``("message", "error")``; for a ``Sink`` the
+        default is its own filter). With ``replay`` (default) the recent
+        matching events, e.g. those of the first render, are rendered first.
+        The root-level renderer of ADR 0001; bus subscriptions stay for
+        devtools."""
+        from pyreact.observability import ConsoleSink, Sink
+
+        if isinstance(sink, str) and sink == "console":
+            sink = ConsoleSink(kinds=tuple(kinds) if kinds is not None else ConsoleSink.DEFAULT_KINDS)
+            kinds = None  # the sink filters
+        elif isinstance(sink, str):
+            raise ValueError(f"unknown sink {sink!r} (use 'console', a Sink or a callable)")
+        elif not callable(sink):
+            raise TypeError(f"render_to needs 'console', a Sink or a callable, got {sink!r}")
+        elif kinds is None and not isinstance(sink, Sink):
+            kinds = ConsoleSink.DEFAULT_KINDS
+        return self.events.subscribe(sink, tuple(kinds) if kinds is not None else None,
+                                     replay=replay)
 
     @property
     def mismatches(self) -> List[Dict[str, Any]]:

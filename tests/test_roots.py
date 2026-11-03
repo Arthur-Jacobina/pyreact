@@ -281,3 +281,48 @@ def test_root_resume_pending_reruns_unfinished_turns_from_the_turn_store(roots):
     assert store.ended == [("p/t3", "done")]
     assert root.resume_pending() == []
     assert root.send("next", wait=True, timeout=5) == "p/t4"
+
+
+def test_render_to_renders_message_events_and_replays_recent_ones(roots, capsys):
+    from pyreact.observability import ConsoleSink
+
+    @component
+    def Hello():
+        return []
+
+    root = create_root(Hello, session_id="rt")
+    roots.append(root)
+    bus = root.event_bus
+    bus.publish("message", {"role": "assistant", "text": "before attach"})
+    bus.publish("llm.end", {"model": "x"})
+
+    got = []
+    unsub = root.render_to(got.append)
+    assert [e.payload["text"] for e in got] == ["before attach"]  # replayed
+    bus.publish("message", {"role": "assistant", "text": "live"})
+    bus.publish("tool.start", {"name": "t"})
+    assert [e.kind for e in got] == ["message", "message"]
+    unsub()
+    bus.publish("message", {"role": "assistant", "text": "after"})
+    assert len(got) == 2
+
+    off = root.render_to("console", replay=False)
+    bus.publish("message", {"role": "assistant", "text": "to the console"})
+    off()
+    assert "to the console" in capsys.readouterr().out
+
+    class Collect(ConsoleSink):
+        def __init__(self):
+            super().__init__(kinds=["llm.*"])
+            self.seen = []
+
+        def handle(self, ev):
+            self.seen.append(ev.kind)
+
+    sink = Collect()
+    root.render_to(sink)()  # a Sink keeps its own filter
+    assert sink.seen == ["llm.end"]
+    with pytest.raises(ValueError):
+        root.render_to("html")
+    with pytest.raises(TypeError):
+        root.render_to(42)

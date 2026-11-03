@@ -22,7 +22,7 @@ from collections import Counter
 
 import dspy
 
-from examples._devtools import collect, show_messages
+from examples._devtools import collect
 from examples._lm import example_lm, out_path
 from integrations import DSPyProvider, use_agent_call
 from integrations.architectures import build_module
@@ -139,7 +139,7 @@ def main() -> None:
         return [DSPyProvider(key="dspy", lm=lm, children=[Riddler(key="riddler")])]
 
     with create_root(Root, session_id="riddler") as root:
-        show_messages(root)
+        root.render_to("console")
         ends = collect(root, ["llm.end"])  # devtools: latency + LM calls of the call
         root.send("I speak without a mouth and hear without ears. What am I? One word.",
                   wait=True, timeout=300)
