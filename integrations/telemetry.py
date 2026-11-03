@@ -1,0 +1,178 @@
+"""Observability plumbing for the DSPy hooks layer.
+
+Every LM/module call and tool call is published on the app's
+:class:`~pyreact.core.events.EventBus` service (``event_bus``):
+
+    llm.start   {call_id, module, component, model, inputs}
+    llm.chunk   {call_id, module, field, chunk, last}
+    llm.status  {call_id, module, message}
+    llm.end     {call_id, module, component, model, latency, usage, cost, outputs}
+    llm.error   {call_id, module, component, model, latency, usage, cost, error}
+    llm.cancel  {call_id, module, component, latency}
+    tool.start  {call_id, tool, args}
+    tool.end    {call_id, tool, args, duration, error, result}
+
+Token usage / cost come from the LM history entries recorded *for that call
+only* (a per-call recorder is injected into ``dspy.settings.caller_modules``,
+which is a contextvar, so concurrent calls never mix their usage).
+"""
+
+from __future__ import annotations
+
+import itertools
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from pyreact.core.events import EventBus
+from pyreact.core.hook import HookContext
+
+_call_ids = itertools.count(1)
+
+
+def new_call_id(prefix: str = "llm") -> str:
+    return f"{prefix}-{next(_call_ids)}"
+
+
+def event_bus() -> EventBus:
+    """The app-wide EventBus service (same instance as ``hooks.get_service``)."""
+    return HookContext.get_service("event_bus", EventBus)
+
+
+def publish(kind: str, payload: Dict[str, Any], *, turn_id=None, source=None) -> None:
+    try:
+        event_bus().publish(kind, payload, turn_id=turn_id, source=source)
+    except Exception:  # observability must never break a call
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Turn ids
+# ---------------------------------------------------------------------------
+def current_turn_id() -> Optional[str]:
+    """Turn the calling code belongs to (see ``pyreact.core.turns``)."""
+    from pyreact.core import runtime
+
+    try:
+        return runtime.current_turn_id()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Component path
+# ---------------------------------------------------------------------------
+def component_path(ctx) -> Optional[str]:
+    if ctx is None:
+        return None
+    parts = []
+    node = ctx
+    while node is not None:
+        label = node.name
+        if node.key is not None:
+            label += f"#{node.key}"
+        parts.append(label)
+        node = node.parent
+    return "/".join(reversed(parts))
+
+
+# ---------------------------------------------------------------------------
+# Call scope: what the current task is doing (read by tool wrappers)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CallScope:
+    call_id: str
+    module: str
+    component: Optional[str]
+    turn_id: Optional[str]
+
+
+_scope: ContextVar[Optional[CallScope]] = ContextVar("pyreact_dspy_call", default=None)
+
+
+def current_scope() -> Optional[CallScope]:
+    return _scope.get()
+
+
+def enter_scope(scope: CallScope):
+    return _scope.set(scope)
+
+
+def exit_scope(token) -> None:
+    try:
+        _scope.reset(token)
+    except ValueError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+class UsageRecorder:
+    """Duck-typed 'module' placed in ``settings.caller_modules``.
+
+    ``BaseLM.update_history`` appends each LM history entry (with ``usage``
+    and ``cost``) to every caller module, so this collects exactly the LM
+    calls made inside one hook call.
+    """
+
+    def __init__(self) -> None:
+        self.history: List[dict] = []
+
+    def summary(self) -> Dict[str, Any]:
+        return summarize_usage(self.history)
+
+
+_TOKEN_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def summarize_usage(entries: List[dict]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {k: 0 for k in _TOKEN_KEYS}
+    out["lm_calls"] = len(entries)
+    out["cost"] = None
+    models = []
+    for e in entries:
+        usage = e.get("usage") or {}
+        for k in _TOKEN_KEYS:
+            v = usage.get(k) if isinstance(usage, dict) else getattr(usage, k, None)
+            if isinstance(v, (int, float)):
+                out[k] += v
+        cost = e.get("cost")
+        if isinstance(cost, (int, float)):
+            out["cost"] = (out["cost"] or 0.0) + cost
+        m = e.get("model")
+        if m and m not in models:
+            models.append(m)
+    out["models"] = models
+    return out
+
+
+# ---------------------------------------------------------------------------
+# JSON-friendly previews for event payloads
+# ---------------------------------------------------------------------------
+def brief(value: Any, limit: int = 400) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit] + "…"
+    if isinstance(value, dict):
+        return {str(k): brief(v, limit) for k, v in list(value.items())[:20]}
+    if isinstance(value, (list, tuple)):
+        return [brief(v, limit) for v in list(value)[:20]]
+    s = repr(value)
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def outputs_of(result: Any) -> Any:
+    """Prediction -> {field: value} (minus bulky trajectories); else a preview."""
+    items = getattr(result, "items", None)
+    if callable(items):
+        try:
+            return {k: brief(v) for k, v in items() if k != "trajectory"}
+        except Exception:
+            pass
+    return brief(result)
+
+
+def model_name(lm: Any) -> Optional[str]:
+    return getattr(lm, "model", None) if lm is not None else None
