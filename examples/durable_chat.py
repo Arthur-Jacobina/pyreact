@@ -22,7 +22,7 @@ Inspect the file from another terminal:
 
     uv run python -m pyreact_durable show artifacts/durable_chat.jsonl
 
-Uses OpenAI when OPENAI_API_KEY is set, otherwise the ``claude -p`` dev LM.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
 """
 
 from __future__ import annotations

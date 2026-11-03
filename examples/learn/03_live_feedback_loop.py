@@ -20,7 +20,8 @@ Scripted (a simulated user rates each answer against a gold route)::
 
     uv run python -m examples.learn.03_live_feedback_loop --demo
 
-Uses the ``claude -p`` dev LM. ``--demo`` makes ~25 LM calls.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
+``--demo`` makes ~25 LM calls.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import asyncio
 from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_examples
 from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
-from examples._lm import example_lm
+from examples._lm import example_lm, out_path
 from integrations.learn import configure_learning, wait_optimizations
 from pyreact.boot import bootstrap, handle_command, read_terminal_and_invoke
 from pyreact.components.message import Message
@@ -84,7 +85,7 @@ def configure(budget: int = 14) -> None:
         trainset=to_examples(TRAIN[4:7]),  # seed data on top of your ratings
         valset=to_examples(VAL[:4]),
         min_examples=3,
-        save_dir="artifacts/learn",
+        save_dir=out_path(),
     )
 
 

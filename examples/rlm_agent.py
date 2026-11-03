@@ -7,7 +7,7 @@ relevant pieces, instead of stuffing everything into a prompt.
 
     uv run python -m examples.rlm_agent "Where are rerenders deduplicated?"
 
-Uses the ``claude -p`` CLI LM (no API key needed). Requires Deno for the
+LM: ``examples._lm`` (``claude -p`` by default; skipped offline). Requires Deno for the
 default sandbox (see ``integrations/rlm.py``).
 """
 

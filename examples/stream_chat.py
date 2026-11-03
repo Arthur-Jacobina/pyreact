@@ -8,8 +8,9 @@ Run from the repo root:
 
     uv run python -m examples.stream_chat
 
-Uses OpenAI (streams token by token) when OPENAI_API_KEY is set, otherwise
-the ``claude -p`` dev LM (no streaming: the answer appears at once).
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
+OpenAI streams token by token; the ``claude -p`` dev LM doesn't stream, so the
+answer appears at once.
 """
 
 import asyncio

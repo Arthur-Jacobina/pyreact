@@ -15,7 +15,7 @@ from), the same cancellation. Each user input is a turn naming the arch to use.
     uv run python -m examples.learn.01_architectures            # predict, cot, rlm
     uv run python -m examples.learn.01_architectures cot rlm    # pick some
 
-Uses the ``claude -p`` dev LM (no API key). ~8 LM calls.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``). ~8 LM calls.
 """
 
 from __future__ import annotations

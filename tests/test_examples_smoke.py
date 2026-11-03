@@ -5,8 +5,10 @@ so nothing is imported here):
 
     SMOKE = {"args": [...], "stdin": "line\\n:q\\n", "timeout": 120}
 
-``{tmp}`` in args is replaced by a per-test temporary directory. The run must
-exit 0 and print no traceback. Answers are meaningless offline: this guards
+``{tmp}`` in args is replaced by a per-test temporary directory, and artifacts
+go there too (``PYREACT_EXAMPLE_OUT``). The run must exit 0, print no traceback
+and leave the repository untouched (offline output must never overwrite real
+artifacts). Answers are meaningless offline: this guards
 against examples rotting, not against bad prompts.
 """
 
@@ -41,6 +43,14 @@ def _specs():
 SPECS = _specs()
 
 
+def _repo_status():
+    out = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    return out.stdout if out.returncode == 0 else None
+
+
 def test_examples_declare_smoke_specs():
     assert len(SPECS) >= 8, "examples lost their SMOKE specs"
 
@@ -49,8 +59,14 @@ def test_examples_declare_smoke_specs():
 @pytest.mark.parametrize("module,spec", SPECS)
 def test_example_runs_offline(module, spec, tmp_path):
     args = [a.replace("{tmp}", str(tmp_path)) for a in spec.get("args", [])]
-    env = {**os.environ, "PYREACT_EXAMPLE_LM": "offline", "PYTHONUNBUFFERED": "1"}
+    env = {
+        **os.environ,
+        "PYREACT_EXAMPLE_LM": "offline",
+        "PYREACT_EXAMPLE_OUT": str(tmp_path / "out"),
+        "PYTHONUNBUFFERED": "1",
+    }
     env.pop("OPENAI_API_KEY", None)
+    before = _repo_status()
     proc = subprocess.run(
         [sys.executable, "-m", module, *args],
         cwd=tmp_path if spec.get("cwd") == "tmp" else ROOT,
@@ -63,3 +79,5 @@ def test_example_runs_offline(module, spec, tmp_path):
     output = proc.stdout + proc.stderr
     assert proc.returncode == 0, f"{module} exited {proc.returncode}\n{output[-4000:]}"
     assert "Traceback (most recent call last)" not in output, output[-4000:]
+    if before is not None:
+        assert _repo_status() == before, f"{module} wrote into the repository"

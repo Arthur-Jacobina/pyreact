@@ -1,12 +1,12 @@
 {
   "format": "pyreact.learn/1",
-  "created": "2026-11-03T10:27:00",
+  "created": "2026-11-03T01:50:00",
   "optimizer": "bootstrap",
   "budget": 2,
-  "baseline": 0.0,
-  "score": 0.0,
-  "calls": 10,
-  "seconds": 0.03,
+  "baseline": 0.5,
+  "score": 0.5,
+  "calls": 7,
+  "seconds": 16.48,
   "train_size": 6,
   "val_size": 4,
   "metric": "route_metric",
@@ -16,7 +16,7 @@
   "module_key": null,
   "details": {
     "calls_by_phase": {
-      "compile": 6,
+      "compile": 3,
       "evaluate": 4
     },
     "log_dir": null
@@ -26,12 +26,14 @@
     "train": [],
     "demos": [
       {
-        "ticket": "I was charged twice this month, please refund one of them",
-        "team": "account"
+        "augmented": true,
+        "ticket": "Can you send me a copy of my March invoice?",
+        "team": "billing"
       },
       {
-        "ticket": "I can't log in, the password reset email never arrives",
-        "team": "tech"
+        "augmented": true,
+        "ticket": "I want to cancel, your app keeps crashing",
+        "team": "retention"
       }
     ],
     "signature": {

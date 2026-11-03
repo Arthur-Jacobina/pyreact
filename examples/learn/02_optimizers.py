@@ -13,7 +13,8 @@ feedback text; the others use the score).
     uv run python -m examples.learn.02_optimizers                 # all three
     uv run python -m examples.learn.02_optimizers gepa            # just one
 
-Uses the ``claude -p`` dev LM. ~60 LM calls with the budgets below.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
+~60 LM calls with the budgets below.
 Results are saved to ``artifacts/learn/02_<optimizer>.json``; compare them
 with ``python -m integrations.learn diff a.json b.json``.
 """
@@ -25,7 +26,7 @@ import sys
 import dspy
 
 from integrations.architectures import build_module
-from examples._lm import example_lm
+from examples._lm import example_lm, out_path
 from integrations.learn import evaluate, optimize
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -111,7 +112,7 @@ def main(names: list[str]) -> None:
                        baseline=baseline, num_threads=4,
                        on_progress=lambda phase, info: print(f"  [{phase}] {info}", flush=True),
                        **opts)
-        res.save(f"artifacts/learn/02_{name}.json")
+        res.save(out_path(f"02_{name}.json"))
         results[name] = res
 
     print(f"\n{'optimizer':<10} {'budget':>6} {'val before':>10} {'val after':>9} "

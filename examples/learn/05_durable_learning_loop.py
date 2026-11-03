@@ -28,7 +28,8 @@ Phases (each one is a separate process in real life)::
     uv run python -m pyreact_durable show runs/store_router.jsonl
     uv run python -m pyreact_durable events runs/store_router.jsonl --kind feedback
 
-Uses the ``claude -p`` dev LM (haiku). ``all`` makes roughly 50-70 LM calls.
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
+``all`` makes roughly 50-70 LM calls.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ from pyreact_durable import Durable, SessionLog
 SMOKE = {"args": ["all", "--log", "{tmp}/store.jsonl", "--out", "{tmp}/router.json", "--budget", "16"]}
 
 LOG = "runs/store_router.jsonl"
-ARTIFACT = "artifacts/learn/router_from_journal.json"
+ARTIFACT = "artifacts/learn/router_from_journal.json"  # default --out
 KEY = "supervisor"  # module name -> the handle hot_swap / datasets use
 
 

@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import dspy
 
-__all__ = ["OFFLINE", "OfflineLM", "example_lm", "example_models", "lm_kind"]
+__all__ = ["OFFLINE", "OfflineLM", "example_lm", "example_models", "lm_kind", "out_path"]
 
 
 def lm_kind() -> str:
@@ -57,6 +57,14 @@ def example_lm(model: str = "haiku") -> Any:
     from integrations.claude_cli_lm import ClaudeCLILM
 
     return ClaudeCLILM(model)
+
+
+def out_path(name: str = "") -> str:
+    """Where examples write artifacts: ``$PYREACT_EXAMPLE_OUT`` (the smoke test
+    points it at a temp dir) or ``artifacts/learn``. Creates the directory."""
+    root = os.getenv("PYREACT_EXAMPLE_OUT") or "artifacts/learn"
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, name) if name else root
 
 
 def example_models() -> Dict[str, Any]:
