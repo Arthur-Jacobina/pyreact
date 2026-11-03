@@ -502,6 +502,7 @@ async def invoke_module(
         tm.exit_scope(token)
     if used["model"] != model:  # a middleware switched models (fallback_model)
         base["model"] = used["model"]
+    if models:
         base["model_key"] = used["model_key"]
     usage = recorder.summary()
     usage["latency"] = time.perf_counter() - t0
