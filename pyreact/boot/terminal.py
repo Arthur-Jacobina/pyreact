@@ -77,9 +77,11 @@ async def read_terminal_and_invoke(
             if s in (":q", ":quit", ":exit"):
                 break
             try:
-                app.invoke(txt, wait=wait)
-            except Exception:
-                # Keep the loop resilient to user code errors
-                pass
+                await app.ainvoke(txt, wait=wait)
+            except Exception as exc:
+                # Keep the loop resilient, but don't hide the problem
+                print(f"\x1b[31m[pyreact]\x1b[0m input not delivered: {exc}")
+                if not app.is_running:
+                    break
     except (KeyboardInterrupt, SystemExit):
         pass

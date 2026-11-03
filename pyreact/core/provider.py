@@ -1,15 +1,30 @@
 # provider.py ----------------------------------------------------
-from contextvars import ContextVar
 from functools import wraps
 from weakref import WeakSet
 from pyreact.core.core import component, hooks
 from pyreact.core.runtime import schedule_rerender
 
-# Global registry to prevent ContextVar instances from being garbage collected
-_CONTEXT_REGISTRY = {}
+# Strong references to every created context (kept for introspection).
+_CONTEXT_REGISTRY = []
 
 
-def provider(ctx_var, *, prop="value"):
+class _ContextKey:
+    """Identity key for a context; holds the global (provider-less) value."""
+
+    __slots__ = ("name", "value")
+
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def __repr__(self):
+        return f"<ContextKey {self.name!r}>"
+
+
+def provider(ctx_key, *, prop="value"):
     def decorator(body_fn):
         @component
         @wraps(body_fn)
@@ -19,14 +34,9 @@ def provider(ctx_var, *, prop="value"):
             except KeyError:
                 raise TypeError(f"Provider missing required prop '{prop}'")
 
-            token = ctx_var.set(value)
-
-            def cleanup():
-                ctx_var.reset(token)
-
-            # register the cleanup – runs on the next commit or unmount
-            hooks.use_effect(lambda: cleanup, [value])
-
+            # Scope the value to this provider's subtree (resolved by
+            # descendants walking up their parent chain in use_context).
+            hooks.provide(ctx_key, value)
             return body_fn(**props)
 
         return wrapper
@@ -35,21 +45,24 @@ def provider(ctx_var, *, prop="value"):
 
 
 def create_context(*, default=None, name="Context", prop="value"):
-    # Check if context already exists in registry
-    context_key = f"{name}_{id(default) if default is not None else 'None'}"
-    if context_key in _CONTEXT_REGISTRY:
-        return _CONTEXT_REGISTRY[context_key]
+    """Create a new, independent context.
 
-    ctx_var = ContextVar(name, default=default)
+    - ``Ctx(value=..., children=[...])`` provides a value to a subtree.
+    - ``hooks.use_context(Ctx)`` reads the nearest provided value, or the
+      context's global value when no provider is mounted above.
+    - ``Ctx.set(v)`` updates the global value and rerenders subscribers;
+      it does not override values given by a mounted provider.
+    """
+    ctx_key = _ContextKey(name, default)
     subs_set = WeakSet()
 
-    @provider(ctx_var, prop=prop)
+    @provider(ctx_key, prop=prop)
     def _Provider(**props):
         return props.get("children", [])
 
     class _Context:
         # used by use_context / unmount
-        _ctx = ctx_var
+        _ctx = ctx_key
         _subs = subs_set
 
         @staticmethod
@@ -58,21 +71,14 @@ def create_context(*, default=None, name="Context", prop="value"):
 
         @staticmethod
         def get():
-            return ctx_var.get()
-
-        @staticmethod
-        def reset(token):
-            return ctx_var.reset(token)
+            return ctx_key.value
 
         @staticmethod
         def set(value):
-            token = ctx_var.set(value)
+            ctx_key.value = value
             for hctx in list(subs_set):
-                try:
+                if getattr(hctx, "_mounted", True):
                     schedule_rerender(hctx, reason=f"context {name} set")
-                except Exception:
-                    schedule_rerender(hctx)
-            return token
 
         def __call__(self, **props):
             return _Provider(**props)
@@ -81,8 +87,5 @@ def create_context(*, default=None, name="Context", prop="value"):
             return f"<Context {name!r} default={default!r}>"
 
     context_instance = _Context()
-
-    # Register the context to prevent garbage collection
-    _CONTEXT_REGISTRY[context_key] = context_instance
-
+    _CONTEXT_REGISTRY.append(context_instance)
     return context_instance

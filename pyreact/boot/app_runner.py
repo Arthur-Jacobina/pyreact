@@ -1,11 +1,13 @@
 import asyncio
+import concurrent.futures
 import inspect
 import threading
 import time
 from typing import Optional, Callable
 
 from pyreact.core.hook import HookContext
-from pyreact.core.runtime import run_renders, schedule_rerender, get_render_idle
+from pyreact.core import runtime
+from pyreact.core.runtime import run_renders, schedule_rerender
 from pyreact.input.bus import InputBus
 from pyreact.router.nav_service import NavService
 from pyreact.web.console import MessageBuffer
@@ -36,6 +38,8 @@ class AppRunner:
         )
         self._stopping: bool = False
         self._ready: threading.Event = threading.Event()
+        self._startup_error: Optional[BaseException] = None
+        self._bus = None
 
         self._root_ctx: Optional[HookContext] = None
 
@@ -48,32 +52,55 @@ class AppRunner:
 
         self._thread.start()
         self._ready.wait()
+        if self._startup_error is not None:
+            raise RuntimeError("AppRunner failed to start") from self._startup_error
+
+    @property
+    def is_running(self) -> bool:
+        return not self._stopping and self._thread.is_alive()
+
+    def _submit(self, coro):
+        if not self.is_running:
+            coro.close()
+            raise RuntimeError("AppRunner is not running")
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    async def _emit_and_maybe_wait(self, txt: str, should_wait: bool):
+        _emit_text_and_submit(self._bus, txt)
+        if should_wait:
+            await runtime.wait_idle()
 
     def invoke(
         self, text: str, *, wait: bool = False, timeout: Optional[float] = None
     ) -> None:
         """Send a line of input to the app via the InputBus.
 
-        If wait=True, blocks until the current render batch becomes idle or until timeout.
+        If wait=True, blocks until the app is idle: no queued renders and no
+        pending background tasks spawned by components (e.g. LLM calls).
+        Raises TimeoutError if that takes longer than ``timeout`` seconds.
+        Do not call with wait=True from inside a running event loop; use
+        :meth:`ainvoke` there.
         """
-        if self._stopping or self._bus is None:
-            return
-
-        async def _do_emit_and_maybe_wait(txt: str, should_wait: bool):
-            _emit_text_and_submit(self._bus, txt)
-            if should_wait:
-                # Let at least one render cycle commit before returning
-                await asyncio.sleep(0)
-                await get_render_idle().wait()
-
-        fut = asyncio.run_coroutine_threadsafe(
-            _do_emit_and_maybe_wait(text, wait), self._loop
-        )
+        fut = self._submit(self._emit_and_maybe_wait(text, wait))
         if wait:
             try:
                 fut.result(timeout=timeout)
-            except Exception:
-                return
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"app not idle after {timeout}s") from None
+
+    async def ainvoke(
+        self, text: str, *, wait: bool = False, timeout: Optional[float] = None
+    ) -> None:
+        """Async version of :meth:`invoke` for callers on another event loop."""
+        fut = self._submit(self._emit_and_maybe_wait(text, wait))
+        await asyncio.wait_for(asyncio.wrap_future(fut), timeout)
+
+    def wait_idle(self, timeout: Optional[float] = None) -> None:
+        """Block until no renders or component tasks are pending."""
+        try:
+            self._submit(runtime.wait_idle()).result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"app not idle after {timeout}s") from None
 
     def shutdown(self) -> None:
         """Stop render loop and background threads."""
@@ -105,16 +132,21 @@ class AppRunner:
         except Exception:
             pass
 
-        # Nudge the loop so the sleep wakes up promptly
-        def _noop():
-            return None
+        # Wake the loop so it notices _stopping promptly
+        def _wake():
+            runtime.get_render_signal().set()
 
         try:
-            self._loop.call_soon_threadsafe(_noop)
+            self._loop.call_soon_threadsafe(_wake)
         except Exception:
             pass
         # Wait loop thread to exit
         self._thread.join(timeout=2.0)
+        if not self._thread.is_alive():
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     # -------------------------------
     # Debug/Navigation helpers
@@ -246,13 +278,23 @@ class AppRunner:
     # -------------------------------
     def _thread_main(self) -> None:
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._loop_main())
+        try:
+            self._loop.run_until_complete(self._loop_main())
+        except BaseException as exc:  # pragma: no cover - defensive
+            if not self._ready.is_set():
+                self._startup_error = exc
+            else:
+                runtime.report_error(exc, self._root_ctx, "runner")
+        finally:
+            self._stopping = True
+            self._ready.set()
 
     async def _loop_main(self) -> None:
         from pyreact.core.debug import enable_tracing, clear_traces
 
         clear_traces()
         enable_tracing()
+        runtime.bind_loop(asyncio.get_running_loop())
 
         # Initialize root context and services within the loop thread
         self._root_ctx = HookContext(
@@ -293,16 +335,45 @@ class AppRunner:
         except Exception:
             pass
 
+        # Commit the first render (and its effects, e.g. input subscriptions)
+        # before reporting ready, so early invoke() calls are not lost.
+        try:
+            # schedule_rerender enqueues via call_soon; yield so it lands,
+            # and keep going while the first commit schedules more renders.
+            await asyncio.sleep(0)
+            while not runtime.is_idle() or not runtime.rerender_queue.empty():
+                if runtime.pending_tasks() and runtime.rerender_queue.empty():
+                    break  # only background work left; don't block startup
+                await run_renders()
+                await asyncio.sleep(0)
+        except BaseException as exc:
+            self._startup_error = exc
+            raise
+
         self._ready.set()
 
+        # fps is now only an upper bound on how long we sleep between checks
+        # of _stopping; renders run as soon as they are scheduled.
         interval = 1.0 / max(1, self._fps)
+        signal = runtime.get_render_signal()
         try:
             while not self._stopping:
-                await run_renders()
-                await asyncio.sleep(interval)
+                try:
+                    await asyncio.wait_for(signal.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    continue
+                if self._stopping:
+                    break
+                try:
+                    await run_renders()
+                except Exception as exc:  # never let the loop die
+                    runtime.report_error(exc, self._root_ctx, "render")
         finally:
             try:
                 if self._root_ctx is not None:
                     self._root_ctx.unmount()
             except Exception:
                 pass
+            for t in runtime.pending_tasks():
+                t.cancel()
+            runtime.bind_loop(None)

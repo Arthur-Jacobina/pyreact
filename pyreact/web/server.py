@@ -43,7 +43,10 @@ def create_fastapi_app(runner: AppRunner):
         async def _broadcast_stdout(text: str) -> None:
             if text.startswith("__MESSAGE__:"):
                 message_json = text[12:]  # Remove "__MESSAGE__:"
-                message_data = json.loads(message_json)
+                try:
+                    message_data = json.loads(message_json)
+                except ValueError:
+                    message_data = {"type": "message", "text": message_json, "sender": "system", "message_type": "error"}
 
                 await broadcast.publish(
                     ChannelName.MSG,
@@ -111,7 +114,8 @@ def create_fastapi_app(runner: AppRunner):
                         },
                     },
                 )
-                runner.invoke(value, wait=True)
+                # Never block the server's event loop waiting on the app.
+                await runner.ainvoke(value)
                 return
 
             if t == "debug":

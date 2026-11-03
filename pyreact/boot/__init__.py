@@ -4,7 +4,6 @@ from .web import run_web
 from .app_runner import AppRunner
 
 __all__ = [
-    "run_terminal",
     "run_web",
     "bootstrap",
     "AppRunner",
