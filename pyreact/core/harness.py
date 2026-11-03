@@ -59,13 +59,22 @@ _ids = itertools.count(1)
 
 
 class Blocked(Exception):
-    """Raised by a guard to refuse a boundary call (the call never runs)."""
+    """Raised by a guard to refuse a boundary call (the call never runs).
+
+    The harness fills ``boundary`` when the guard didn't, so the message
+    always says what was blocked: ``"llm 'QA' blocked by toxicity: <reason>"``.
+    """
 
     def __init__(self, reason: str, *, boundary: "Boundary" = None, by: str = None):
         super().__init__(reason)
         self.reason = reason
         self.boundary = boundary
         self.by = by
+
+    def __str__(self) -> str:
+        b = self.boundary
+        what = f"{b.kind} {b.name!r} blocked" if b is not None else "blocked"
+        return f"{what}{f' by {self.by}' if self.by else ''}: {self.reason}"
 
 
 @dataclass
@@ -124,22 +133,42 @@ class Harness:
 
     async def run(self, b: Boundary, fn: Next) -> Any:
         chain = [mw for mw in self.middleware if _applies(mw, b.kind)]
+        if not chain:  # fast path: an empty pipeline is a plain call
+            return await fn(b)
 
         async def call(i: int, bnd: Boundary) -> Any:
             if i == len(chain):
-                return await fn(bnd)
+                try:
+                    return await fn(bnd)
+                except Blocked as exc:  # raised by the owner itself
+                    exc._harness_seen = True
+                    raise
 
             async def call_next(nb: Boundary) -> Any:
                 return await call(i + 1, nb)
 
-            return await chain[i](bnd, call_next)
+            try:
+                return await chain[i](bnd, call_next)
+            except Blocked as exc:
+                if not getattr(exc, "_harness_seen", False):
+                    exc._harness_seen = True  # first frame = the guard that raised
+                    if exc.by is None:
+                        exc.by = _name(chain[i])
+                raise
 
-        return await call(0, b)
+        try:
+            return await call(0, b)
+        except Blocked as exc:
+            if exc.boundary is None:
+                exc.boundary = b
+            raise
 
     def __repr__(self) -> str:
-        names = [getattr(m, "harness_name", getattr(m, "__name__", type(m).__name__))
-                 for m in self.middleware]
-        return f"<Harness {names}>"
+        return f"<Harness {[_name(m) for m in self.middleware]}>"
+
+
+def _name(mw: Any) -> str:
+    return getattr(mw, "harness_name", None) or getattr(mw, "__name__", type(mw).__name__)
 
 
 # ---------------------------------------------------------------------------

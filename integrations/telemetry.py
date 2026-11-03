@@ -9,6 +9,7 @@ Every LM/module call and tool call is published on the app's
     llm.end     {call_id, module, component, model, latency, usage, cost, outputs}
     llm.error   {call_id, module, component, model, latency, usage, cost, error}
     llm.cancel  {call_id, module, component, latency}
+    llm.blocked {call_id, module, component, model, reason, by, message}  (then llm.error)
     tool.start  {call_id, tool, args}
     tool.end    {call_id, tool, args, duration, error, result}
 

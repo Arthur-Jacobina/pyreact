@@ -12,6 +12,7 @@ from integrations.claude_cli_lm import _wrap
 from integrations.dspy_integration import DSPyProvider
 from integrations.rlm import LenientRLMAdapter, RLMSandboxError, use_rlm
 from pyreact.core import EventBus, HookContext, component, hooks, runtime
+from pyreact.core.harness import HarnessProvider
 from pyreact.core.runtime import schedule_rerender
 
 
@@ -194,3 +195,36 @@ def test_lenient_adapter_accepts_prose_plus_code_block():
     assert out == {"reasoning": "I'll look first.", "code": "print(1)"}
     with pytest.raises(Exception):
         LenientRLMAdapter().parse(dspy.Signature("q -> answer"), "no markers")
+
+
+def test_rlm_run_is_an_llm_boundary():
+    seen = []
+
+    async def spy(b, call_next):
+        out = await call_next(b)
+        seen.append((b.kind, b.attrs["arch"], b.attrs["call_id"], b.attrs["outputs"]["answer"]))
+        return out
+
+    hs = {}
+
+    @component
+    def Agent():
+        run, (result, ver), _l, error = use_rlm(
+            "context, question -> answer", lm=FakeLM(), max_iterations=5,
+            interpreter=lambda: FakeInterpreter(steps=1),
+        )
+        hs["run"], hs["result"] = run, result
+        return []
+
+    @component
+    def Root():
+        return [HarnessProvider(key="h", middleware=[spy], children=[Agent(key="a")])]
+
+    async def main():
+        schedule_rerender(HookContext("Root", Root))
+        await _settle()
+        hs["cid"] = hs["run"](context="abc", question="q")
+        await _settle()
+
+    asyncio.run(main())
+    assert seen == [("llm", "rlm", hs["cid"], "len=3")]
