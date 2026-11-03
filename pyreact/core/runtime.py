@@ -156,9 +156,36 @@ def set_error_handler(handler: Optional[ErrorHandler]) -> None:
     _error_handler = handler
 
 
+# Phases an ErrorBoundary (pyreact.core.error_boundary) may catch.
+BOUNDARY_PHASES = frozenset({"render", "effect", "task"})
+
+
+def _to_error_boundary(exc: BaseException, ctx: Any, phase: str) -> bool:
+    """Offer the error to the nearest mounted ancestor exposing
+    ``_catch_error(exc, ctx, phase) -> bool`` (an ErrorBoundary); True if one
+    handled it."""
+    node = getattr(ctx, "parent", None)
+    while node is not None:
+        catch = getattr(node, "_catch_error", None)
+        if catch is not None and getattr(node, "_mounted", True):
+            try:
+                if catch(exc, ctx, phase):
+                    return True
+            except Exception:
+                pass  # a failing boundary must not hide the original error
+        node = getattr(node, "parent", None)
+    return False
+
+
 def report_error(
     exc: BaseException, ctx: Any = None, phase: str = "render", *, turn: Any = _UNSET
 ) -> None:
+    """Route a component error: to the nearest ``ErrorBoundary`` above
+    ``ctx`` (render / effect / task errors), else record it on its turn
+    (status ``"error"``) and pass it to the error handler (stderr by
+    default)."""
+    if ctx is not None and phase in BOUNDARY_PHASES and _to_error_boundary(exc, ctx, phase):
+        return
     tid = current_turn_id(ctx) if turn is _UNSET else turn
     if tid is not None:
         _turn_errors.setdefault(tid, []).append((phase, exc))
