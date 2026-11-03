@@ -7,9 +7,9 @@ does. Rendering ``Message(text=..., sender=..., message_type=...)`` publishes
     message  {"text", "sender", "message_type", "timestamp"}
 
 on the session's ``EventBus`` (with the turn id and component path). Who
-displays it is the transport's business: the terminal's ``ConsoleSink``, the
-web UI over its WebSocket, a JSONL log, your own subscriber -- below, a plain
-``bus.subscribe`` callback.
+displays it is the transport's business: the terminal's ``ConsoleSink``
+(``run_repl``), the web UI over its WebSocket, a JSONL log -- below, also a
+devtools trace of the raw event (``examples/_devtools.py``).
 
 Run from the repo root::
 
@@ -22,9 +22,8 @@ No LM.
 
 from __future__ import annotations
 
-import asyncio
-
-from pyreact.boot import bootstrap, read_terminal_and_invoke
+from examples._devtools import run_repl, trace
+from pyreact.boot import create_root
 from pyreact.components.message import Message, set_legacy_message_bridge
 from pyreact.core import component, use_turn
 
@@ -46,20 +45,16 @@ def Greeter():
                     f"({len(turn.text)} chars)", sender="assistant")]
 
 
-async def main() -> None:
-    app = bootstrap(Greeter)
-    # Any subscriber can render messages; this one prints the raw event. It
-    # attaches after mount, so it misses the welcome (ConsoleSink replays the log).
-    app.event_bus.subscribe(
-        lambda ev: print(f"  [subscriber] {ev.kind} turn={ev.turn_id} from {ev.source}: "
-                         f"{ev.payload['sender']}/{ev.payload['message_type']}"),
-        ["message"],
-    )
-    try:
-        await read_terminal_and_invoke(app, prompt="> ")  # ConsoleSink renders them too
-    finally:
-        app.shutdown()
+def raw(ev) -> str:  # devtools view of the event behind each Message
+    return (f"  [devtools] {ev.kind} turn={ev.turn_id} from {ev.source}: "
+            f"{ev.payload['sender']}/{ev.payload['message_type']}")
+
+
+def main() -> None:
+    with create_root(Greeter, session_id="message") as root:  # mounts the tree; unmounts on exit
+        trace(root, ["message"], raw)
+        run_repl(root, prompt="> ")  # each line -> root.send(line); Messages print
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

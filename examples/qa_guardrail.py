@@ -28,14 +28,14 @@ LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offl
 
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
 
 import dspy
 
+from examples._devtools import run_repl
 from examples._lm import example_models
 from integrations import DSPyProvider, use_agent_call
-from pyreact.boot import bootstrap, read_terminal_and_invoke
+from pyreact.boot import create_root
 from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_turn
 
@@ -125,13 +125,10 @@ def Root(models=None):
     return [DSPyProvider(key="dspy", models=lms, children=[QAHome(key="qa-home")])]
 
 
-async def main() -> None:
-    app = bootstrap(Root)
-    try:
-        await read_terminal_and_invoke(app, prompt="> ")  # messages render via ConsoleSink
-    finally:
-        app.shutdown()
+def main() -> None:
+    with create_root(Root, session_id="qa") as root:  # the outside world's handle
+        run_repl(root, prompt="> ")  # a line = a turn; Messages print
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -21,10 +21,10 @@ No LM.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
 
-from pyreact.boot import bootstrap, read_terminal_and_invoke
+from examples._devtools import run_repl
+from pyreact.boot import create_root
 from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_emit, use_turn
 
@@ -58,14 +58,11 @@ def Echo():
     return out
 
 
-async def main() -> None:
-    app = bootstrap(Echo)
-    try:
+def main() -> None:
+    with create_root(Echo, session_id="log") as root:
         # Show our custom kind next to chat messages.
-        await read_terminal_and_invoke(app, prompt="> ", console_kinds=("message", "log"))
-    finally:
-        app.shutdown()
+        run_repl(root, prompt="> ", console_kinds=("message", "log"))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
