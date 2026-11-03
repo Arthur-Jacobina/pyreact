@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import dspy
 
-from pyreact.core.core import component, hooks
+from pyreact.core.core import component, hooks, use_path
 from pyreact.core.provider import create_context
 
 
@@ -122,11 +122,7 @@ def DSPyProvider(
     # Make the env discoverable from outside the tree (dev tools, hot swap by
     # key): ``session.services["dspy_envs"][provider_path] = env``.
     try:
-        from pyreact.core.core import _context_stack
-
-        from .telemetry import component_path
-
-        hooks.get_service(ENVS_SERVICE, dict)[component_path(_context_stack.get())] = env
+        hooks.get_service(ENVS_SERVICE, dict)[use_path()] = env
     except Exception:
         pass
     return [DSPyContext(value=env, children=children or [])]

@@ -263,3 +263,43 @@ def test_use_ref_is_stable_and_does_not_rerender():
     asyncio.run(main())
     assert isinstance(refs[0], Ref) and refs[0] is refs[1]
     assert renders == [0, 41]  # initial ignored after mount
+
+
+def test_use_path_in_render_and_effects():
+    import pytest
+
+    from pyreact.core import use_path
+
+    seen = {}
+
+    @component
+    def Leaf():
+        seen["render"] = use_path()
+        hooks.use_effect(lambda: seen.__setitem__("effect", use_path()), [])
+        return []
+
+    @component
+    def App():
+        return [create_context(name="X")(value=1, children=[Leaf(key="leaf")])]
+
+    asyncio.run(_mount(App))
+    assert seen == {"render": "App/Leaf[leaf]", "effect": "App/Leaf[leaf]"}
+    with pytest.raises(RuntimeError):
+        use_path()
+
+
+def test_message_source_is_the_component_path(tmp_path):
+    from pyreact.boot import bootstrap
+    from pyreact.components.message import Message
+
+    @component
+    def App():
+        return [Message(key="hello", text="hi", sender="assistant")]
+
+    app = bootstrap(App)
+    try:
+        app.wait_idle(timeout=5)
+        (ev,) = app.events.recent(None, ["message"])
+    finally:
+        app.shutdown()
+    assert ev.source == "App/Message[hello]"
