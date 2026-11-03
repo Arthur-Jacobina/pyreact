@@ -3,7 +3,9 @@
 ``.diff()`` shows per-predictor instructions and demos before -> after,
 ``.report()`` a summary, ``.save()`` / :func:`load` persist it as JSON
 (program state + metadata + the baseline state, so ``diff`` works offline),
-``.hot_swap(target)`` replaces the module in a running app (HMR).
+``.hot_swap(target)`` makes it the live program (HMR): it updates the
+``LearnedProgram`` provider that declares it (a re-render), else replaces the
+module in the app's ``DSPyEnv`` (legacy).
 """
 
 from __future__ import annotations
@@ -230,16 +232,26 @@ class OptimizationResult:
 
     # -- shipping -----------------------------------------------------------
     def hot_swap(self, target: Any, key: Any = None) -> List[Any]:
-        """Replace the module in a running app with :attr:`program` (HMR).
+        """Make :attr:`program` the live program for ``key`` (HMR).
 
-        ``target``: a ``DSPyEnv``, an ``AppRunner`` / ``Session`` (the swap is
-        scheduled on its loop) or ``None`` (every live provider). ``key``: the
-        module key (tuple, ``"Cls:sig:scope"`` string, or just the scope /
+        A thin wrapper: when ``target`` (an ``AppRunner`` / ``Session``, or
+        ``None`` for headless trees) mounts a ``LearnedProgram`` /
+        ``LearnedPrograms`` provider that declares ``key`` (or whose
+        ``use_learned`` users match it), that provider's state is updated
+        and its subtree re-renders with this program -- the same thing as
+        re-rendering it with ``src=<this result>``. Returns the paths of the
+        components that read it.
+
+        Otherwise (legacy, apps without a provider) the module cached under
+        ``key`` in the app's ``DSPyEnv`` is replaced in place; ``target`` may
+        also be a ``DSPyEnv`` for that. ``key``: the learned name or module
+        key (tuple, ``"Cls:sig:scope"`` string, or just the scope /
         component key, e.g. ``"supervisor"``); default: ``module_key``.
-        Returns the components scheduled for rerender (``[]`` when the swap
-        was scheduled on an app loop).
         """
+        from integrations.dspy_integration import DSPyEnv
+
         from .hmr import hot_swap_into
+        from .programs import swap_learned
 
         for attr, val in (("_pyreact_result_path", self.path),
                           ("_pyreact_optimizer", self.optimizer)):
@@ -248,7 +260,12 @@ class OptimizationResult:
                     setattr(self.program, attr, val)  # a suspend can point at the file
                 except Exception:
                     pass
-        return hot_swap_into(target, key if key is not None else self.module_key, self.program)
+        key = key if key is not None else self.module_key
+        if not isinstance(target, DSPyEnv):
+            users = swap_learned(target, key, self)
+            if users is not None:
+                return users
+        return hot_swap_into(target, key, self.program)
 
 
 def load(path: str, program: Any = None) -> OptimizationResult:
