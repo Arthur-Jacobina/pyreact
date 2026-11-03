@@ -40,6 +40,7 @@ import copy
 import json
 import os
 import secrets
+import shutil
 import threading
 import uuid
 import warnings
@@ -47,6 +48,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from urllib.parse import quote
 
 try:  # POSIX advisory locks
     import fcntl
@@ -63,6 +65,10 @@ __all__ = [
     "SessionLocked",
     "register_migration",
     "kind_matches",
+    "safe_session_id",
+    "log_files",
+    "archive_log",
+    "delete_log",
 ]
 
 FORMAT_VERSION = 1
@@ -863,3 +869,59 @@ class SQLiteSessionLog(SessionLog):
         except BaseException:
             db.execute("ROLLBACK")
             raise
+
+
+# ---------------------------------------------------------------------------
+# Files: session ids as file names, retention
+# ---------------------------------------------------------------------------
+def safe_session_id(session_id: Any) -> str:
+    """``session_id`` as a single, safe file-name component.
+
+    Ids made of ``[A-Za-z0-9_-]`` (web session ids, uuids, ``"default"``)
+    are returned unchanged; anything else is percent-encoded (``/`` ->
+    ``%2F``, ``.`` -> ``%2E``...), so an id can never escape its directory
+    (``../x``), hide (``.x``) or be empty.
+    """
+    sid = str(session_id)
+    if not sid:
+        return "%00"
+    return quote(sid, safe="").replace(".", "%2E").replace("~", "%7E")
+
+
+def log_files(path: PathLike) -> List[Path]:
+    """The files that make up the log at ``path`` and exist on disk: the file
+    itself plus backend sidecars (SQLite ``-wal`` / ``-shm`` / ``-journal``,
+    the ``.lock`` writer guard)."""
+    p = Path(path)
+    candidates = [p] + [Path(str(p) + s) for s in ("-wal", "-shm", "-journal", ".lock")]
+    return [f for f in candidates if f.exists()]
+
+
+def archive_log(path: PathLike, archive_dir: Optional[PathLike] = None) -> Optional[Path]:
+    """Move a *closed* log (and its sidecars) into ``archive_dir`` (default
+    ``<log dir>/archive``); returns the new path of the log, ``None`` if it did
+    not exist. An existing archive of the same name is not overwritten: the
+    new one gets a ``-<n>`` suffix."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    dest_dir = Path(archive_dir) if archive_dir is not None else p.parent / "archive"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest, n = dest_dir / p.name, 1
+    while dest.exists():
+        dest, n = dest_dir / f"{p.stem}-{n}{p.suffix}", n + 1
+    for f in log_files(p):
+        if f.name.endswith(".lock"):
+            f.unlink(missing_ok=True)  # a lock file means nothing once closed
+        else:
+            shutil.move(str(f), str(dest) + str(f)[len(str(p)):])
+    return dest
+
+
+def delete_log(path: PathLike) -> List[Path]:
+    """Delete a *closed* log and its sidecars; returns the files removed."""
+    removed = []
+    for f in log_files(path):
+        f.unlink(missing_ok=True)
+        removed.append(f)
+    return removed

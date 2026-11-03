@@ -195,6 +195,29 @@ log.close()                               # also a context manager
   Durable(log_factory=lambda sid: f"logs/{sid}.jsonl", children=[...])
   ```
 
+  The factory gets the id through `safe_session_id(sid)`: ids made of
+  `[A-Za-z0-9_-]` (web ids, uuids, `default`) are unchanged, anything else is
+  percent-encoded (`../x` -> `%2E%2E%2Fx`), so an id can never escape the
+  directory.
+- **Log retention** (`on_close=`): sessions closed by the web TTL reaper (or
+  `close_session()`) leave their log behind by default. Choose what happens
+  to a log `Durable` opened itself when its session closes:
+
+  ```python
+  Durable(log_factory=..., on_close="keep")     # default: leave the file
+  Durable(log_factory=..., on_close="archive")  # move to <log dir>/archive/ (or archive_dir=...)
+  Durable(log_factory=..., on_close="delete")   # remove it (+ SQLite sidecars)
+  Durable(log_factory=..., on_close=lambda path, sid: upload_and_delete(path))
+  ```
+
+  The policy runs only when the *session* is closed — `session.close_reason`
+  is `"idle"` (TTL) or `"closed"` (`close_session`) — never on runner
+  shutdown (`"shutdown"`: restart the server and the tab resumes from its
+  log) and not when just the `Durable` subtree unmounts. Logs passed in as
+  `SessionLog` objects are yours and never touched. `archive_log(path)`,
+  `delete_log(path)` and `log_files(path)` are available for your own
+  cleanup jobs.
+
 - **`use_persistent_state(initial, *, key)`** → `(value, set_value)`, like
   `use_state`. Address = `(hooks.path, key)`; give components stable `key=`
   props so the path does not depend on sibling order. **Providers are
