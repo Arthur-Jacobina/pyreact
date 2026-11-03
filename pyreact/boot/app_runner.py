@@ -4,7 +4,7 @@ import inspect
 import threading
 import time
 import uuid
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from pyreact.core.hook import HookContext
 from pyreact.core import runtime
@@ -14,6 +14,18 @@ from pyreact.core.turns import POLICIES, TurnManager
 from pyreact.web.console import MessageBuffer
 from pyreact.observability import install_session_error_events
 from .session import DEFAULT_SESSION_ID, Session
+
+
+def _accepts_arg(fn: Callable[..., Any]) -> bool:
+    """True if ``fn`` can be called with one positional argument."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    for p in sig.parameters.values():
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL):
+            return True
+    return False
 
 
 class AppRunner:
@@ -49,12 +61,17 @@ class AppRunner:
         turn_policy: str = "queue",
         session_id: str = DEFAULT_SESSION_ID,
         default_session: bool = True,
+        participants: Iterable[Callable[..., Any]] = (),
     ):
         """``turn_policy``: default ``"queue"`` or ``"interrupt"`` for every
         session (see ``pyreact.core.turns``); ``open_session`` may override it.
 
         ``session_id``: id of the default session. ``default_session=False`` starts the loop without mounting
         anything; use :meth:`open_session`.
+
+        ``participants``: factories of checkpoint participants added to every
+        session when it opens (see :meth:`add_participant`); registered
+        before the default session opens.
         """
         if turn_policy not in POLICIES:
             raise ValueError(f"turn_policy must be 'queue' or 'interrupt', got {turn_policy!r}")
@@ -65,6 +82,10 @@ class AppRunner:
         self._sessions: Dict[str, Session] = {}
         self._sessions_lock = threading.Lock()
         self._default: Optional[Session] = None
+        self._session_hooks: List[Dict[str, Optional[Callable[[Session], Any]]]] = []
+        self._hooks_lock = threading.Lock()
+        for factory in participants:
+            self.add_participant(factory)
 
         self._fps: int = max(1, int(fps))
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -157,6 +178,84 @@ class AppRunner:
         with self._sessions_lock:
             return list(self._sessions.values())
 
+    # -------------------------------
+    # Session lifecycle hooks
+    # -------------------------------
+    def on_session(
+        self,
+        open: Optional[Callable[[Session], Any]] = None,
+        close: Optional[Callable[[Session], Any]] = None,
+        *,
+        replay: bool = False,
+    ) -> Callable[[], None]:
+        """Call ``open(session)`` whenever a session opens (or is resumed)
+        and ``close(session)`` whenever one closes (or is suspended).
+        Returns a function that removes the hooks.
+
+        ``open`` runs on the runner loop *before the session's first render*
+        and before ``session.opened`` is published: subscribe to its
+        ``event_bus``, add participants, seed services.
+        ``close`` runs after the tree unmounted (``session.close_reason`` is
+        set). A failing hook is reported, never fatal. ``replay=True`` also
+        calls ``open`` now for the sessions already open (from the calling
+        thread).
+        """
+        entry = {"open": open, "close": close}
+        with self._hooks_lock:
+            self._session_hooks.append(entry)
+        if replay and open is not None:
+            for sess in self.sessions():
+                self._call_hook(open, sess)
+
+        def _remove() -> None:
+            with self._hooks_lock:
+                try:
+                    self._session_hooks.remove(entry)
+                except ValueError:
+                    pass
+
+        return _remove
+
+    def add_participant(self, factory: Callable[..., Any]) -> Callable[[], None]:
+        """Add a checkpoint participant to every session that opens from now
+        on. ``factory(session)`` (or ``factory()``) returns the participant
+        (a class works). Returns a function that stops adding it."""
+        wants_session = _accepts_arg(factory)
+
+        def _add(sess: Session) -> None:
+            sess.participants.add(factory(sess) if wants_session else factory())
+
+        return self.on_session(open=_add)
+
+    def _call_hook(self, fn: Callable[[Session], Any], sess: Session) -> None:
+        try:
+            fn(sess)
+        except Exception as exc:
+            runtime.report_error(exc, sess.root, "session-hook")
+
+    def _fire(self, which: str, sess: Session) -> None:
+        with self._hooks_lock:
+            hooks = [h[which] for h in self._session_hooks if h[which] is not None]
+        for fn in hooks:
+            self._call_hook(fn, sess)
+
+    def _new_session(self, session_id, app, policy) -> Session:
+        sess = Session(
+            self,
+            session_id,
+            app or self._app_component_fn,
+            turn_policy=policy,
+            # Turn ids must be unique across sessions sharing the loop;
+            # the default session keeps the plain "t1", "t2"... ids.
+            turn_id_prefix="" if session_id == self._default_id else f"{session_id}/",
+        )
+        self._sessions[session_id] = sess
+        return sess
+
+    def _opened(self, sess: Session, **payload: Any) -> None:
+        self._fire("open", sess)
+        sess.event_bus.publish("session.opened", {"session_id": sess.id, **payload})
+
     def _open_on_loop(self, session_id, app, turn_policy=None) -> tuple:
         """Get-or-create (loop thread only). Returns (session, created)."""
         policy = turn_policy or self._turn_policy
@@ -167,16 +266,8 @@ class AppRunner:
             if sess is not None and not sess.closed:
                 sess.touch()
                 return sess, False
-            sess = Session(
-                self,
-                session_id,
-                app or self._app_component_fn,
-                turn_policy=policy,
-                # Turn ids must be unique across sessions sharing the loop;
-                # the default session keeps the plain "t1", "t2"... ids.
-                turn_id_prefix="" if session_id == self._default_id else f"{session_id}/",
-            )
-            self._sessions[session_id] = sess
+            sess = self._new_session(session_id, app, policy)
+        self._opened(sess, resumed=False)
         sess._mount()
         return sess, True
 
@@ -230,6 +321,7 @@ class AppRunner:
         if sess is self._default:
             self._default = None
         sess._unmount(reason)
+        self._fire("close", sess)
         return True
 
     async def _aclose_on_loop(self, session_id: str, reason: str = "closed") -> bool:

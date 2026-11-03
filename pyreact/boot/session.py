@@ -41,6 +41,8 @@ from pyreact.input.bus import InputBus
 from pyreact.observability import Observer
 from pyreact.router.nav_service import NavService
 
+from .stateful import Participants
+
 if TYPE_CHECKING:  # pragma: no cover
     from .app_runner import AppRunner
 
@@ -87,6 +89,10 @@ class Session:
             (also ``events`` / ``usage`` / ``timeline``).
         services: the session's services dict.
         created_at / last_active: wall-clock timestamps.
+        participants: checkpoint participants (see ``pyreact.boot.stateful``).
+
+    Lifecycle events on ``event_bus``: ``session.opened`` (before the first
+    render), ``session.closed`` (after the tree unmounted, ``{"reason"}``).
     """
 
     def __init__(
@@ -115,6 +121,7 @@ class Session:
             SESSION: self,
         }
         self.observer = Observer().attach(self.event_bus)
+        self.participants = Participants()
         self._unsubs: list = []
         self.root: Optional[HookContext] = None
         self.created_at = self.last_active = time.time()

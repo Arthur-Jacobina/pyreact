@@ -35,7 +35,7 @@ from .tracing import _jsonable, _trace_name_of, turn_span
 
 __all__ = ["DEFAULT_KINDS", "CONTENT_KEYS", "EventBridge"]
 
-DEFAULT_KINDS = ("message", "error", "feedback", "optimize.*")
+DEFAULT_KINDS = ("message", "error", "feedback", "optimize.*", "session.*")
 CONTENT_KEYS = frozenset({
     "text", "content", "message", "messages", "prompt", "completion", "inputs", "outputs",
     "question", "answer", "expected", "result", "args",
