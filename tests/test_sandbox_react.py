@@ -353,3 +353,33 @@ def test_autosnapshot_is_part_of_the_turn():
     finally:
         app.shutdown()
         wait_closed(10)
+
+
+def test_use_sandbox_and_provider_expose_handles_through_refs():
+    from pyreact.core import REFS_SERVICE, Ref
+
+    drv = FakeDriver()
+    env_ref = Ref()
+
+    @component
+    def Coder():
+        use_sandbox(ref="sandbox")  # named ref: the session's refs registry
+        return []
+
+    @component
+    def App():
+        return [SandboxProvider(key="sbx", driver=drv, ref=env_ref,
+                                children=[Coder(key="coder")])]
+
+    app = bootstrap(App, default_session=False)
+    try:
+        s = app.open_session("s1")
+        h = s.services[REFS_SERVICE]["sandbox"]
+        assert h is env_ref.current.handles["default"]
+        assert h.store_key == "s1/default"
+        assert h.run_sync(lambda: h.exec("echo hi")).stdout == "hi\n"
+        app.close_session("s1")
+        assert "sandbox" not in s.services[REFS_SERVICE] and env_ref.current is None
+    finally:
+        app.shutdown()
+        wait_closed(10)

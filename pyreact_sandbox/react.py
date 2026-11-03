@@ -69,7 +69,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Union
 
-from pyreact.core import EventBus, component, create_context, hooks, runtime, use_path
+from pyreact.core import (EventBus, component, create_context, hooks, runtime,
+                          use_imperative_handle, use_path)
 from pyreact.core.harness import through
 
 from ._util import truncate
@@ -723,7 +724,8 @@ def _driver_key(driver: Any) -> Any:
 @component(transparent=True)
 def SandboxProvider(driver: Union[str, SandboxDriver] = "docker", spec=None, store=None,
                     on_close: Any = "destroy", autosnapshot: Optional[str] = None,
-                    driver_options: Optional[Mapping[str, Any]] = None, children=None):
+                    driver_options: Optional[Mapping[str, Any]] = None, ref=None,
+                    children=None):
     """Provide a sandbox driver, default spec and policies to the subtree.
 
     - ``driver``: a registered name (``"docker"``, ``"local"``, a vendor) or
@@ -732,6 +734,10 @@ def SandboxProvider(driver: Union[str, SandboxDriver] = "docker", spec=None, sto
     - ``store``: :class:`SnapshotStore` for restart records (default: one
       in-memory store per provider).
     - ``on_close`` / ``autosnapshot``: defaults for handles (see module docs).
+
+    - ``ref``: exposes the provider's :class:`SandboxEnv` (its ``handles``
+      by key) through :func:`~pyreact.core.use_imperative_handle` -- a
+      ``Ref``, a callback, or a name for the session's refs registry.
 
     Session-scoped sandboxes created under it are closed when it unmounts
     (session close / app shutdown included).
@@ -751,6 +757,7 @@ def SandboxProvider(driver: Union[str, SandboxDriver] = "docker", spec=None, sto
         return env.close_all
 
     hooks.use_effect(_lifecycle, [id(env)])
+    use_imperative_handle(ref, lambda: env, [id(env)])
     hooks.provide(_SandboxCtx, env)
     return list(children or [])
 
@@ -777,7 +784,8 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
                 key: Optional[str] = None, scope: str = "session",
                 driver: Union[str, SandboxDriver, None] = None,
                 store: Optional[SnapshotStore] = None, on_close: Any = None,
-                autosnapshot: Optional[str] = None, eager: bool = True) -> SandboxHandle:
+                autosnapshot: Optional[str] = None, eager: bool = True,
+                ref: Any = None) -> SandboxHandle:
     """A :class:`SandboxHandle` for this component.
 
     - ``spec``: a :class:`SandboxSpec` replaces the provider's; a dict
@@ -788,6 +796,11 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
     - ``driver`` / ``store`` / ``on_close`` / ``autosnapshot``: override the
       provider's (without a provider: docker, in-memory store, destroy).
     - ``eager``: start creating on mount (else on first use).
+    - ``ref``: also expose the handle through
+      :func:`~pyreact.core.use_imperative_handle` -- a ``Ref`` /
+      callback, or a name: ``use_sandbox(ref="sandbox")`` registers it in
+      the session's refs registry (``root.ref("sandbox")``) instead of
+      reaching into ``session.services[HANDLES_SERVICE]``.
 
     The record key in the store is ``"<session id>/<key>"``.
     """
@@ -848,4 +861,5 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
         return None
 
     hooks.use_effect(_lifecycle, [id(handle)])
+    use_imperative_handle(ref, lambda: handle, [id(handle)])
     return handle
