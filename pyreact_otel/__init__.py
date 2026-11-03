@@ -20,4 +20,16 @@ require_otel()
 
 __version__ = "0.1.0"
 
-__all__ = ["INSTALL_HINT", "__version__"]
+from . import attributes  # noqa: E402
+from .tracing import Enricher, SpanInfo, otel_middleware, provider_of, turn_span  # noqa: E402
+
+__all__ = [
+    "Enricher",
+    "INSTALL_HINT",
+    "SpanInfo",
+    "__version__",
+    "attributes",
+    "otel_middleware",
+    "provider_of",
+    "turn_span",
+]
