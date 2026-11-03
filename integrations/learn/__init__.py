@@ -20,7 +20,7 @@ Quick start::
 
 Importing this package also registers the ``:modules``, ``:inspect``,
 ``:explain``, ``:feedback`` and ``:optimize`` terminal commands.
-
+CLI: ``python -m integrations.learn --help``.
 """
 
 from integrations.architectures import (
