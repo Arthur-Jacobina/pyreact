@@ -108,7 +108,7 @@ class _P:
 def test_participants_factories_are_added_to_every_session(runner):
     app = runner(participants=[_P, lambda: _NoArg()], default_session=True)
     sess = app.default_session
-    assert sess.participants.names() == ["p", "noarg"]
+    assert sess.participants.names() == ["turns", "p", "noarg"]  # turns: built in
     assert sess.participants.get("p").session is sess
     other = app.open_session("o")
     assert other.participants.get("p").session is other

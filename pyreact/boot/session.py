@@ -31,7 +31,8 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pyreact.core import runtime
 from pyreact.core.events import EventBus
@@ -41,7 +42,15 @@ from pyreact.input.bus import InputBus
 from pyreact.observability import Observer
 from pyreact.router.nav_service import NavService
 
-from .stateful import Participants
+from .stateful import (
+    MANIFEST_FORMAT,
+    ManifestStore,
+    Participants,
+    SuspendError,
+    TurnsParticipant,
+    _jsonable,
+    versions,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .app_runner import AppRunner
@@ -91,8 +100,14 @@ class Session:
         created_at / last_active: wall-clock timestamps.
         participants: checkpoint participants (see ``pyreact.boot.stateful``).
 
+        resumed_from: the manifest this session was resumed from (or None).
+        degraded: what could not be restored on resume (see :meth:`degrade`).
+
     Lifecycle events on ``event_bus``: ``session.opened`` (before the first
-    render), ``session.closed`` (after the tree unmounted, ``{"reason"}``).
+    render), ``session.suspending`` / ``session.suspended`` /
+    ``session.suspend.failed`` (:meth:`suspend`), ``session.resumed`` and
+    ``session.resume.degraded`` (``AppRunner.resume``), ``session.closed``
+    (after the tree unmounted, ``{"reason"}``).
     """
 
     def __init__(
@@ -122,13 +137,21 @@ class Session:
         }
         self.observer = Observer().attach(self.event_bus)
         self.participants = Participants()
+        self.participants.add(TurnsParticipant())
+        self.suspending = False
+        self.resumed_from: Optional[Dict[str, Any]] = None
+        self.degraded: List[Dict[str, Any]] = []
+        self._suspend_carry: list = []  # turns a suspend cut short
+        self._resumed_turns: List[str] = []
+        self._resume_turns = True
         self._unsubs: list = []
         self.root: Optional[HookContext] = None
         self.created_at = self.last_active = time.time()
         self.closed = False
         # Why the session was closed (set before its tree unmounts, so
         # cleanups can read it): "idle" (reaped after its TTL), "closed"
-        # (close_session) or "shutdown" (the runner stopped). None while open.
+        # (close_session), "shutdown" (the runner stopped) or "suspend"
+        # (suspend(): its state lives on in a manifest). None while open.
         self.close_reason: Optional[str] = None
 
         def _on_nav(url: str) -> None:
@@ -165,6 +188,21 @@ class Session:
     def _check_open(self) -> None:
         if self.closed:
             raise RuntimeError(f"session {self.id!r} is closed")
+        if self.suspending:
+            raise RuntimeError(f"session {self.id!r} is suspending")
+
+    def degrade(self, participant: str, reason: str, **info: Any) -> None:
+        """Record that ``participant`` could not restore everything on
+        resume (the session goes on with what it has) and publish
+        ``session.resume.degraded {session_id, participant, reason, **info}``.
+        Participants call it themselves (e.g. a sandbox whose snapshot is gone
+        boots fresh); ``AppRunner.resume`` calls it when one raises."""
+        rec = {"participant": participant, "reason": reason, **info}
+        self.degraded.append(rec)
+        try:
+            self.event_bus.publish("session.resume.degraded", {"session_id": self.id, **rec})
+        except Exception:
+            pass
 
     # ---------------------------------------------------------- loop-side ops
     def _mount(self) -> None:
@@ -196,6 +234,8 @@ class Session:
         pump = getattr(self.turns, "_pump", None)
         if pump is not None and not pump.done():
             pump.cancel()
+        # queued turns will never run here: release their waiters
+        self.turns.abandon("suspended" if reason == "suspend" else "closed")
         runtime.set_active_turn(None, scope=self.turns)
         root = self.root
         if root is not None:
@@ -214,6 +254,131 @@ class Session:
         self.event_bus.publish(
             "session.closed", {"session_id": self.id, "reason": reason}
         )
+
+    # ---------------------------------------------------------------- suspend
+    async def _settle_active(self, on_active: str, timeout: Optional[float]) -> None:
+        """Let the active turn end (or cut it short); remember a cut turn."""
+        active = self.turns.active
+        if active is None:
+            return
+        aborted = False
+        if on_active == "interrupt":
+            self.turns.abort_active()
+            aborted = True
+        elif timeout is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self.turns.wait(active.id)), timeout)
+            except asyncio.TimeoutError:
+                self.turns.abort_active()
+                aborted = True
+        res = await self.turns.wait(active.id)
+        if aborted and res.get("status") == "interrupted":
+            self._suspend_carry.append(active)
+
+    async def _suspend_on_loop(self, on_active: str, timeout: Optional[float],
+                               store: Optional[ManifestStore], reason: str) -> Dict[str, Any]:
+        if on_active not in ("wait", "interrupt"):
+            raise ValueError(f"on_active must be 'wait' or 'interrupt', got {on_active!r}")
+        self._check_open()
+        store = store if store is not None else self.runner.manifest_store
+        self.suspending = True
+        self._suspend_carry = []
+        self.event_bus.publish("session.suspending", {
+            "session_id": self.id, "reason": reason, "on_active": on_active})
+        self.turns.hold()
+        t0 = time.time()
+        try:
+            await self._settle_active(on_active, timeout)
+            await self._drain()
+            fragments: Dict[str, Any] = {}
+            for p in self.participants:
+                try:
+                    frag = await p.suspend(self)
+                except Exception as exc:
+                    raise SuspendError(f"participant {p.name!r} failed to suspend: "
+                                       f"{type(exc).__name__}: {exc}") from exc
+                fragments[p.name] = _jsonable(frag if frag is not None else {}, p.name)
+            app = self.app_component_fn
+            manifest = {
+                "format": MANIFEST_FORMAT,
+                "session_id": self.id,
+                "created_at": self.created_at,
+                "suspended_at": time.time(),
+                "reason": reason,
+                "turn_seq": self.turns.next_index() - 1,
+                "turn_policy": self.turns.policy,
+                "app": f"{getattr(app, '__module__', '?')}:{getattr(app, '__qualname__', app)}",
+                "participants": fragments,
+                "versions": versions(self.participants),
+            }
+            try:
+                ref = store.save(manifest)
+            except Exception as exc:
+                raise SuspendError(f"could not save the manifest: {type(exc).__name__}: {exc}"
+                                   ) from exc
+        except BaseException as exc:
+            # The session goes on: let queued turns start again and re-run
+            # the turn we cut short.
+            self.suspending = False
+            carry, self._suspend_carry = self._suspend_carry, []
+            self.turns.release()
+            for t in carry:
+                try:
+                    self.turns.enqueue(replace(t, resumed=True, ts=time.time()))
+                except Exception:
+                    pass
+            self.event_bus.publish("session.suspend.failed", {
+                "session_id": self.id, "reason": reason, "error": f"{type(exc).__name__}: {exc}"})
+            if isinstance(exc, SuspendError) or not isinstance(exc, Exception):
+                raise
+            raise SuspendError(f"suspend of session {self.id!r} failed: {exc}") from exc
+        manifest["ref"] = ref
+        self.event_bus.publish("session.suspended", {
+            "session_id": self.id, "ref": ref, "turn_seq": manifest["turn_seq"],
+            "participants": list(fragments), "carried_turns": [
+                t["id"] for t in fragments.get("turns", {}).get("carry", [])],
+            "duration": round(time.time() - t0, 4)})
+        self.runner._close_on_loop(self.id, "suspend")
+        for p in self.participants:
+            fn = getattr(p, "suspended", None)
+            if callable(fn):
+                try:
+                    await fn(self)
+                except Exception as exc:
+                    runtime.report_error(exc, None, "suspend")
+        return manifest
+
+    def suspend(self, *, on_active: str = "wait", timeout: Optional[float] = None,
+                store: Optional[ManifestStore] = None, reason: str = "manual") -> Dict[str, Any]:
+        """Suspend this agent: one explicit, observable operation.
+
+        1. ``session.suspending``; new input is refused, queued turns are held;
+        2. the active turn ends: ``on_active="wait"`` (default) lets it finish
+           (after ``timeout`` seconds it is interrupted), ``"interrupt"``
+           cancels it now -- an interrupted turn is *carried*: re-run on resume;
+        3. every participant's ``suspend(session)`` returns its fragment;
+        4. the manifest is saved to ``store`` (default: the runner's
+           ``manifest_store``), ``session.suspended`` is published;
+        5. the tree unmounts (``close_reason == "suspend"``, ``session.closed``),
+           then participants' optional ``suspended(session)`` run.
+
+        Returns the manifest (plus ``"ref"``: where the store put it). If a
+        participant or the store fails, nothing is unmounted: the session
+        goes on (held turns start, a cut turn is re-queued),
+        ``session.suspend.failed`` is published and :class:`SuspendError`
+        raised. Do not call from inside one of this session's turns with
+        ``on_active="wait"`` (it would wait for itself).
+        """
+        if self.runner._on_loop_thread():
+            raise RuntimeError("Session.suspend() blocks; use 'await session.asuspend()' on the loop")
+        return self.runner._submit(self._suspend_on_loop(on_active, timeout, store, reason)).result()
+
+    async def asuspend(self, *, on_active: str = "wait", timeout: Optional[float] = None,
+                       store: Optional[ManifestStore] = None,
+                       reason: str = "manual") -> Dict[str, Any]:
+        """Async :meth:`suspend`."""
+        fut = self.runner._submit(self._suspend_on_loop(on_active, timeout, store, reason))
+        return await asyncio.wrap_future(fut)
 
     async def _enqueue_turn(self, turn, wait: bool) -> Dict[str, Any]:
         self.turns.enqueue(turn)
