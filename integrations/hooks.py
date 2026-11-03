@@ -349,7 +349,10 @@ async def invoke_module(
     ``usage``, ``cost``, ``latency``, ``outputs``, ``lm_calls``); calling
     ``call_next`` again re-runs the module, not calling it short-circuits
     with the middleware's prediction, :class:`~pyreact.core.harness.Blocked`
-    fails the call (``llm.blocked`` + ``llm.error``).
+    fails the call (``llm.blocked`` + ``llm.error``). A re-run honors the
+    ``rollout_id`` and ``feedback`` attrs a verifier sets
+    (:func:`pyreact.harness.verify`): the attempt bypasses the LM cache and
+    sees the feedback as an extra ``feedback`` input field.
 
     Model switching (the hook point of
     :func:`integrations.recovery.fallback_model`): with a ``models``
@@ -447,7 +450,8 @@ async def invoke_module(
         settings = _overrides_for(b)
         t_run = time.perf_counter()
         try:
-            with dspy.context(**settings):
+            # model choice (fallback_model) first, then a verifier's retry settings
+            with dspy.context(**_attempt_overrides(settings, b)):
                 if runner is not None:
                     result, more = await runner(
                         module, args, call_id=call_id,
@@ -514,6 +518,19 @@ async def invoke_module(
         payload["lm_calls"] = lm_calls
     pub("llm.end", payload)
     return result, usage
+
+
+def _attempt_overrides(overrides: Dict[str, Any], b: Boundary) -> Dict[str, Any]:
+    """Settings for one run of the module: a verifier's retry sets
+    ``rollout_id`` / ``feedback`` attrs (``pyreact.harness.verify``), applied
+    through a wrapped adapter (``integrations.harness.attempt_adapter``)."""
+    feedback, rollout = b.attrs.get("feedback"), b.attrs.get("rollout_id")
+    if not feedback and rollout is None:
+        return overrides
+    from .harness.adapter import attempt_adapter
+
+    base = overrides.get("adapter") or getattr(dspy.settings, "adapter", None) or dspy.ChatAdapter()
+    return {**overrides, "adapter": attempt_adapter(base, feedback=feedback, rollout_id=rollout)}
 
 
 def _annotate(b: Boundary, recorder: "tm.UsageRecorder", t_run: float, result: Any = _NO_RESULT):
