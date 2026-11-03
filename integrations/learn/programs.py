@@ -499,8 +499,8 @@ def use_learned_registry() -> Optional[LearnedRegistry]:
 # Swapping from outside the tree (thin: it updates a provider's state)
 # ---------------------------------------------------------------------------
 def find_registries(target: Any = None) -> List[Tuple[str, LearnedRegistry]]:
-    """``[(provider path, LearnedRegistry)]`` mounted in an AppRunner / Session
-    (``None``: headless trees)."""
+    """``[(provider path, LearnedRegistry)]`` mounted in a Root (through its
+    session), an AppRunner or a Session (``None``: headless trees)."""
     from .hmr import _services_of
 
     out: List[Tuple[str, LearnedRegistry]] = []
