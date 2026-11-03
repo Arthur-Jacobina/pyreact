@@ -3,6 +3,7 @@
 - :mod:`pyreact_durable.log`   pure storage (no pyreact / dspy imports)
 - :mod:`pyreact_durable.react` ``Durable`` provider + persistent hooks
 - :mod:`pyreact_durable.lm`    ``durable_lm`` record/replay at the LM boundary
+- :mod:`pyreact_durable.turns` ``DurableTurnStore``: resume turns cut short by a crash
 
 ``render_tree(log)`` / ``log.render()`` draw the entry tree as text. Only the
 storage layer (and its text rendering) is imported eagerly, so ``from pyreact_durable import
@@ -32,7 +33,7 @@ _LM = {"durable_lm", "ReplayMissError", "DurableLM", "llm_entries"}
 __all__ = [
     "FORMAT_VERSION", "SessionLocked", "SessionLog", "SessionLogError",
     "register_migration", "render_tree", "safe_session_id", "log_files",
-    "archive_log", "delete_log", *sorted(_REACT), *sorted(_LM),
+    "archive_log", "delete_log", "DurableTurnStore", *sorted(_REACT), *sorted(_LM),
 ]
 
 
@@ -45,4 +46,8 @@ def __getattr__(name):
         from . import lm
 
         return getattr(lm, name)
+    if name == "DurableTurnStore":
+        from .turns import DurableTurnStore
+
+        return DurableTurnStore
     raise AttributeError(f"module 'pyreact_durable' has no attribute {name!r}")

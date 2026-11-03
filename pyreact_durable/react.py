@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from pyreact.core import EventBus, TurnManager, component, create_context, hooks
 
-from .log import SessionLog, archive_log, delete_log, safe_session_id
+from .log import SessionLog, archive_log, delete_log, kind_matches, safe_session_id
 
 __all__ = [
     "DEFAULT_JOURNAL",
@@ -149,7 +149,7 @@ def _retire(slog: SessionLog, on_close: Any, archive_dir: Any, session_id: str) 
 
 @component(transparent=True)
 def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep",
-            archive_dir=None, children=None):
+            archive_dir=None, resume_turns=True, children=None):
     """Provide a :class:`SessionLog` to the subtree and journal bus events.
 
     - ``log``: a :class:`SessionLog` (caller owns it) or a path (opened on
@@ -178,6 +178,12 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
     On mount the session's ``TurnManager`` continues numbering after the
     highest turn index journaled in the log (``TurnManager.advance_to``), so
     turn ids (``t1``, ``t2``, ...) are not reused across restarts.
+
+    - ``resume_turns`` (default ``True``, needs ``turn.*`` in ``journal``):
+      attach a :class:`~pyreact_durable.turns.DurableTurnStore` to the
+      session's ``TurnManager`` (unless it has a store already), so turns
+      cut short by a crash can be re-run with ``app.resume_pending()`` /
+      ``session.resume_turn(turn_id)``.
     """
     if not (on_close in ON_CLOSE or callable(on_close)):
         raise ValueError(f"Durable: on_close must be one of {ON_CLOSE} or a callable, "
@@ -242,6 +248,25 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
             turns.advance_to(last + 1)
 
     hooks.use_effect(_continue_turn_ids, [slog, turns])
+
+    tracks_turns = bool(resume_turns) and all(
+        any(kind_matches(k, [p]) for p in kinds) for k in ("turn.start", "turn.end"))
+
+    def _attach_turn_store():
+        if not tracks_turns or getattr(turns, "store", "n/a") is not None:
+            return None
+        from .turns import DurableTurnStore
+
+        store = DurableTurnStore(slog)
+        turns.configure(store=store)
+
+        def _detach():
+            if turns.store is store:
+                turns.store = None
+
+        return _detach
+
+    hooks.use_effect(_attach_turn_store, [slog, turns, tracks_turns])
 
     hooks.provide(_DurableCtx, DurableHandle(slog, gen))
     return list(children or [])
