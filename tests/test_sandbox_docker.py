@@ -197,3 +197,21 @@ def test_gc_collects_orphans_and_expired_but_keeps_live(docker, monkeypatch):
     assert sorted(out) == sorted([expired.id, orphan.id])
     assert live.status_sync() == Status.RUNNING
     live.destroy_sync()
+
+
+def test_rlm_interpreter_runs_inside_the_container(docker):
+    from dspy.primitives.code_interpreter import FinalOutput
+
+    from pyreact_sandbox.interpreter import SandboxInterpreter
+
+    sb = docker.create_sync(spec())
+    try:
+        with SandboxInterpreter(sb, tools={"shout": lambda text: text.upper()},
+                                output_fields=[{"name": "answer"}], timeout=30) as it:
+            assert it.execute("import platform; print(platform.system())") == "Linux\n"
+            assert it.execute("x = shout(word)", {"word": "hi"}) is None
+            assert it.execute("open('/workspace/x.txt', 'w').write(x); SUBMIT(x)") == \
+                FinalOutput({"answer": "HI"})
+        assert sb.read_file_sync("x.txt") == b"HI"
+    finally:
+        sb.destroy_sync()

@@ -51,6 +51,7 @@ __all__ = [
     "SandboxDriver",
     "SandboxError",
     "SandboxHandle",
+    "SandboxInterpreter",
     "SandboxNotFound",
     "SandboxProcess",
     "SandboxProvider",
@@ -63,6 +64,7 @@ __all__ = [
     "get_driver",
     "list_drivers",
     "register_driver",
+    "sandbox_tools",
     "unregister_driver",
     "use_sandbox",
     "wait_closed",
@@ -78,6 +80,8 @@ _LAZY = {
     "SandboxHandle": ".react",
     "use_sandbox": ".react",
     "wait_closed": ".react",
+    "SandboxInterpreter": ".interpreter",
+    "sandbox_tools": ".tools",
 }
 
 
