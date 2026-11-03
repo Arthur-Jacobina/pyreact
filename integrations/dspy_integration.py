@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Tuple, Optional
 import asyncio
 import dspy
-import os
 from pyreact.core.core import component, hooks
 from pyreact.core.provider import create_context
 

@@ -1,7 +1,7 @@
 import json
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.core.core import component
-from components import Root
+from examples.components import Root
 import os
 import dotenv
 import dspy
