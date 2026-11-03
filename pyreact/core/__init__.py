@@ -11,6 +11,7 @@ from .turn_hooks import use_on_turn
 from . import runtime
 from . import harness
 from . import recovery
+from .error_boundary import ErrorBoundary
 from .harness import Blocked, Boundary, HarnessProvider, current_boundary, through, use_harness
 
 __all__ = [
@@ -33,6 +34,7 @@ __all__ = [
     "runtime",
     "harness",
     "recovery",
+    "ErrorBoundary",
     "Blocked",
     "Boundary",
     "HarnessProvider",
