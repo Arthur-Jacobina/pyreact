@@ -60,6 +60,8 @@ __all__ = [
     "LearnedContext",
     "SavedProgram",
     "LEARNED_SERVICE",
+    "dehydrate_programs",
+    "hydrate_programs",
 ]
 
 # Session service: {provider path: LearnedRegistry}. Internal plumbing for
@@ -180,6 +182,10 @@ class LearnedRegistry:
         stored = {str(k): self._store(v) for k, v in programs.items()}
         self._apply(lambda cur: {**cur, **stored})
 
+    def dehydrate(self) -> Dict[str, Any]:
+        """This provider's state as a JSON slice (:func:`dehydrate_programs`)."""
+        return dehydrate_programs(self._state())
+
     def remove(self, name: str) -> None:
         self._apply(lambda cur: {k: v for k, v in cur.items() if k != str(name)})
 
@@ -267,6 +273,52 @@ def _declared_sig(declared: Mapping[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Dehydration (the hook-in point for core use_dehydrate, ADR 0001)
+# ---------------------------------------------------------------------------
+def _plain(obj: Any) -> Any:
+    import json
+
+    return json.loads(json.dumps(obj, default=str))
+
+
+def dehydrate_programs(programs: Mapping[str, Any]) -> Dict[str, Any]:
+    """A provider's state -> its JSON slice: ``{name: path | {"state": ...} | None}``.
+
+    Paths stay paths (the learned program is a *reference* to its artifact);
+    a program/result with a file becomes that file's path; one without is
+    inlined as its ``dump_state()``."""
+    from .result import OptimizationResult
+
+    out: Dict[str, Any] = {}
+    for name, src in programs.items():
+        if src is None or _is_path(src):
+            out[str(name)] = None if src is None else os.fspath(src)
+            continue
+        path = (src.path if isinstance(src, OptimizationResult)
+                else getattr(src, "_pyreact_result_path", None))
+        if path and os.path.exists(path):
+            out[str(name)] = str(path)
+        elif isinstance(src, OptimizationResult):
+            out[str(name)] = {"state": _plain(src.state), "optimizer": src.optimizer}
+        else:
+            out[str(name)] = {"state": _plain(src.dump_state()),
+                              "optimizer": getattr(src, "_pyreact_optimizer", None)}
+    return out
+
+
+def hydrate_programs(slice_: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Inverse of :func:`dehydrate_programs`: paths stay paths (loaded on the
+    first render), inline states become :class:`SavedProgram`."""
+    out: Dict[str, Any] = {}
+    for name, v in (slice_ or {}).items():
+        if isinstance(v, dict) and "state" in v:
+            out[str(name)] = SavedProgram(v["state"], optimizer=v.get("optimizer"))
+        else:
+            out[str(name)] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
 # The provider
 # ---------------------------------------------------------------------------
 def _use_watch(ctx: Any, paths: tuple, watch: bool, interval: float) -> None:
@@ -305,9 +357,12 @@ def _use_learned_provider(declared: Mapping[str, Any], *, watch: bool, interval:
     # it is a single JSON-able value ({name: path}) held by ONE hook.
     # TODO(use_dehydrate): in the migration PR this use_state becomes
     #   programs, set_programs = use_dehydrate("learned", initial=dict(declared),
-    #       dehydrate=lambda: dehydrate_programs(programs), hydrate=hydrate_programs)
+    #       dehydrate=lambda: dehydrate_programs(<current state>),
+    #       hydrate=hydrate_programs)
     # so the learned program reference survives suspend/resume as state of the
-    # provider (replacing CompiledModulesParticipant).
+    # provider (replacing CompiledModulesParticipant for programs given through
+    # a provider). Nothing else here changes: the state is already that one
+    # JSON-able value and every swap goes through set_programs.
     state_idx = ctx.hook_idx
     programs, set_programs = hooks.use_state(dict(declared))
     box = hooks.use_ref(None)
