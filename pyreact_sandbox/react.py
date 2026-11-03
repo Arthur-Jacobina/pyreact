@@ -477,16 +477,13 @@ class SandboxHandle:
 
     async def _snapshot(self, label: Optional[str], *, auto: bool) -> SnapshotRef:  # worker
         async def do(sb):
+            # auto snapshots reuse one label, so each sandbox keeps one; older
+            # ones (other sandboxes, e.g. before a restart) stay: a durable
+            # store may still point at them from another branch. gc() them.
             ref = await sb.snapshot(label)
-            prev = self.last_snapshot
             self.last_snapshot = ref
             self.dirty = False
             self._save(sandbox_id=sb.id, snapshot=ref.to_dict())
-            if auto and prev is not None and prev.id != ref.id:
-                try:  # keep one auto snapshot per sandbox
-                    await self.driver.delete_snapshot(prev)
-                except Exception:
-                    pass
             self._publish("sandbox.snapshot", {"snapshot": ref.id, "label": label, "auto": auto})
             return ref
 
@@ -575,15 +572,10 @@ class SandboxHandle:
             return
         if policy == "snapshot":
             ref = await sb.snapshot("close")
-            prev, self.last_snapshot = self.last_snapshot, ref
+            self.last_snapshot = ref
             self._save(sandbox_id=None, snapshot=ref.to_dict())
             self._publish("sandbox.snapshot", {"snapshot": ref.id, "label": "close",
                                                "auto": True})
-            if prev is not None and prev.id != ref.id:
-                try:
-                    await self.driver.delete_snapshot(prev)
-                except Exception:
-                    pass
         await sb.destroy()
         if self.store is not None and policy == "destroy":
             rec = self.store.get(self.store_key) or {}
