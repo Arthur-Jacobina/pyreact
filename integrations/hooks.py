@@ -810,6 +810,8 @@ def use_agent(
         react = dspy.ReAct(signature, tools=[to_dspy_tool(t) for t in resolved],
                            max_iters=max_iters)
         react._pyreact_name = name or f"ReAct({_sig_key(signature)})"
+        react._pyreact_key, react._pyreact_arch = key, "react"
+        react._pyreact_signature = signature
         if env is not None:
             env.caches[key] = react
         return react

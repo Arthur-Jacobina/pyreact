@@ -216,3 +216,34 @@ def test_use_agent_call_rlm_has_call_shape_events_and_cancel():
     assert "llm.end" not in kinds[5:]
     assert interps[-1].shut and interps[-1].executed < 3  # stopped in the worker
     assert hs["call"].loading is False
+
+
+def test_react_arch_resolves_provider_tools_by_name():
+    from pyreact.tools import ToolProvider
+
+    def lookup(sku: str) -> str:
+        """Look up a SKU.
+        sku: the sku
+        """
+        return sku
+
+    seen = {}
+
+    @component
+    def Agent():
+        seen["mod"] = use_module("question -> answer", arch="react", tools=["lookup"], max_iters=3)
+        return []
+
+    @component
+    def Root():
+        return [DSPyProvider(key="d", lm=DummyLM([]), children=[
+            ToolProvider(key="t", tools=[lookup], children=[Agent(key="a")])])]
+
+    async def main():
+        schedule_rerender(HookContext("Root", Root))
+        await _settle()
+
+    asyncio.run(main())
+    mod = seen["mod"]
+    assert isinstance(mod, dspy.ReAct) and "lookup" in mod.tools and mod.max_iters == 3
+    assert mod._pyreact_key[0] == "ReAct"

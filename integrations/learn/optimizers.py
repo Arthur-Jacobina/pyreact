@@ -456,6 +456,11 @@ def _gepa(program, *, trainset, valset, metric: Metric, budget, lm, reflection_l
 def _mipro(program, *, trainset, valset, metric, budget, lm, reflection_lm, log_dir,
            num_threads, seed, **opts):
     """Instruction + demo search with Bayesian optimization (dspy.MIPROv2)."""
+    try:  # fail before spending LM calls on proposals
+        import optuna  # noqa: F401
+    except ImportError:
+        raise OptimizeError("optimizer 'mipro' needs the optional dependency optuna: "
+                            "`uv add optuna` (or pip install 'dspy[optuna]').") from None
     init_o, comp_o = _split_opts(opts, dspy.MIPROv2.__init__, dspy.MIPROv2.compile)
     init = dict(metric=metric, prompt_model=reflection_lm or lm, task_model=lm,
                 num_threads=num_threads, seed=seed or 9, log_dir=log_dir, verbose=False,
