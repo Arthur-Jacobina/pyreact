@@ -6,6 +6,8 @@ What it teaches:
   the guard knows nothing about what it protects
 - conditional rendering gates work: until the guard's verdict for *this*
   turn says "safe", the QA agent is not mounted, so it makes no LLM call
+- call identity: ``check.run(..., tag=turn_id)`` + ``check.tag == turn_id``
+  tells whether the settled result answers *this* turn -- no extra state
 - two architectures side by side: a cheap ``predict`` classifier on the
   ``fast`` model, a ``cot`` answerer on the ``reasoning`` model
   (``use_agent_call(sig, arch=..., model=...)``)
@@ -59,33 +61,24 @@ class QASig(dspy.Signature):
 @component
 def GuardRail(text: str, turn_id: str, children):
     check = use_agent_call(ToxicitySig, arch="predict", model="fast")
-    asked, set_asked = hooks.use_state(None)  # turn id of the in-flight check
-    verdict, set_verdict = hooks.use_state(None)  # (turn_id, "safe"|"toxic"|"unknown")
 
     def start():
         if text.strip():
-            set_asked(turn_id)
-            check.run(comment=text)
+            check.run(comment=text, tag=turn_id)  # tag: which turn this check is for
 
     hooks.use_effect(start, [turn_id])
 
-    def settle():  # once per finished check
-        if check.ver and asked is not None:
-            v = getattr(check.result, "verdict", None) if check.error is None else "unknown"
-            set_verdict((asked, v))
-
-    hooks.use_effect(settle, [check.ver])
-
-    # No verdict for *this* turn yet: render nothing below us (no QA call).
-    if verdict is None or verdict[0] != turn_id:
+    # No settled check for *this* turn yet: render nothing below us (no QA call).
+    if check.tag != turn_id or check.loading:
         if check.loading:
             return [Message(key="checking", text="checking the question...", sender="system",
                             message_type="info")]
         return []
-    if verdict[1] == "toxic":
+    verdict = getattr(check.result, "verdict", None) if check.error is None else "unknown"
+    if verdict == "toxic":
         return [Message(key=f"blocked-{turn_id}", text="Blocked: that message looks toxic.",
                         sender="system", message_type="warning")]
-    if verdict[1] == "unknown":
+    if verdict == "unknown":
         # The checker failed. Policy choice: fail open (warn and continue).
         # A stricter guard would return the warning alone (fail closed).
         return [Message(key=f"unchecked-{turn_id}", text="Could not check toxicity; continuing.",
