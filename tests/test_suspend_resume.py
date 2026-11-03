@@ -304,3 +304,29 @@ def test_async_suspend_and_resume(runner):
         return await r.ainvoke("two", wait=True)
 
     assert asyncio.run(main()) == "as/t2"
+
+
+def test_legacy_suspend_and_resume_carry_use_dehydrate_slices(runner):
+    from pyreact.core import use_dehydrate
+
+    seen = []
+
+    @component
+    def Counter():
+        start = use_dehydrate("n", dehydrate=lambda: n.current, initial=0)
+        n = hooks.use_ref(start)
+        turn = use_turn()
+        hooks.use_effect(lambda: setattr(n, "current", n.current + (turn is not None)),
+                         [turn and turn.id])
+        seen.append(start)
+        return []
+
+    app = runner(Counter)
+    s = app.open_session("legacy")
+    s.invoke("a", wait=True, timeout=5)
+    s.invoke("b", wait=True, timeout=5)
+    m = s.suspend()
+    assert m["slices"] == {"Counter": {"n": 2}}
+    seen.clear()
+    app.resume("legacy", m)
+    assert seen[0] == 2

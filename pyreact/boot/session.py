@@ -35,7 +35,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pyreact.core import runtime
-from pyreact.core.dehydrate import begin_hydration
+from pyreact.core.dehydrate import SnapshotError, adehydrate_tree, begin_hydration
 from pyreact.core.events import EventBus
 from pyreact.core.hook import HookContext
 from pyreact.core.turns import TurnManager
@@ -305,6 +305,11 @@ class Session:
                     raise SuspendError(f"participant {p.name!r} failed to suspend: "
                                        f"{type(exc).__name__}: {exc}") from exc
                 fragments[p.name] = _jsonable(frag if frag is not None else {}, p.name)
+            # use_dehydrate slices ride along (hydrated by AppRunner.resume)
+            try:
+                slices = (await adehydrate_tree(self.root, session_id=self.id))["slices"]
+            except SnapshotError as exc:
+                raise SuspendError(str(exc)) from exc
             app = self.app_component_fn
             manifest = {
                 "format": MANIFEST_FORMAT,
@@ -316,6 +321,7 @@ class Session:
                 "turn_policy": self.turns.policy,
                 "app": f"{getattr(app, '__module__', '?')}:{getattr(app, '__qualname__', app)}",
                 "participants": fragments,
+                "slices": slices,
                 "versions": versions(self.participants),
             }
             try:

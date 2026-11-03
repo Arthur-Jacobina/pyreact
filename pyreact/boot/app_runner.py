@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from pyreact.core.dehydrate import finish_hydration, hydration_of
 from pyreact.core.hook import HookContext
 from pyreact.core import runtime
 from pyreact.core.events import EventBus
@@ -496,8 +497,18 @@ class AppRunner:
                 restored.append(p)
             except Exception as exc:
                 sess.degrade(p.name, "resume failed", error=f"{type(exc).__name__}: {exc}")
-        sess._mount()
+        slices = manifest.get("slices")
+        sess._mount(slices=slices if isinstance(slices, dict) else None)
         await sess._drain()
+        if isinstance(slices, dict):  # use_dehydrate hooks (see pyreact.boot.root)
+            state = hydration_of(sess.root)
+            while state is not None:
+                pending = [t for t in state.pending if not t.done()]
+                if not pending:
+                    break
+                await asyncio.wait(pending)
+                await sess._drain()
+            finish_hydration(sess.root)
         for p in restored:
             fn = getattr(p, "resumed", None)
             if callable(fn):
