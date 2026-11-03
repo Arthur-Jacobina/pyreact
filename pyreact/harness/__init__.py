@@ -10,7 +10,9 @@ process) and your own middleware:
   :func:`require_confirmation`;
 - **verifiers** run *after* a call and check its result, then raise, retry
   (optionally with the feedback injected) or flag: :func:`verify` with the
-  checks :func:`schema`, :func:`assert_that`, :func:`grounded_in`.
+  checks :func:`schema`, :func:`assert_that`, :func:`grounded_in`;
+- **hooks** scope either to the calling component and its subtree, with its
+  lifecycle: :func:`use_guard`, :func:`use_verify`, :func:`use_middleware`.
 
 This package is framework-generic (no DSPy); the DSPy-aware pieces live in
 ``integrations.harness``.
@@ -28,6 +30,7 @@ from .guards import (
     require_confirmation,
     tool_allowlist,
 )
+from .hooks import scoped_middleware, use_guard, use_middleware, use_verify
 from .verify import (
     Verdict,
     VerificationFailed,
@@ -54,6 +57,10 @@ __all__ = [
     "rate_limit",
     "require_confirmation",
     "schema",
+    "scoped_middleware",
     "tool_allowlist",
+    "use_guard",
+    "use_middleware",
+    "use_verify",
     "verify",
 ]
