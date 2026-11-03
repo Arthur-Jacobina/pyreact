@@ -27,6 +27,8 @@ from typing import Any, Callable, Deque, Dict, Hashable, Iterable, Mapping, Opti
 
 from pyreact.core.harness import Blocked, Boundary, Next
 
+from ._base import HarnessMiddleware, Kinds
+from ._base import resolve as _resolve
 from ._events import emit
 
 __all__ = [
@@ -42,41 +44,15 @@ __all__ = [
     "tool_allowlist",
 ]
 
-Kinds = Union[str, Iterable[str], None]
-
-
-def _kinds(kinds: Kinds) -> Optional[Tuple[str, ...]]:
-    if kinds is None:
-        return None
-    return (kinds,) if isinstance(kinds, str) else tuple(kinds)
-
-
-async def _resolve(value: Any) -> Any:
-    return await value if inspect.isawaitable(value) else value
-
-
 def block(b: Boundary, by: str, reason: str) -> None:
     """Refuse ``b``: publish ``guard.blocked`` and raise :class:`Blocked`."""
     emit("guard.blocked", b, guard=by, reason=reason)
     raise Blocked(reason, boundary=b, by=by)
 
 
-class GuardMiddleware:
-    """Base of the built-in guards: a middleware object with ``kinds`` (the
-    harness kind filter) and ``harness_name`` (shown in ``Blocked`` messages
-    and events). Subclasses implement :meth:`check` (and may override
-    ``__call__`` to look at the result)."""
-
-    __pyreact_harness__ = True  # recognized by use_guard / use_verify
-    default_kinds: Optional[Tuple[str, ...]] = None
-
-    def __init__(self, *, kinds: Kinds = None, name: Optional[str] = None) -> None:
-        self.kinds = _kinds(kinds) if kinds is not None else self.default_kinds
-        self.harness_name = name or type(self).__name__
-
-    @property
-    def __name__(self) -> str:  # so _name(mw) / logs read naturally
-        return self.harness_name
+class GuardMiddleware(HarnessMiddleware):
+    """Base of the built-in guards. Subclasses implement :meth:`check`
+    (and may override ``__call__`` to look at the result too)."""
 
     async def check(self, b: Boundary) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -87,9 +63,6 @@ class GuardMiddleware:
 
     def block(self, b: Boundary, reason: str) -> None:
         block(b, self.harness_name, reason)
-
-    def __repr__(self) -> str:
-        return f"<{type(self).__name__} {self.harness_name!r} kinds={self.kinds}>"
 
 
 # ---------------------------------------------------------------------------
