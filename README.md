@@ -545,6 +545,28 @@ feedback` shows what it learned from.
 7. **Is the new program live?** after `result.hot_swap(app, key)` / `:optimize`, `:modules`
    shows `compiled swaps=1`, and the next `:explain` shows the new instructions.
 
+## OpenTelemetry: Langfuse and any OTLP backend
+
+`pyreact_otel` (optional extra: `pip install 'pyreact[otel]'` / `uv sync --extra otel`)
+exports every harness boundary as an OpenTelemetry span. A turn is the trace
+root (`pyreact.turn`), LLM calls become `chat <model>` spans with GenAI
+semantic conventions (model, tokens, cost), and tools become
+`execute_tool <name>` spans. It also exports token/latency/cost/error
+metrics and bridges `message`/`error`/`feedback` events. Like
+`pyreact_durable`, it lives at the border: `pyreact` never imports it.
+
+```python
+import pyreact_otel
+otel = pyreact_otel.setup(exporter="langfuse")   # LANGFUSE_HOST / _PUBLIC_KEY / _SECRET_KEY
+# or exporter="otlp" (OTEL_EXPORTER_OTLP_* env: Jaeger, Phoenix, Honeycomb, Datadog, ...)
+```
+
+Prompts and completions are recorded only with `capture_content=True`. Add a
+vendor with `register_exporter(name, factory)`. See
+[`pyreact_otel/README.md`](pyreact_otel/README.md) for the span/attribute
+reference, and [`deploy/langfuse/`](deploy/langfuse/README.md) for a local
+Langfuse plus `scripts/e2e_otel_langfuse.py`.
+
 ## Troubleshooting
 
 ### Error: "DSPy context not available"
