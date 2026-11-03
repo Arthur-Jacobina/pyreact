@@ -1,7 +1,17 @@
 # pyreact/core/__init__.py
 from .hook import HookContext, Ref, use_cleanup_reason
 from .activity import Activity
-from .dehydrate import Hydrating, HydrationWarning, use_dehydrate
+from .dehydrate import (
+    SNAPSHOT_FORMAT,
+    Hydrating,
+    HydrationWarning,
+    Snapshot,
+    SnapshotError,
+    adehydrate_tree,
+    check_snapshot,
+    dehydrate_tree,
+    use_dehydrate,
+)
 from .provider import create_context
 from .runtime import schedule_rerender, run_renders
 from .core import VNode
@@ -26,6 +36,12 @@ __all__ = [
     "Hydrating",
     "HydrationWarning",
     "use_dehydrate",
+    "SNAPSHOT_FORMAT",
+    "Snapshot",
+    "SnapshotError",
+    "adehydrate_tree",
+    "check_snapshot",
+    "dehydrate_tree",
     "create_context",
     "schedule_rerender",
     "run_renders",

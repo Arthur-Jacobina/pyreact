@@ -26,24 +26,72 @@ keeping across a suspend / a process restart declares it with a hook::
 The hook never fails a render: a ``hydrate`` that raises is reported as a
 ``hydration.mismatch`` (``kind: "error"``) and the hook starts from
 ``initial``.
+
+Snapshot (``SNAPSHOT_FORMAT``), the dehydrated tree, JSON only::
+
+    {"format": "pyreact.snapshot/1", "session_id": "coder-1",
+     "created_at": 1793720877.92,
+     "slices": {"App/Coder[coder]": {"history": [...], "program": {...}}},
+     "turns": {"next_index": 3, "policy": "queue", "carry": [{"id": "coder-1/t2", ...}]},
+     "versions": {"snapshot": 1, "pyreact": "0.1.0", "python": "3.13.0"}}
+
+:func:`dehydrate_tree` builds one from a mounted tree; :func:`begin_hydration`
++ :func:`finish_hydration` hydrate a tree from its ``slices``. Hydration
+mismatches (React's warning) are never fatal: a slice no hook claims by the
+time hydration finishes (``unclaimed``), a hook with no slice (``missing``)
+and a failing ``hydrate`` (``error``) are published as ``hydration.mismatch``
+events ``{kind, path, key, message}`` on the session bus and warned
+(:class:`HydrationWarning`).
 """
 
 from __future__ import annotations
 
 import inspect
+import json
+import platform
+import time
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, TypedDict, Union,
+)
 
 from .core import VNode, _context_stack, component
 
 __all__ = [
+    "SNAPSHOT_FORMAT",
+    "SNAPSHOT_VERSION",
     "Hydrating",
     "HydrationState",
     "HydrationWarning",
+    "Snapshot",
+    "SnapshotError",
+    "adehydrate_tree",
     "begin_hydration",
+    "check_snapshot",
+    "dehydrate_tree",
+    "finish_hydration",
     "hydration_of",
     "use_dehydrate",
 ]
+
+SNAPSHOT_VERSION = 1
+SNAPSHOT_FORMAT = f"pyreact.snapshot/{SNAPSHOT_VERSION}"
+
+
+class Snapshot(TypedDict):
+    """The dehydrated tree (a plain JSON dict at runtime)."""
+
+    format: str
+    session_id: Optional[str]
+    created_at: float
+    slices: Dict[str, Dict[str, Any]]
+    turns: Dict[str, Any]
+    versions: Dict[str, Any]
+
+
+class SnapshotError(ValueError):
+    """A tree could not be dehydrated (a slice is not JSON, a dehydrate
+    failed...), or a dict is not a snapshot this pyreact can hydrate."""
 
 
 class HydrationWarning(RuntimeWarning):
@@ -109,12 +157,45 @@ class HydrationState:
                 pass
 
 
-def begin_hydration(root: Any, slices: Optional[Dict[str, Dict[str, Any]]]) -> HydrationState:
+    def unclaimed(self) -> List[Tuple[str, str]]:
+        return [(p, k) for p, part in self.slices.items() for k in part
+                if (p, k) not in self.claimed]
+
+
+def begin_hydration(root: Any, slices: Optional[Dict[str, Dict[str, Any]]],
+                    *, event_bus: Any = None) -> HydrationState:
     """Make ``root`` (a root HookContext, before its first render) hydrate
-    from ``slices`` (``{path: {key: value}}``)."""
+    from ``slices`` (``{path: {key: value}}``, or a whole snapshot).
+    Mismatches are published as ``hydration.mismatch`` on ``event_bus``
+    (default: the root's own services' ``event_bus``, if any)."""
+    if isinstance(slices, dict) and "format" in slices and "slices" in slices:
+        slices = slices["slices"]
     state = HydrationState(slices)
+    if event_bus is None:
+        services = getattr(root, "_session_services", None)
+        event_bus = services.get("event_bus") if services else None
+    if event_bus is not None:
+        state.on_mismatch(lambda rec: event_bus.publish(
+            "hydration.mismatch", rec, source=rec.get("path")))
     root._hydration = state
     return state
+
+
+def finish_hydration(root: Any) -> List[Dict[str, Any]]:
+    """End ``root``'s hydration (call it once the first render committed and
+    the async hydrates resolved): every slice no hook claimed is reported as
+    an ``unclaimed`` mismatch; hooks mounted from now on start fresh, with no
+    ``missing`` report. Returns all the mismatches of this hydration."""
+    state = hydration_of(root)
+    if state is None:
+        return []
+    if state.active:
+        state.active = False
+        for path, key in state.unclaimed():
+            state.mismatch("unclaimed", path, key,
+                           f"slice {key!r} of {path} was not claimed by any "
+                           "use_dehydrate (component gone, renamed or re-keyed?)")
+    return list(state.mismatches)
 
 
 def hydration_of(ctx: Any) -> Optional[HydrationState]:
@@ -281,6 +362,166 @@ def discard_suspended_render(ctx: Any, old_children: Sequence[Any]) -> None:
         if ctx not in waiting:
             waiting.add(ctx)
             schedule_rerender(boundary, reason="hydrating")
+
+
+# ---------------------------------------------------------------------------
+# dehydration
+# ---------------------------------------------------------------------------
+def _pyreact_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("pyreact")
+    except Exception:  # pragma: no cover - not installed as a dist
+        return "unknown"
+
+
+def snapshot_versions() -> Dict[str, Any]:
+    return {"snapshot": SNAPSHOT_VERSION, "pyreact": _pyreact_version(),
+            "python": platform.python_version()}
+
+
+def _iter_slots(root: Any) -> Iterator[Tuple[str, DehydrateSlot]]:
+    """(path, slot) of every live registration, tree order (root first)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if not getattr(node, "_mounted", True):
+            continue
+        regs = dict(node.__dict__.get("_suspended_slots") or {})
+        regs.update(node.__dict__.get("_dehydrators") or {})
+        if regs:
+            path = node.path
+            for slot in regs.values():
+                yield path, slot
+        stack.extend(reversed(list(node.children)))
+
+
+def _to_json(value: Any, path: str, key: str) -> Any:
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise SnapshotError(f"use_dehydrate({key!r}) of {path} returned a value that is "
+                            f"not JSON ({type(exc).__name__}: {exc})") from None
+
+
+def _plan(root: Any) -> List[Tuple[str, DehydrateSlot]]:
+    seen: Dict[Tuple[str, str], DehydrateSlot] = {}
+    out = []
+    for path, slot in _iter_slots(root):
+        if (path, slot.key) in seen:
+            raise SnapshotError(f"two components at {path} both dehydrate {slot.key!r}: "
+                                "give them distinct keys")
+        seen[(path, slot.key)] = slot
+        out.append((path, slot))
+    return out
+
+
+def _call_dehydrate(path: str, slot: DehydrateSlot) -> Any:
+    if slot.pending:  # never hydrated: keep the slice it would have used
+        return slot.raw
+    try:
+        return slot.dehydrate()
+    except Exception as exc:
+        raise SnapshotError(f"use_dehydrate({slot.key!r}) of {path}: dehydrate() failed "
+                            f"({type(exc).__name__}: {exc})") from exc
+
+
+def _turns_of(root: Any, carry: Sequence[Any]) -> Dict[str, Any]:
+    services = getattr(root, "_session_services", None) or {}
+    tm = services.get("turns")
+    fn = getattr(tm, "dehydrate", None)
+    return fn(carry=carry) if callable(fn) else {}
+
+
+def _session_id_of(root: Any) -> Optional[str]:
+    services = getattr(root, "_session_services", None) or {}
+    return getattr(services.get("session"), "id", None)
+
+
+def _envelope(root: Any, slices, session_id, turns, carry) -> Snapshot:
+    return {
+        "format": SNAPSHOT_FORMAT,
+        "session_id": session_id if session_id is not None else _session_id_of(root),
+        "created_at": time.time(),
+        "slices": slices,
+        "turns": _to_json(turns if turns is not None else _turns_of(root, carry),
+                          "<root>", "turns"),
+        "versions": snapshot_versions(),
+    }
+
+
+def _add(slices: Dict[str, Dict[str, Any]], path: str, key: str, value: Any) -> None:
+    slices.setdefault(path, {})[key] = _to_json(value, path, key)
+
+
+def dehydrate_tree(root: Any, *, session_id: Optional[str] = None,
+                   turns: Optional[Dict[str, Any]] = None,
+                   carry: Sequence[Any] = ()) -> Snapshot:
+    """Snapshot of the mounted tree under ``root``: calls every registered
+    ``dehydrate()`` (see the module docs). Does not unmount anything.
+
+    ``turns`` defaults to the session's ``TurnManager.dehydrate(carry=...)``
+    (``carry``: turns cut short, re-run on hydrate); ``session_id`` to the
+    session's. Raises :class:`SnapshotError` (naming the path and key) if a
+    slice is not JSON or a ``dehydrate`` fails; an async ``dehydrate`` needs
+    :func:`adehydrate_tree`. Must run on the render loop (or with no loop
+    running the tree).
+    """
+    slices: Dict[str, Dict[str, Any]] = {}
+    for path, slot in _plan(root):
+        value = _call_dehydrate(path, slot)
+        if inspect.isawaitable(value):
+            close = getattr(value, "close", None)
+            if callable(close):
+                close()
+            raise SnapshotError(f"use_dehydrate({slot.key!r}) of {path} has an async "
+                                "dehydrate: use 'await adehydrate_tree(root)'")
+        _add(slices, path, slot.key, value)
+    return _envelope(root, slices, session_id, turns, carry)
+
+
+async def adehydrate_tree(root: Any, *, session_id: Optional[str] = None,
+                          turns: Optional[Dict[str, Any]] = None,
+                          carry: Sequence[Any] = ()) -> Snapshot:
+    """:func:`dehydrate_tree` that also awaits async ``dehydrate`` functions."""
+    slices: Dict[str, Dict[str, Any]] = {}
+    for path, slot in _plan(root):
+        value = _call_dehydrate(path, slot)
+        if inspect.isawaitable(value):
+            try:
+                value = await value
+            except Exception as exc:
+                raise SnapshotError(f"use_dehydrate({slot.key!r}) of {path}: dehydrate() "
+                                    f"failed ({type(exc).__name__}: {exc})") from exc
+        _add(slices, path, slot.key, value)
+    return _envelope(root, slices, session_id, turns, carry)
+
+
+def check_snapshot(snapshot: Any) -> Snapshot:
+    """Validate a snapshot's envelope (format, version, ``slices`` shape);
+    returns it. Raises :class:`SnapshotError`."""
+    if not isinstance(snapshot, dict):
+        raise SnapshotError(f"a snapshot is a dict, got {type(snapshot).__name__}")
+    fmt = snapshot.get("format")
+    if not isinstance(fmt, str) or not fmt.startswith("pyreact.snapshot/"):
+        raise SnapshotError(f"not a pyreact snapshot (format={fmt!r})")
+    try:
+        ver = int(fmt.rsplit("/", 1)[1])
+    except ValueError:
+        raise SnapshotError(f"bad snapshot format {fmt!r}") from None
+    if ver > SNAPSHOT_VERSION:
+        raise SnapshotError(f"snapshot format {fmt!r} is newer than this pyreact "
+                            f"({SNAPSHOT_FORMAT})")
+    slices = snapshot.get("slices", {})
+    if not isinstance(slices, dict):
+        raise SnapshotError("snapshot['slices'] must be a dict {path: {key: value}}")
+    for path, part in slices.items():
+        if not isinstance(part, dict):
+            raise SnapshotError(f"snapshot['slices'][{path!r}] must be a dict {{key: value}}")
+    if not isinstance(snapshot.get("turns", {}), dict):
+        raise SnapshotError("snapshot['turns'] must be a dict")
+    return snapshot
 
 
 def drop_registrations(ctx: Any) -> None:
