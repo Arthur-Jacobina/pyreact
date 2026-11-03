@@ -2,6 +2,8 @@
 
 Pyreact is a Python multi‑agent framework with React‑style components and hooks. It coordinates agents via a router and input bus, runs on web and terminal, and integrates with DSPy for LLM‑powered agents.
 
+> **Examples:** see [`examples/README.md`](examples/README.md) for a guided tour (every example runs offline too).
+
 ## React ↔ Multi‑agent analogy (how it works)
 
 ### 1) Component ↔ Agent
