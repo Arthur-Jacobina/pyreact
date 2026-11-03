@@ -6,6 +6,12 @@ app runs you rate its answers; ``:optimize`` turns those ratings (events) into
 a dataset, runs GEPA in a worker thread and hot-swaps the better program into
 the running component (HMR). The next message already uses the new prompt.
 
+The learned program is a prop: ``LearnedProgram(key="supervisor", src=...)``
+wraps the router and the router reads it with ``use_learned("supervisor")``.
+``:optimize`` saves the result and makes it that provider's new ``src`` -- a
+re-render, not a mutation of the module cache. Start from a saved program
+with ``--program artifacts/learn/<file>.json``.
+
 Interactive::
 
     uv run python -m examples.learn.03_live_feedback_loop
@@ -33,7 +39,13 @@ from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_exa
 from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
 from examples._lm import example_lm, out_path
-from integrations.learn import configure_learning, wait_optimizations
+from integrations.learn import (
+    LearnedProgram,
+    configure_learning,
+    find_registries,
+    use_learned,
+    wait_optimizations,
+)
 from pyreact.boot import bootstrap, handle_command, read_terminal_and_invoke
 from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_turn
@@ -46,8 +58,10 @@ SMOKE = {"args": ["--demo"]}
 def StoreRouter():
     turn = use_turn()
     # name="supervisor" -> module key ("ChainOfThought", "RouteSpecialistSig", "supervisor"):
-    # the handle :optimize / :inspect / hot_swap use.
-    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor")
+    # the handle :optimize / :inspect use. program=: the learned program the
+    # LearnedProgram above provides (None until :optimize swaps one in).
+    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor",
+                        program=use_learned("supervisor"))
     call = use_call(router)
 
     def route():
@@ -67,10 +81,13 @@ def StoreRouter():
     return []
 
 
-def make_root(lm):
+def make_root(lm, program=None):
     @component
     def Root():
-        return [DSPyProvider(key="dspy", lm=lm, children=[StoreRouter(key="router")])]
+        return [DSPyProvider(key="dspy", lm=lm, children=[
+            # src: a saved result (or None: the baseline). :optimize updates it.
+            LearnedProgram(key="supervisor", src=program, children=[StoreRouter(key="router")]),
+        ])]
 
     return Root
 
@@ -127,6 +144,8 @@ def demo(lm) -> None:
         cmd(":optimize supervisor")
         wait_optimizations(timeout=900)
         app.wait_idle(timeout=30)
+        for path, reg in find_registries(app):  # the swap is the provider's new src
+            print(f"[learn] {path}: {reg.programs}")
         say(AFTER[0])
         cmd(":inspect supervisor")
         cmd(":events optimize.* 10")
@@ -145,13 +164,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--demo", action="store_true", help="scripted run")
     ap.add_argument("--model", default="haiku")
+    ap.add_argument("--program", default=None, help="saved result to start from")
     args = ap.parse_args()
     lm = example_lm(args.model)
     if args.demo:
         demo(lm)
         return
     configure()
-    app = bootstrap(make_root(lm))
+    app = bootstrap(make_root(lm, args.program))
     print("Loja (router). Rate answers with :feedback +/- [name=<route>], then "
           ":optimize supervisor. :help lists all commands.")
     try:
