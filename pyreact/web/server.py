@@ -1,34 +1,49 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-
-from fastapi import FastAPI, Response, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-from urllib.parse import parse_qs
+
 from pyreact.boot.app_runner import AppRunner
 from pyreact.core.hook import HookContext
-from .console import enable_web_print, disable_web_print
-from .broadcast import InMemoryBroadcast
-from .ansi import ansi_to_html
-from .ws_endpoint import (
-    register_ws_routes,
-    ChannelName,
-)
-from .input_consumer import InputConsumer
+from pyreact.core.message_buffer import MessageBuffer
+
+from .console import disable_web_print, enable_web_print
+from .sessions import FORWARDED_EVENT_KINDS, SessionHub
 from .templates import BASE_HTML
+from .ws_endpoint import register_session_ws_route
 
 
-def create_fastapi_app(runner: AppRunner):
-    """Create the FastAPI app with lifecycle via ``lifespan``.
+def create_fastapi_app(
+    runner: AppRunner,
+    *,
+    session_ttl: Optional[float] = 900.0,
+    reap_interval: Optional[float] = None,
+    event_kinds=FORWARDED_EVENT_KINDS,
+    capture_stdout: bool = True,
+):
+    """Create the FastAPI app serving ``runner`` over a per-session WebSocket.
 
-    When ``app_runner`` is provided, the server bridges HTML/nav updates from the
-    runner and forwards WebSocket inputs via runner.invoke/nav/print helpers.
+    Each WebSocket connection gets (or resumes) its own session on ``runner``
+    (see :mod:`pyreact.web.sessions`); inputs and outputs never cross sessions.
+
+    Args:
+        runner: the AppRunner hosting the sessions. Its default session (if
+            any) is not exposed over the web.
+        session_ttl: seconds a session with no socket attached is kept before
+            being closed (``None``/``0`` disables reaping).
+        reap_interval: how often to check for idle sessions (default
+            ``min(30, ttl/2)``).
+        event_kinds: EventBus kinds forwarded to the browser.
+        capture_stdout: redirect stdout/stderr into the web log channel.
+
+    Returns ``(app, None)`` for backward compatibility; the hub is available as
+    ``app.state.session_hub`` while the app is running.
     """
     app = FastAPI()
     static_dir = Path(__file__).parent / "static"
@@ -36,120 +51,38 @@ def create_fastapi_app(runner: AppRunner):
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        server_loop = asyncio.get_running_loop()
-        broadcast = InMemoryBroadcast()
-        enable_web_print()
-
-        async def _broadcast_stdout(text: str) -> None:
-            if text.startswith("__MESSAGE__:"):
-                message_json = text[12:]  # Remove "__MESSAGE__:"
-                try:
-                    message_data = json.loads(message_json)
-                except ValueError:
-                    message_data = {"type": "message", "text": message_json, "sender": "system", "message_type": "error"}
-
-                await broadcast.publish(
-                    ChannelName.MSG,
-                    {"channel": "chat", "type": "message", "data": message_data},
-                )
-                return
-
-            await broadcast.publish(
-                ChannelName.STDOUT,
-                {"channel": "logs", "type": "stdout", "data": ansi_to_html(text)},
-            )
-
-        async def publish_nav(path: str) -> None:
-            await broadcast.publish(
-                ChannelName.NAV, {"channel": "ui", "type": "nav", "data": path}
-            )
-
-        async def publish_console(text: str) -> None:
-            await _broadcast_stdout(text)
-
-        runner.attach_web_bridge(
-            on_nav=publish_nav,
-            on_console=publish_console,
-            target_loop=server_loop,
+        hub = SessionHub(
+            runner,
+            loop=asyncio.get_running_loop(),
+            ttl=session_ttl,
+            reap_interval=reap_interval,
+            event_kinds=event_kinds,
         )
-
-        async def _handle_input_message(msg: dict) -> None:
-            t = msg.get("t")
-
-            if t in ("hello", "nav"):
-                path = msg.get("path", "/")
-                raw_query = msg.get("query", "") or ""
-                raw_fragment = msg.get("fragment", "") or ""
-                query = {}
-
-                if len(raw_query) > 0:
-                    q = raw_query[1:] if raw_query.startswith("?") else raw_query
-                    parsed_q = parse_qs(q)
-
-                    query = {
-                        k: (v[0] if isinstance(v, list) and v else "")
-                        for k, v in parsed_q.items()
-                    }
-
-                fragment = (
-                    raw_fragment[1:] if raw_fragment.startswith("#") else raw_fragment
-                )
-
-                runner.nav(path, query=query, fragment=fragment)
-                return
-
-            if t == "submit":
-                value = msg.get("v", "")
-                await broadcast.publish(
-                    ChannelName.MSG,
-                    {
-                        "channel": "chat",
-                        "type": "message",
-                        "data": {
-                            "type": "message",
-                            "text": value,
-                            "sender": "user",
-                            "message_type": "chat",
-                            "timestamp": time.time(),
-                        },
-                    },
-                )
-                # Never block the server's event loop waiting on the app.
-                await runner.ainvoke(value)
-                return
-
-            if t == "debug":
-                what = msg.get("what")
-                if what == "tree":
-                    runner.print_vnode_tree()
-                elif what == "trace":
-                    runner.print_render_trace()
-
-        # Register WebSocket routes
-        register_ws_routes(
-            app,
-            broadcast=broadcast,
-            channels_to_forward=[ChannelName.NAV, ChannelName.STDOUT, ChannelName.MSG],
-            input_channel=ChannelName.INPUT,
-        )
-
-        input_consumer = InputConsumer(
-            broadcast=broadcast,
-            input_channel=ChannelName.INPUT,
-            handle_message=_handle_input_message,
-        )
-
-        input_task = asyncio.create_task(input_consumer.run())
-
+        app.state.session_hub = hub
+        if capture_stdout:
+            enable_web_print()
+        console = HookContext.get_service("console_buffer", MessageBuffer)
+        console.subscribe(hub.on_console)
+        reaper = asyncio.create_task(hub.reap_forever())
         try:
             yield
         finally:
+            reaper.cancel()
+            console.unsubscribe(hub.on_console)
+            hub.close()
             runner.shutdown()
-            input_task.cancel()
-            HookContext._services.clear()
-            disable_web_print()
+            if capture_stdout:
+                disable_web_print()
 
     app.router.lifespan_context = lifespan
+
+    class _HubProxy:
+        """Resolve the hub lazily (it is created in the lifespan)."""
+
+        def __getattr__(self, name):
+            return getattr(app.state.session_hub, name)
+
+    register_session_ws_route(app, _HubProxy())
 
     @app.get("/favicon.ico")
     async def favicon():

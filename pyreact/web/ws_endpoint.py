@@ -67,3 +67,48 @@ def register_ws_routes(
                 return
 
     app.add_websocket_route("/ws", AppWS)
+
+
+def register_session_ws_route(app: FastAPI, hub, *, path: str = "/ws") -> None:
+    """Register the per-session WebSocket route (see :mod:`pyreact.web.sessions`).
+
+    The first client message should be ``{"t": "hello", "session": id|null,
+    ...}``; any other first message attaches a fresh session and is then
+    handled normally.
+    """
+    from starlette.websockets import WebSocketDisconnect
+
+    from .sessions import Connection
+
+    async def _recv_json(ws: WebSocket) -> dict:
+        while True:
+            data = await ws.receive_text()
+            try:
+                msg = json.loads(data)
+            except ValueError:
+                continue
+            if isinstance(msg, dict):
+                return msg
+
+    async def endpoint(ws: WebSocket) -> None:
+        await ws.accept()
+        conn = Connection(ws.send_text)
+        sender = asyncio.create_task(conn.pump())
+        try:
+            first = await _recv_json(ws)
+            requested = first.get("session") if first.get("t") == "hello" else None
+            await hub.attach(conn, requested)
+            await hub.handle(conn, first)
+            while True:
+                msg = await _recv_json(ws)
+                try:
+                    await hub.handle(conn, msg)
+                except Exception:
+                    pass
+        except WebSocketDisconnect:
+            pass
+        finally:
+            hub.detach(conn)
+            sender.cancel()
+
+    app.add_api_websocket_route(path, endpoint)

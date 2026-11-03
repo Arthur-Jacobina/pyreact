@@ -11,6 +11,38 @@
   const maxDelay = 10000; // 10s cap
   let heartbeat;
 
+  // Session id: per tab (sessionStorage), survives reloads so the server can
+  // resume this tab's session; a new tab gets a new session.
+  const SESSION_KEY = 'pyreact.session';
+  function loadSessionId() { try { return sessionStorage.getItem(SESSION_KEY); } catch { return null; } }
+  function saveSessionId(id) { try { sessionStorage.setItem(SESSION_KEY, id); } catch {} }
+
+  // The same chat message may arrive both as a legacy `chat` message and as
+  // an EventBus `message` event; render it once (only cross-channel copies
+  // within 2s are treated as duplicates).
+  const recentMessages = new Map(); // key -> [{t, src}]
+  function isDuplicate(data, src) {
+    const key = [data.sender, data.message_type, data.text].join('\u0000');
+    const now = Date.now();
+    for (const [k, list] of recentMessages) {
+      const kept = list.filter((e) => now - e.t <= 2000);
+      if (kept.length) recentMessages.set(k, kept); else recentMessages.delete(k);
+    }
+    const list = recentMessages.get(key) || [];
+    const i = list.findIndex((e) => e.src !== src);
+    if (i >= 0) { list.splice(i, 1); return true; }
+    list.push({ t: now, src });
+    recentMessages.set(key, list);
+    return false;
+  }
+  function appendChatMessage(data, src) {
+    if (!data || typeof data.text !== 'string') return;
+    data = Object.assign({ sender: 'assistant', message_type: 'chat' }, data);
+    if (isDuplicate(data, src)) return;
+    chronologicalOutput.appendChild(createChatMessage(data));
+    scrollToBottom(chatContainer || chronologicalOutput);
+  }
+
   function scrollToBottom(el){ try{ el.scrollTop = el.scrollHeight; }catch{} }
   function isOpen() { return ws && ws.readyState === WebSocket.OPEN; }
   
@@ -59,13 +91,13 @@
         ws.send(
           JSON.stringify({
             t: 'hello',
+            session: loadSessionId(),
             path: location.pathname,
             query: location.search || '',
             fragment: location.hash || ''
           })
         );
       } catch {}
-      try { ws.send(JSON.stringify({t:'subscribe', channels:['ui','logs','chat']})); } catch {}
       clearInterval(heartbeat);
       heartbeat = setInterval(() => {
         try { if (isOpen()) ws.send(JSON.stringify({t:'ping', ts: Date.now()})); } catch {}
@@ -75,6 +107,15 @@
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
+        if (msg.channel === 'session' && msg.type === 'session') {
+          if (msg.data && msg.data.id) saveSessionId(msg.data.id);
+          return;
+        }
+        if (msg.channel === 'events' && msg.event) {
+          const e = msg.event;
+          if (e.kind === 'message') appendChatMessage(e.payload || {}, 'events');
+          return;
+        }
         if (msg.channel === 'ui' && msg.type === 'nav') {
           if (location.pathname !== msg.data) history.pushState({}, '', msg.data);
           return;
@@ -88,9 +129,7 @@
           return;
         }
         if (msg.channel === 'chat' && msg.type === 'message') {
-          const messageElement = createChatMessage(msg.data);
-          chronologicalOutput.appendChild(messageElement);
-          scrollToBottom(chatContainer || chronologicalOutput);
+          appendChatMessage(msg.data, 'chat');
           return;
         }
       } catch {
