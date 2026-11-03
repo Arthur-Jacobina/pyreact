@@ -32,8 +32,9 @@ Turns (watch the ``recovery.*`` lines):
 Then **crash & resume**: a child process answers a question with a durable
 session log (``pyreact_durable``), and is ``kill -9``'d while saving a
 note, after the model answered but before the turn ended. A new process
-resumes the unfinished turn (``app.resume_pending()``): the journaled LLM
-call is replayed (0 model calls) and the answer is the same.
+mounts the same root (same ``session_id``) and resumes the unfinished turn
+(``resume_pending()``): the journaled LLM call is replayed (0 model calls)
+and the answer is the same.
 
 Run from the repo root::
 
@@ -65,12 +66,13 @@ from integrations.recovery import (
     retry,
     timeout,
 )
-from pyreact.boot import bootstrap
+from pyreact.boot import create_root
 from pyreact.components.message import Message
-from pyreact.core import ErrorBoundary, component, current_boundary, hooks, use_emit, use_turn
+from pyreact.core import ErrorBoundary, component, current_boundary, hooks, use_turn
 from pyreact.core.harness import HarnessProvider
 from pyreact.tools import make_tool
 
+from examples._devtools import trace
 from examples._lm import OFFLINE, example_lm
 
 # Offline smoke run (tests/test_examples_smoke.py): logs go to the temp dir.
@@ -188,7 +190,6 @@ def city_of(text: str) -> str:
 @component
 def Assistant(tools: Dict[str, Any]):
     turn = use_turn()
-    emit = use_emit()
     mod = use_module(Answer, name="answer")
     call = use_call(mod)
 
@@ -202,17 +203,19 @@ def Assistant(tools: Dict[str, Any]):
 
     hooks.use_effect(lambda: research() if turn else None, [turn and turn.id])
 
-    async def deliver():
-        if call.error is not None:
-            emit("message", {"text": f"sorry, no model could answer ({call.error})",
-                                    "sender": "assistant", "message_type": "error"})
-            return
-        answer = call.result.answer
-        emit("message", {"text": answer, "sender": "assistant", "message_type": "chat"})
-        await call_tool(tools["save_note"], kwargs={"text": answer})
+    settled = call.ver and not call.loading
 
-    hooks.use_effect(lambda: deliver() if call.ver and not call.loading else None, [call.ver])
-    return []
+    async def save():  # a side effect of the answer: part of the turn
+        await call_tool(tools["save_note"], kwargs={"text": call.result.answer})
+
+    hooks.use_effect(lambda: save() if settled and call.error is None else None, [call.ver])
+
+    if not settled:
+        return []
+    if call.error is not None:
+        return [Message(key=f"error-{call.ver}", sender="assistant", message_type="error",
+                        text=f"sorry, no model could answer ({call.error})")]
+    return [Message(key=f"answer-{call.ver}", text=call.result.answer, sender="assistant")]
 
 
 @component
@@ -263,35 +266,33 @@ def middleware_stack(clock=None):
 # Transcript
 # ---------------------------------------------------------------------------
 def printer(prefix: str = ""):
-    def show(ev) -> None:
+    """Devtools: one line per event of KINDS (the transcript of the demo)."""
+
+    def show(ev):
         p = ev.payload
         if ev.kind == "turn.start":
             tag = " (resumed)" if p.get("resumed") else ""
-            print(f"{prefix}\n{prefix}> {p['text']}   [{ev.turn_id}{tag}]", flush=True)
-        elif ev.kind == "turn.end":
-            print(f"{prefix}  turn {ev.turn_id}: {p['status']} in {p['duration']:.2f}s",
-                  flush=True)
-        elif ev.kind == "message":
-            who = p.get("sender")
-            print(f"{prefix}  {who}: {p.get('text')}", flush=True)
-        elif ev.kind == "llm.end":
+            return f"{prefix}\n{prefix}> {p['text']}   [{ev.turn_id}{tag}]"
+        if ev.kind == "turn.end":
+            return f"{prefix}  turn {ev.turn_id}: {p['status']} in {p['duration']:.2f}s"
+        if ev.kind == "message":
+            return f"{prefix}  {p.get('sender')}: {p.get('text')}"
+        if ev.kind == "llm.end":
             key = f" ({p['model_key']})" if p.get("model_key") else ""
-            print(f"{prefix}  · llm answered by {p.get('model')}{key}", flush=True)
-        elif ev.kind == "error.caught":
-            print(f"{prefix}  · ErrorBoundary caught {p['error']} in {p['component']}",
-                  flush=True)
-        elif ev.kind == "recovery.retry":
+            return f"{prefix}  · llm answered by {p.get('model')}{key}"
+        if ev.kind == "error.caught":
+            return f"{prefix}  · ErrorBoundary caught {p['error']} in {p['component']}"
+        if ev.kind == "recovery.retry":
             hint = f", Retry-After {p['hint']}s" if p.get("hint") else ""
-            print(f"{prefix}  · retry {p['kind']} {p['name']!r} attempt {p['next_attempt']} "
-                  f"in {p['delay']:.2f}s{hint} <- {p['error']}", flush=True)
-        elif ev.kind == "recovery.timeout":
-            print(f"{prefix}  · timeout {p['kind']} {p['name']!r} after {p['seconds']}s",
-                  flush=True)
-        elif ev.kind == "recovery.circuit":
-            print(f"{prefix}  · circuit {p['key']}: {p['prev']} -> {p['state']}", flush=True)
-        elif ev.kind == "recovery.fallback":
-            print(f"{prefix}  · fallback {p.get('from')} -> {p['to']} <- {p['error']}",
-                  flush=True)
+            return (f"{prefix}  · retry {p['kind']} {p['name']!r} attempt {p['next_attempt']} "
+                    f"in {p['delay']:.2f}s{hint} <- {p['error']}")
+        if ev.kind == "recovery.timeout":
+            return f"{prefix}  · timeout {p['kind']} {p['name']!r} after {p['seconds']}s"
+        if ev.kind == "recovery.circuit":
+            return f"{prefix}  · circuit {p['key']}: {p['prev']} -> {p['state']}"
+        if ev.kind == "recovery.fallback":
+            return f"{prefix}  · fallback {p.get('from')} -> {p['to']} <- {p['error']}"
+        return None
 
     return show
 
@@ -315,8 +316,6 @@ def resilience_demo() -> FlakyLM:
     def Root():
         return [App(key="app", models=models, middleware=stack, tools=tools)]
 
-    app = bootstrap(Root)
-    app.event_bus.subscribe(printer(), KINDS)
     questions = [
         "What's the weather in Lisbon?",
         "And in Porto?",
@@ -324,16 +323,15 @@ def resilience_demo() -> FlakyLM:
         "Show me a chart for Lisbon",
         "Thanks! And Lisbon tomorrow?",
     ]
-    try:
+    with create_root(Root, session_id="weather") as root:
+        trace(root, KINDS, printer())
         for i, q in enumerate(questions):
             if i == 4:
                 clock.t += 31
                 print("\n  ... 31 seconds later (simulated clock) ...")
-            app.invoke(q, wait=True, timeout=600)
-        print(f"\n  circuit {primary.model}: {breaker.state(primary.model)}; real model "
-              f"calls: primary {primary.real_calls}, fast {fast.real_calls}")
-    finally:
-        app.shutdown()
+            root.send(q, wait=True, timeout=600)
+    print(f"\n  circuit {primary.model}: {breaker.state(primary.model)}; real model "
+          f"calls: primary {primary.real_calls}, fast {fast.real_calls}")
     return primary
 
 
@@ -353,15 +351,18 @@ def child(mode: str, log_path: str) -> None:
         return [App(key="app", models={"default": dlm}, middleware=stack, tools=tools,
                     durable_log=slog)]
 
-    app = bootstrap(Root)
-    app.event_bus.subscribe(printer("    |"), KINDS)
+    # the same session id in both processes: the log's turns are this root's
+    root = create_root(Root, session_id="weather")
+    trace(root, KINDS, printer("    |"))
     if mode == "crash":
-        app.invoke("What's the weather in Porto?")
+        root.send("What's the weather in Porto?")
         time.sleep(300)  # never returns: the parent kills us mid-turn
         return
-    resumed = app.resume_pending(wait=True, timeout=300)
+    # Re-run the turn the log saw start but never end. TODO(api): there is no
+    # Root.resume_pending() yet; the session is the root's low-level side.
+    resumed = root.session.resume_pending(wait=True, timeout=300)
     print(f"    | resumed: {resumed}; durable_lm: {dlm.stats}", flush=True)
-    app.shutdown()
+    root.unmount()
     slog.close()
 
 
@@ -391,7 +392,7 @@ def crash_and_resume(log_dir: str) -> None:
             proc.kill()
     print(f"  process 1: killed with SIGKILL (exit {proc.returncode}) before the turn ended")
 
-    print("  process 2: app.resume_pending()")
+    print("  process 2: same root, resume_pending()")
     out = subprocess.run([*cmd, "--child", "resume"], capture_output=True, text=True, env=env,
                          timeout=600)
     print(out.stdout, end="")

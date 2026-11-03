@@ -32,6 +32,7 @@ from typing import Annotated, Literal
 import dspy
 from pydantic import Field
 
+from examples._devtools import show_messages, trace
 from examples._lm import example_lm
 from integrations import DSPyProvider, use_agent, use_agent_call
 from integrations.harness import (
@@ -43,8 +44,9 @@ from integrations.harness import (
     tool_allowlist,
     use_verify,
 )
-from pyreact.boot import bootstrap
-from pyreact.core import EventBus, HookContext, component, hooks, use_on_turn
+from pyreact.boot import create_root
+from pyreact.components.message import Message
+from pyreact.core import component, hooks, use_on_turn
 from pyreact.core.harness import HarnessProvider
 from pyreact.tools import ToolProvider
 
@@ -123,23 +125,30 @@ def Clerk(on_answer):
 @component
 def Shop():
     summary = use_agent_call("answer -> one_line_summary", name="summary")
+    quote, set_quote = hooks.use_state(None)  # (n, result, error): the clerk's last answer
 
-    def on_answer(agent):
-        if agent.error is not None:
-            print(f"\nclerk error: {agent.error}")
-            return
-        r = agent.result
-        print(f"\nclerk: {r.answer}\n       sku={r.sku} total={r.total}")
-        summary.run(answer=r.answer)  # 2nd LLM call this turn: over budget
+    def on_answer(agent):  # a callback prop: the clerk reports, the shop decides
+        set_quote(lambda q: ((q[0] + 1) if q else 1, agent.result, agent.error))
 
-    def summarized():
-        if summary.ver and summary.error is not None:
-            print(f"summary: not run ({type(summary.error).__name__})")
-        elif summary.ver:
-            print(f"summary: {summary.result.one_line_summary}")
+    def summarize():
+        if quote is not None and quote[2] is None:
+            summary.run(answer=quote[1].answer)  # 2nd LLM call this turn: over budget
 
-    hooks.use_effect(summarized, [summary.ver])
-    return [Clerk(key="clerk", on_answer=on_answer)]
+    hooks.use_effect(summarize, [quote and quote[0]])
+
+    out = [Clerk(key="clerk", on_answer=on_answer)]
+    if quote is not None:
+        n, r, error = quote
+        text = (f"clerk error: {error}" if error is not None
+                else f"clerk: {r.answer}\n       sku={r.sku} total={r.total}")
+        out.append(Message(key=f"quote-{n}", text=text, sender="assistant"))
+    if summary.ver:
+        text = (f"summary: not run ({type(summary.error).__name__})"
+                if summary.error is not None
+                else f"summary: {summary.result.one_line_summary}")
+        out.append(Message(key=f"summary-{summary.ver}", text=text, sender="system",
+                           message_type="info"))
+    return out
 
 
 LM = example_lm()
@@ -160,43 +169,44 @@ def _short(v, n=110):
     return s if len(s) <= n else s[: n - 3] + "..."
 
 
-def trace(ev) -> None:
+def decision(ev):
+    """Devtools: one line per harness decision (``None``: not shown)."""
     p, k = ev.payload, ev.kind
     if k == "llm.start":
-        print(f"  llm     {p['module']}: start")
-    elif k in ("llm.end", "llm.error"):
+        return f"  llm     {p['module']}: start"
+    if k in ("llm.end", "llm.error"):
         u = p.get("usage") or {}
         end = "end" if k == "llm.end" else "error"
-        print(f"  llm     {p['module']}: {end} ({u.get('lm_calls', 0)} LM calls, "
-              f"{u.get('total_tokens', 0)} tokens)")
-    elif k == "tool.start":
-        print(f"  tool    {p['tool']}({_short(p['args'], 60)})")
-    elif k == "tool.end" and not p.get("error"):
-        print(f"  tool    {p['tool']} -> {_short(p['result'], 60)}")
-    elif k == "guard.redacted":
-        print(f"  GUARD   {p['guard']}: redacted {p['count']} item(s) in {p['fields']} "
-              f"of {p['kind']} {p['name']!r}")
-    elif k == "guard.blocked":
-        print(f"  GUARD   {p['guard']}: BLOCKED {p['kind']} {p['name']!r}: {p['reason']}")
-    elif k == "verify.passed":
-        print(f"  VERIFY  {p['verifier']}: passed (score {p['score']:g})")
-    elif k == "verify.failed":
-        print(f"  VERIFY  {p['verifier']}: FAILED (score {p['score']:g}) -> {p['action']}: "
-              f"{_short(p['feedback'])}")
-    elif k == "feedback":
-        print(f"  LEARN   feedback event for {p['target']}: score {p['score']:g}")
+        return (f"  llm     {p['module']}: {end} ({u.get('lm_calls', 0)} LM calls, "
+                f"{u.get('total_tokens', 0)} tokens)")
+    if k == "tool.start":
+        return f"  tool    {p['tool']}({_short(p['args'], 60)})"
+    if k == "tool.end" and not p.get("error"):
+        return f"  tool    {p['tool']} -> {_short(p['result'], 60)}"
+    if k == "guard.redacted":
+        return (f"  GUARD   {p['guard']}: redacted {p['count']} item(s) in {p['fields']} "
+                f"of {p['kind']} {p['name']!r}")
+    if k == "guard.blocked":
+        return f"  GUARD   {p['guard']}: BLOCKED {p['kind']} {p['name']!r}: {p['reason']}"
+    if k == "verify.passed":
+        return f"  VERIFY  {p['verifier']}: passed (score {p['score']:g})"
+    if k == "verify.failed":
+        return (f"  VERIFY  {p['verifier']}: FAILED (score {p['score']:g}) -> {p['action']}: "
+                f"{_short(p['feedback'])}")
+    if k == "feedback":
+        return f"  LEARN   feedback event for {p['target']}: score {p['score']:g}"
+    return None
+
+
+KINDS = ["llm.start", "llm.end", "llm.error", "tool.*", "guard.*", "verify.*", "feedback"]
 
 
 def main(request: str) -> None:
-    HookContext.get_service("event_bus", EventBus).subscribe(
-        trace, ["llm.start", "llm.end", "llm.error", "tool.*", "guard.*", "verify.*",
-                "feedback"])
-    app = bootstrap(Root)
-    try:
+    with create_root(Root, session_id="shop") as root:
+        trace(root, KINDS, decision)  # the trace of every decision (devtools)
+        show_messages(root)           # what the shop says (Message components)
         print(f"> {request}")
-        tid = app.invoke(request, wait=True, timeout=600)
-    finally:
-        app.shutdown()
+        tid = root.send(request, wait=True, timeout=600)
     spent = BUDGET.spent(tid)
     print(f"\nturn budget: {spent['tokens']} of {BUDGET.max_tokens} tokens spent")
 
