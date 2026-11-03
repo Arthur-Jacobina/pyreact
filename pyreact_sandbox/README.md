@@ -249,35 +249,48 @@ What survives what:
 | `autosnapshot="turn"` | snapshot of the last turn | snapshot of the last finished turn | snapshot image |
 | `on_close="snapshot"` | snapshot at close | (no close) → the record's live id is reattached if alive | snapshot image |
 
-### Suspend / resume with the whole agent (`SandboxParticipant`)
+### Suspend / hydrate with the whole agent (roots)
 
-With pyreact's stateful sessions (`session.suspend()` / `app.resume(id)`, see
-"Stateful agents" in the main README), `SandboxParticipant` puts every
-sandbox the session created into the suspend manifest:
+`use_sandbox` / `SandboxProvider` own their state (ADR 0001): on
+`root.suspend()` the effect cleanup (`use_cleanup_reason() == "suspend"`)
+snapshots or pauses each sandbox per `on_close`, and the provider's
+`use_dehydrate` slice records how to bring it back. No participant:
 
 ```python
-from pyreact_sandbox import SandboxParticipant
-app = AppRunner(App, participants=[DurableParticipant, SandboxParticipant],
-                manifest_store=DirectoryManifestStore("runs/manifests"))
-# mode: participants=[lambda s: SandboxParticipant(s, mode="suspend")]
+root = create_root(App, session_id="agent", store=DirectorySnapshots("runs/state"))
+root.suspend(on_active="interrupt")
+root = hydrate_root(App, session_id="agent", store=DirectorySnapshots("runs/state"))
 ```
 
 ```json
-"sandbox": {"mode": "snapshot", "sandboxes": [{"key": "default", "store_key": "agent/default",
-            "driver": "docker", "sandbox_id": null, "snapshot": {"id": "pyreact-sandbox:…"}, "spec": {}}]}
+"slices": {"App/SandboxProvider[sandbox]": {"sandboxes": {"default": {
+    "driver": "docker", "spec": {}, "sandbox_id": null, "snapshot": {"id": "pyreact-sandbox:…"}}}}}
 ```
 
-| `mode` | at suspend | at resume |
-|---|---|---|
-| `snapshot` (default) | snapshot, then destroy | new sandbox from the snapshot |
-| `suspend` | pause (`docker pause`), keep | reattach + unpause (else the last snapshot) |
-| `keep` | leave running | reattach |
+The suspend policy is `resolve_policy(on_close, "suspend")`, which **never
+destroys implicitly**: `"destroy"` (a plain policy or a mapping's `"*"`)
+becomes `"snapshot"`. Name `"suspend"` in a mapping to choose:
 
-The manifest's record wins over the provider's `SnapshotStore` for the same
+| `on_close` for `"suspend"` | at suspend | at hydrate |
+|---|---|---|
+| `"snapshot"` (also the default `"destroy"`) | snapshot, then destroy | new sandbox from the snapshot |
+| `{"suspend": "suspend", ...}` | pause (`docker pause`), keep | reattach + unpause (else the last snapshot) |
+| `{"suspend": "keep", ...}` | leave running | reattach |
+| `{"suspend": "destroy", ...}` | destroy (nothing carried) | fresh sandbox |
+
+The slice's record wins over the provider's `SnapshotStore` for the same
 key. If the snapshot is gone (or the sandbox, or the driver changed), a
-fresh sandbox boots and `session.resume.degraded` is published
-(`participant: "sandbox"`, `reason: "snapshot missing"` ...). `suspend()`
-returns once the sandboxes reached their final state.
+fresh sandbox boots and a `hydration.mismatch` (`kind: "error"`,
+`reason: "snapshot missing"` ...) plus `session.resume.degraded`
+(`participant: "sandbox"`) are published. `root.suspend()` returns once the
+sandboxes reached their final state (the dehydrate awaits the closes).
+`scope="component"` sandboxes (and provider-less ones) are dehydrated by
+`use_sandbox` in the calling component (slice `"sandbox"` / `"sandbox:<key>"`).
+Under a hidden `Activity` sandboxes keep running.
+
+`SandboxParticipant` is deprecated (a `DeprecationWarning`); it still works
+with the legacy `session.suspend()` / `app.resume(id)` (`mode=` overrides the
+suspend policy, the fragment lists the sandboxes as before).
 
 ## Integrations
 

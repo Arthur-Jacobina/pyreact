@@ -1,126 +1,227 @@
-"""SandboxParticipant: sandboxes in suspend manifests (LocalDriver, no Docker).
+"""Sandboxes dehydrate their snapshot ref (use_dehydrate): roots carry them.
 
-The provider's SnapshotStore is in memory (lost with the runner), so the
-only thing that brings a sandbox back is the manifest.
+LocalDriver, no Docker (``tests/test_sandbox_docker.py`` repeats the round
+trip with Docker). The provider's SnapshotStore is in memory (lost with the
+runner), so the only thing that brings a sandbox back is the snapshot.
 """
 
 import shutil
+import warnings
 
 import pytest
 
-from pyreact.boot import AppRunner, DirectoryManifestStore
-from pyreact.core import component, hooks, use_turn
+from pyreact.boot import AppRunner, DirectoryManifestStore, DirectorySnapshots
+from pyreact.boot import create_root, hydrate_root
+from pyreact.core import HydrationWarning, component, hooks, use_turn
 from pyreact_sandbox import LocalDriver, SandboxParticipant, SandboxSpec
-from pyreact_sandbox.react import SandboxProvider, use_sandbox, wait_closed
+from pyreact_sandbox.react import SandboxProvider, resolve_policy, use_sandbox, wait_closed
+
+SLICE = "App/SandboxProvider[sbx]"
 
 
-@component
-def Notes():
-    """`write <text>` appends to notes.txt, `read` prints it."""
-    sb = use_sandbox()
-    turn = use_turn()
-    bus = hooks.get_service("event_bus", lambda: None)
+def _notes(**sandbox_kw):
+    @component
+    def Notes():
+        """`write <text>` appends to notes.txt, `read` prints it."""
+        sb = use_sandbox(**sandbox_kw)
+        turn = use_turn()
+        bus = hooks.get_service("event_bus", lambda: None)
 
-    async def act():
-        cmd, _, arg = turn.text.partition(" ")
-        try:
-            old = await sb.read_text("notes.txt")
-        except FileNotFoundError:
-            old = ""
-        if cmd == "write":
-            await sb.write_file("notes.txt", old + arg + "\n")
-        else:
-            bus.publish("message", {"text": old.strip() or "(none)", "sender": "sandbox"})
+        async def act():
+            cmd, _, arg = turn.text.partition(" ")
+            try:
+                old = await sb.read_text("notes.txt")
+            except FileNotFoundError:
+                old = ""
+            if cmd == "write":
+                await sb.write_file("notes.txt", old + arg + "\n")
+            else:
+                bus.publish("message", {"text": old.strip() or "(none)", "sender": "sandbox"})
 
-    hooks.use_effect(lambda: act() if turn else None, [turn and turn.id])
-    return []
+        hooks.use_effect(lambda: act() if turn else None, [turn and turn.id])
+        return []
+
+    return Notes
+
+
+def make_app(drv, on_close="destroy"):
+    Notes = _notes()
+
+    @component
+    def App():
+        return [SandboxProvider(key="sbx", driver=drv, spec=SandboxSpec(),
+                                on_close=on_close, children=[Notes(key="n")])]
+
+    return App
 
 
 @pytest.fixture
-def make(tmp_path):
-    made = []
-
-    def _make(mode="snapshot"):
-        drv = LocalDriver(root=tmp_path / "sbx")
-
-        @component
-        def App():
-            return [SandboxProvider(key="sbx", driver=drv, spec=SandboxSpec(),
-                                    on_close="destroy", children=[Notes(key="n")])]
-
-        app = AppRunner(App, default_session=False,
-                        participants=[lambda s: SandboxParticipant(s, mode=mode)],
-                        manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
-        made.append(app)
-        return app, drv
-
-    yield _make
-    for app in made:
-        app.shutdown()
+def env(tmp_path):
+    roots = []
+    yield tmp_path, roots
+    for r in roots:
+        try:
+            r.unmount()
+        except Exception:
+            pass
     wait_closed(10)
 
 
-def _watch(app, kinds=("sandbox.*", "message", "session.resume.degraded")):
-    events = []
-    app.on_session(open=lambda s: s.event_bus.subscribe(events.append, list(kinds)))
-    return events
+def _texts(root):
+    return [e.payload["text"] for e in root.events.recent(None, ["message"])]
 
 
-def _texts(events):
-    return [e.payload["text"] for e in events if e.kind == "message"]
+def _kinds(root, kind):
+    return [e.payload for e in root.events.recent(None, [kind])]
 
 
-@pytest.mark.parametrize("mode", ["snapshot", "suspend", "keep"])
-def test_sandbox_comes_back_after_suspend_in_a_new_runner(make, mode):
-    app, drv = make(mode)
-    s = app.open_session("agent")
-    s.invoke("write alpha", wait=True, timeout=10)
-    m = s.suspend()
-    [rec] = m["participants"]["sandbox"]["sandboxes"]
-    assert m["participants"]["sandbox"]["mode"] == mode
-    assert rec["store_key"] == "agent/default" and rec["driver"] == "local"
+def test_suspend_policy_never_destroys_implicitly():
+    assert resolve_policy("destroy", "suspend") == "snapshot"
+    assert resolve_policy({"shutdown": "suspend", "*": "destroy"}, "suspend") == "snapshot"
+    assert resolve_policy({"suspend": "destroy"}, "suspend") == "destroy"  # explicit
+    assert resolve_policy("suspend", "suspend") == "suspend"
+    assert resolve_policy(lambda r: "keep" if r == "suspend" else "destroy", "suspend") == "keep"
+    assert resolve_policy("destroy", "closed") == "destroy"
+
+
+@pytest.mark.parametrize("on_close,mode", [
+    ("destroy", "snapshot"),                              # the default: snapshot, not destroy
+    ({"suspend": "suspend", "*": "destroy"}, "suspend"),  # pause, reattach
+    ({"suspend": "keep"}, "keep"),
+])
+def test_sandbox_comes_back_after_suspend_in_a_new_runner(env, on_close, mode):
+    tmp_path, roots = env
+    drv = LocalDriver(root=tmp_path / "sbx")
+    store = DirectorySnapshots(tmp_path / "state")
+    root = create_root(make_app(drv, on_close), session_id="agent", store=store)
+    root.send("write alpha", wait=True, timeout=10)
+    snap = root.suspend()
+    rec = snap["slices"][SLICE]["sandboxes"]["default"]
+    assert rec["driver"] == "local" and rec["spec"]
     live = drv.list_sync()
     if mode == "snapshot":
         assert rec["snapshot"] and rec["sandbox_id"] is None
-        assert live == []  # destroyed by the time suspend() returned
+        assert live == []  # snapshotted then destroyed by the time suspend() returned
     else:
         assert rec["sandbox_id"] in live
         status = drv.attach_sync(rec["sandbox_id"]).status_sync()
         assert status == ("suspended" if mode == "suspend" else "running")
-    app.shutdown()
     wait_closed(10)
 
-    app2, drv2 = make(mode)
-    events = _watch(app2)
-    r = app2.resume("agent")
-    r.invoke("write beta", wait=True, timeout=10)
-    r.invoke("read", wait=True, timeout=10)
-    assert _texts(events) == ["alpha\nbeta"]
-    restored = [e.payload for e in events if e.kind == "sandbox.restored"]
+    r = hydrate_root(make_app(LocalDriver(root=tmp_path / "sbx"), on_close),
+                     session_id="agent", store=store)
+    roots.append(r)
+    r.send("write beta", wait=True, timeout=10)
+    r.send("read", wait=True, timeout=10)
+    assert _texts(r) == ["alpha\nbeta"]
+    restored = _kinds(r, "sandbox.restored")
     assert restored and restored[0]["mode"] == ("snapshot" if mode == "snapshot" else "attach")
-    assert r.degraded == []
-    r.suspend()
+    assert r.mismatches == [] and r.session.degraded == []
+    snap2 = r.suspend()  # and again
+    assert snap2["slices"][SLICE]["sandboxes"]["default"]
 
 
-def test_missing_snapshot_boots_a_fresh_sandbox_and_degrades(make, tmp_path):
-    app, drv = make("snapshot")
-    s = app.open_session("lost")
-    s.invoke("write alpha", wait=True, timeout=10)
-    m = s.suspend()
-    app.shutdown()
+def test_missing_snapshot_boots_a_fresh_sandbox_and_is_a_mismatch(env):
+    tmp_path, roots = env
+    drv = LocalDriver(root=tmp_path / "sbx")
+    root = create_root(make_app(drv), session_id="lost")
+    root.send("write alpha", wait=True, timeout=10)
+    snap = root.suspend()
     wait_closed(10)
     shutil.rmtree(tmp_path / "sbx" / "_snapshots")  # the snapshot is gone
 
-    app2, _ = make("snapshot")
-    events = _watch(app2)
-    r = app2.resume("lost", m)
-    r.invoke("read", wait=True, timeout=10)
-    assert _texts(events) == ["(none)"]  # a fresh sandbox
-    deg = [e.payload for e in events if e.kind == "session.resume.degraded"]
-    assert [(d["participant"], d["reason"], d["key"]) for d in deg] == [
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", HydrationWarning)
+        r = hydrate_root(make_app(drv), session_id="lost", snapshot=snap)
+        roots.append(r)
+        r.send("read", wait=True, timeout=10)
+    assert _texts(r) == ["(none)"]  # a fresh sandbox
+    [m] = r.mismatches
+    assert (m["kind"], m["path"], m["key"], m["reason"]) == (
+        "error", SLICE, "sandboxes", "snapshot missing")
+    assert [(d["participant"], d["reason"], d["key"]) for d in r.session.degraded] == [
         ("sandbox", "snapshot missing", "default")]
-    assert r.degraded[0]["reason"] == "snapshot missing"
-    assert any(e.kind == "sandbox.created" for e in events)
+    assert _kinds(r, "hydration.mismatch") and _kinds(r, "sandbox.created")
+
+
+def test_explicit_destroy_on_suspend_carries_nothing(env):
+    tmp_path, roots = env
+    drv = LocalDriver(root=tmp_path / "sbx")
+    root = create_root(make_app(drv, {"suspend": "destroy"}), session_id="d")
+    root.send("write alpha", wait=True, timeout=10)
+    snap = root.suspend()
+    assert snap["slices"][SLICE]["sandboxes"] == {}
+    assert drv.list_sync() == []
+
+
+def test_component_scoped_sandbox_dehydrates_in_its_component(env):
+    tmp_path, roots = env
+    drv = LocalDriver(root=tmp_path / "sbx")
+    Notes = _notes(scope="component", driver=drv)
+
+    @component
+    def App():
+        return [Notes(key="n")]  # no provider
+
+    root = create_root(App, session_id="c")
+    root.send("write alpha", wait=True, timeout=10)
+    snap = root.suspend()
+    rec = snap["slices"]["App/Notes[n]"]["sandbox"]
+    assert rec["snapshot"] and rec["sandbox_id"] is None
+    wait_closed(10)
+    r = hydrate_root(App, session_id="c", snapshot=snap)
+    roots.append(r)
+    r.send("read", wait=True, timeout=10)
+    assert _texts(r) == ["alpha"] and r.mismatches == []
+
+
+def test_live_dehydrate_keeps_the_sandbox_running(env):
+    tmp_path, roots = env
+    drv = LocalDriver(root=tmp_path / "sbx")
+    root = create_root(make_app(drv), session_id="live")
+    roots.append(root)
+    root.send("write alpha", wait=True, timeout=10)
+    rec = root.dehydrate()["slices"][SLICE]["sandboxes"]["default"]
+    assert rec["sandbox_id"] in drv.list_sync()
+    root.send("read", wait=True, timeout=10)
+    assert _texts(root) == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Deprecated: SandboxParticipant keeps working for one release
+# ---------------------------------------------------------------------------
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize("mode", ["snapshot", "suspend"])
+def test_deprecated_participant_still_round_trips(tmp_path, mode):
+    with pytest.warns(DeprecationWarning, match="SandboxParticipant is deprecated"):
+        SandboxParticipant(mode=mode)
+    drv = LocalDriver(root=tmp_path / "sbx")
+
+    def runner():
+        return AppRunner(make_app(drv), default_session=False,
+                         participants=[lambda s: SandboxParticipant(s, mode=mode)],
+                         manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
+
+    app = runner()
+    try:
+        s = app.open_session("agent")
+        s.invoke("write alpha", wait=True, timeout=10)
+        m = s.suspend()
+        [rec] = m["participants"]["sandbox"]["sandboxes"]
+        assert m["participants"]["sandbox"]["mode"] == mode and rec["driver"] == "local"
+    finally:
+        app.shutdown()
+        wait_closed(10)
+    app2 = runner()
+    try:
+        r = app2.resume("agent")
+        texts = []
+        r.event_bus.subscribe(lambda ev: texts.append(ev.payload["text"]), ["message"])
+        r.invoke("read", wait=True, timeout=10)
+        assert texts == ["alpha"] and r.degraded == []
+    finally:
+        app2.shutdown()
+        wait_closed(10)
 
 
 def test_participant_validates_mode():

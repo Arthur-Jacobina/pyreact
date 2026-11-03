@@ -217,11 +217,9 @@ def test_rlm_interpreter_runs_inside_the_container(docker):
         sb.destroy_sync()
 
 
-@pytest.mark.parametrize("mode", ["snapshot", "suspend"])
-def test_session_suspend_resume_brings_the_container_back(docker, tmp_path, mode):
-    from pyreact.boot import AppRunner, DirectoryManifestStore
+def _shell_app(docker, on_close):
     from pyreact.core import component, hooks, use_turn
-    from pyreact_sandbox.react import SandboxProvider, use_sandbox, wait_closed
+    from pyreact_sandbox.react import SandboxProvider, use_sandbox
 
     @component
     def Shell():
@@ -236,14 +234,84 @@ def test_session_suspend_resume_brings_the_container_back(docker, tmp_path, mode
         hooks.use_effect(lambda: act() if turn else None, [turn and turn.id])
         return []
 
-    def make():
-        @component
-        def App():
-            return [SandboxProvider(key="sbx", driver=docker, spec=spec(), on_close="destroy",
-                                    children=[Shell(key="sh")])]
+    @component
+    def App():
+        return [SandboxProvider(key="sbx", driver=docker, spec=spec(), on_close=on_close,
+                                children=[Shell(key="sh")])]
 
-        return AppRunner(App, default_session=False,
-                         participants=[lambda s: ps.SandboxParticipant(s, mode=mode)],
+    return App
+
+
+@pytest.mark.parametrize("on_close,mode", [
+    ("destroy", "snapshot"),                              # suspend snapshots, never destroys
+    ({"suspend": "suspend", "*": "destroy"}, "suspend"),  # docker pause, reattach
+])
+def test_root_suspend_hydrate_brings_the_container_back(docker, tmp_path, on_close, mode):
+    from pyreact.boot import DirectorySnapshots, create_root, hydrate_root
+    from pyreact_sandbox.react import wait_closed
+
+    store = DirectorySnapshots(tmp_path / "state")
+    root = create_root(_shell_app(docker, on_close), session_id="dk", store=store)
+    root.send("sh -c 'echo persisted > /tmp/state.txt'", wait=True, timeout=120)
+    snap = root.suspend()  # no participants: the provider dehydrates its sandboxes
+    rec = snap["slices"]["App/SandboxProvider[sbx]"]["sandboxes"]["default"]
+    if mode == "suspend":
+        assert inspect(rec["sandbox_id"])["State"]["Paused"] is True
+    else:
+        assert rec["sandbox_id"] is None
+        assert rec["snapshot"]["id"].startswith("pyreact-sandbox:")
+    wait_closed(60)
+
+    r = hydrate_root(_shell_app(docker, on_close), session_id="dk", store=store)
+    try:
+        r.send("cat /tmp/state.txt", wait=True, timeout=120)
+        texts = [e.payload["text"] for e in r.events.recent(None, ["message"])]
+        assert texts == ["persisted"]
+        assert r.mismatches == [] and r.session.degraded == []
+        restored = [e.payload for e in r.events.recent(None, ["sandbox.restored"])]
+        assert restored[0]["mode"] == ("attach" if mode == "suspend" else "snapshot")
+    finally:
+        r.unmount()  # on_close: destroy
+        wait_closed(60)
+
+
+def test_root_hydrate_with_a_lost_snapshot_boots_fresh(docker, tmp_path):
+    import warnings
+
+    from pyreact.boot import create_root, hydrate_root
+    from pyreact.core import HydrationWarning
+    from pyreact_sandbox.react import wait_closed
+
+    root = create_root(_shell_app(docker, "destroy"), session_id="lost")
+    root.send("sh -c 'echo x > /tmp/state.txt'", wait=True, timeout=120)
+    snap = root.suspend()
+    wait_closed(60)
+    ref = snap["slices"]["App/SandboxProvider[sbx]"]["sandboxes"]["default"]["snapshot"]
+    subprocess.run(["docker", "rmi", "-f", ref["id"]], capture_output=True)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", HydrationWarning)
+        r = hydrate_root(_shell_app(docker, "destroy"), session_id="lost", snapshot=snap)
+        try:
+            r.send("sh -c 'cat /tmp/state.txt 2>/dev/null || echo fresh'", wait=True,
+                   timeout=120)
+            texts = [e.payload["text"] for e in r.events.recent(None, ["message"])]
+            assert texts == ["fresh"]
+            assert [m["reason"] for m in r.mismatches] == ["snapshot missing"]
+            assert [d["reason"] for d in r.session.degraded] == ["snapshot missing"]
+        finally:
+            r.unmount()
+            wait_closed(60)
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_deprecated_participant_suspend_resume_still_works(docker, tmp_path):
+    from pyreact.boot import AppRunner, DirectoryManifestStore
+    from pyreact_sandbox.react import wait_closed
+
+    def make():
+        return AppRunner(_shell_app(docker, "destroy"), default_session=False,
+                         participants=[lambda s: ps.SandboxParticipant(s, mode="snapshot")],
                          manifest_store=DirectoryManifestStore(tmp_path / "m"))
 
     app = make()
@@ -252,10 +320,7 @@ def test_session_suspend_resume_brings_the_container_back(docker, tmp_path, mode
         s.invoke("sh -c 'echo persisted > /tmp/state.txt'", wait=True, timeout=120)
         m = s.suspend()
         [rec] = m["participants"]["sandbox"]["sandboxes"]
-        if mode == "suspend":
-            assert inspect(rec["sandbox_id"])["State"]["Paused"] is True
-        else:
-            assert rec["snapshot"]["id"].startswith("pyreact-sandbox:")
+        assert rec["snapshot"]["id"].startswith("pyreact-sandbox:")
     finally:
         app.shutdown()
         wait_closed(60)

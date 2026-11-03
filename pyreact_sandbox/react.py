@@ -69,7 +69,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Union
 
-from pyreact.core import (EventBus, component, create_context, hooks, runtime,
+from pyreact.core import (EventBus, component, create_context, hooks,
+                          report_hydration_mismatch, runtime, use_dehydrate,
                           use_imperative_handle, use_path)
 from pyreact.core.harness import through
 
@@ -104,9 +105,13 @@ __all__ = [
 ON_CLOSE = ("destroy", "suspend", "snapshot", "keep")
 _PREVIEW = 400
 
-# Session services shared with pyreact_sandbox.stateful.SandboxParticipant.
+# Deprecated session services (pyreact_sandbox.stateful.SandboxParticipant,
+# kept for one release): handles now dehydrate through use_dehydrate.
 HANDLES_SERVICE = "pyreact_sandbox.handles"  # {store key: SandboxHandle} of the session
-RESTORE_SERVICE = "pyreact_sandbox.restore"  # {store key: record} from a resumed manifest
+RESTORE_SERVICE = "pyreact_sandbox.restore"  # {store key: record} from a legacy manifest
+
+# How long a dehydrate waits for the suspend close (snapshot / pause) of a handle.
+SUSPEND_CLOSE_TIMEOUT = 600.0
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +208,27 @@ def _check_policy(on_close: Any) -> None:
 
 def resolve_policy(on_close: Any, reason: str) -> str:
     """The close policy for ``reason`` (``"shutdown"``, ``"idle"``,
-    ``"closed"``, ``"unmount"``)."""
+    ``"closed"``, ``"unmount"``, ``"suspend"``).
+
+    ``"suspend"`` (``root.suspend()``: the tree is dehydrated, the agent will
+    be hydrated again) never destroys implicitly: a ``"destroy"`` that comes
+    from a plain policy or a mapping's ``"*"`` becomes ``"snapshot"``. Name
+    ``"suspend"`` in a mapping (or decide in a callable) to choose otherwise,
+    e.g. ``{"suspend": "suspend", "*": "destroy"}`` pauses instead."""
     if callable(on_close):
-        return on_close(reason)
+        policy = on_close(reason)
+        if reason == "suspend" and policy not in ON_CLOSE:
+            return "snapshot"
+        return policy
     if isinstance(on_close, Mapping):
-        return on_close.get(reason, on_close.get("*", "destroy"))
-    return on_close
+        if reason == "suspend" and "suspend" in on_close:
+            return on_close["suspend"]
+        policy = on_close.get(reason, on_close.get("*", "destroy"))
+    else:
+        policy = on_close
+    if reason == "suspend" and policy == "destroy":
+        return "snapshot"
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -249,10 +269,13 @@ class SandboxHandle:
         self.error: Optional[BaseException] = None
         self.closed = False
         self.dirty = False
-        # set by a resumed manifest: tried before the store's record
+        # set by hydration (a snapshot's slice): tried before the store's record
         self.restore_record: Optional[Dict[str, Any]] = None
-        # close policy forced for close_reason "suspend" (SandboxParticipant)
+        # where that slice was (path, key): for hydration.mismatch reports
+        self.restore_origin: Optional[tuple] = None
+        # close policy forced for a suspend (deprecated SandboxParticipant)
         self.suspend_policy: Optional[str] = None
+        self.closed_policy: Optional[str] = None  # the policy close applied
         self.close_future: Optional[concurrent.futures.Future] = None
         self._create_lock: Optional[asyncio.Lock] = None
         self._rw: Optional[_RWLock] = None
@@ -325,14 +348,63 @@ class SandboxHandle:
             return sb
 
     def _degrade(self, reason: str, **info: Any) -> None:
-        """A manifest said how to bring this sandbox back and it could not
-        be done (``session.resume.degraded``)."""
+        """A snapshot (or legacy manifest) said how to bring this sandbox
+        back and it could not be done: a ``hydration.mismatch`` (on the
+        slice it came from) and ``session.resume.degraded``."""
         fn = getattr(self.session, "degrade", None)
         if callable(fn):
             try:
                 fn("sandbox", reason, key=self.key, **info)
             except Exception:
                 pass
+        path, slice_key = self.restore_origin or (self.source, "sandboxes")
+        try:
+            report_hydration_mismatch(
+                slice_key, f"sandbox {self.key!r}: {reason}; a fresh sandbox boots",
+                ctx=self.owner, path=path, reason=reason, sandbox=self.key, **info)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ dehydrate
+    def dehydrate(self) -> Optional[Dict[str, Any]]:
+        """This sandbox's slice record: how to bring it back
+        (``{driver, spec, sandbox_id, snapshot}``), or ``None`` (destroyed).
+
+        After a suspend close: ``"snapshot"`` -> the snapshot ref only,
+        ``"suspend"`` / ``"keep"`` -> its id (reattach) and its last
+        snapshot, ``"destroy"`` -> ``None``. Live (``root.dehydrate()``): its
+        id and last snapshot. Never booted: the record it was given."""
+        base = {"driver": self.driver.name, "spec": self.spec.to_dict()}
+        if self.sandbox is None:
+            rec = self.restore_record or (self.store.get(self.store_key)
+                                          if self.store is not None else None)
+            if not rec or not (rec.get("sandbox_id") or rec.get("snapshot")):
+                return None
+            return {**base, "driver": rec.get("driver") or self.driver.name,
+                    "sandbox_id": rec.get("sandbox_id"), "snapshot": rec.get("snapshot")}
+        policy = self.closed_policy
+        if policy == "destroy":
+            return None
+        snap = self.last_snapshot.to_dict() if self.last_snapshot is not None else None
+        sid = self.id if policy in (None, "suspend", "keep") else None
+        return {**base, "sandbox_id": sid, "snapshot": snap}
+
+    def suspend_close_policy(self) -> str:
+        """The close policy a suspend applies (see :func:`resolve_policy`)."""
+        if self.suspend_policy is not None:
+            return self.suspend_policy
+        return resolve_policy(self.on_close, "suspend")
+
+    async def adehydrate(self, timeout: float = SUSPEND_CLOSE_TIMEOUT) -> Optional[Dict[str, Any]]:
+        """:meth:`dehydrate` once a close in flight (the suspend's snapshot /
+        pause) has finished."""
+        fut = self.close_future
+        if fut is not None and not fut.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(fut)), timeout)
+            except Exception:
+                pass
+        return self.dehydrate()
 
     async def _boot(self) -> Sandbox:
         t0 = time.perf_counter()
@@ -562,8 +634,8 @@ class SandboxHandle:
         resolved against the session's ``close_reason``."""
         if policy is None:
             reason = getattr(self.session, "close_reason", None) or "unmount"
-            if reason == "suspend" and self.suspend_policy is not None:
-                policy = self.suspend_policy
+            if reason == "suspend":
+                policy = self.suspend_close_policy()
             else:
                 policy = resolve_policy(self.on_close, reason)
         fut = _worker.submit(self._aclose(policy), track=True)
@@ -577,6 +649,7 @@ class SandboxHandle:
         if self.closed:
             return
         self.closed = True
+        self.closed_policy = policy
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
@@ -706,12 +779,37 @@ class SandboxEnv:
     autosnapshot: Optional[str] = None
     handles: Dict[str, SandboxHandle] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    # hydration: {key: record} from the provider's slice, taken by use_sandbox
+    restore: Dict[str, Any] = field(default_factory=dict)
+    path: Optional[str] = None  # the provider's path (its slice)
+    # handles a suspend closed (snapshot / pause in flight): still dehydrated
+    suspended: Dict[str, SandboxHandle] = field(default_factory=dict)
 
-    def close_all(self) -> None:
+    def close_all(self, reason: Optional[str] = None) -> None:
+        """Close every handle; ``reason="suspend"`` applies each handle's
+        suspend policy (snapshot / pause, never an implicit destroy) and
+        keeps the handles for :meth:`adehydrate`."""
         with self.lock:
             handles, self.handles = list(self.handles.values()), {}
+            if reason == "suspend":
+                self.suspended.update({h.key: h for h in handles})
         for h in handles:
-            h.close_nowait()
+            h.close_nowait(h.suspend_close_policy() if reason == "suspend" else None)
+
+    async def adehydrate(self) -> Dict[str, Any]:
+        """The provider's slice: ``{key: record}`` (see :meth:`SandboxHandle.dehydrate`)
+        for its handles, after a suspend's closes finished; records hydrated
+        but never asked for in this run are carried over."""
+        with self.lock:
+            handles = {**self.suspended, **self.handles}
+        out: Dict[str, Any] = {k: v for k, v in self.restore.items() if v}
+        for k, h in handles.items():
+            rec = await h.adehydrate()
+            if rec is not None:
+                out[k] = rec
+            else:
+                out.pop(k, None)
+        return out
 
 
 _SandboxCtx = create_context(default=None, name="Sandbox")
@@ -745,21 +843,41 @@ def SandboxProvider(driver: Union[str, SandboxDriver] = "docker", spec=None, sto
     drv = hooks.use_memo(lambda: get_driver(driver, **dict(driver_options or {})),
                          [_driver_key(driver), tuple(sorted((driver_options or {}).items()))])
     default_store = hooks.use_memo(MemorySnapshotStore, [])
+    path = use_path()
+    current = hooks.use_ref(None)
+    # The provider's own state (ADR 0001): how to bring each sandbox back.
+    hydrated = use_dehydrate("sandboxes", dehydrate=lambda: current.current.adehydrate(),
+                             hydrate=_hydrate_records)
     env = hooks.use_memo(lambda: SandboxEnv(driver=drv, spec=SandboxSpec.coerce(spec),
                                             store=store if store is not None else default_store,
-                                            on_close=on_close, autosnapshot=autosnapshot),
+                                            on_close=on_close, autosnapshot=autosnapshot,
+                                            restore=dict(hydrated or {}), path=path),
                          [id(drv)])
+    current.current = env
     env.spec = SandboxSpec.coerce(spec)
     env.store = store if store is not None else default_store
     env.on_close, env.autosnapshot = on_close, autosnapshot
 
     def _lifecycle():
-        return env.close_all
+        def _close(reason):
+            if reason == "hidden":  # Activity: the sandboxes keep running
+                return
+            env.close_all(reason)
+
+        return _close
 
     hooks.use_effect(_lifecycle, [id(env)])
     use_imperative_handle(ref, lambda: env, [id(env)])
     hooks.provide(_SandboxCtx, env)
     return list(children or [])
+
+
+def _hydrate_records(slice_: Any) -> Dict[str, Any]:
+    """``hydrate`` of a sandbox slice: ``{key: record}`` (records are checked
+    when the sandbox boots: a missing snapshot boots a fresh one)."""
+    if not isinstance(slice_, Mapping):
+        raise TypeError(f"a sandbox slice is a dict {{key: record}}, got {type(slice_).__name__}")
+    return {str(k): dict(v) for k, v in slice_.items() if isinstance(v, Mapping)}
 
 
 def use_sandbox_env() -> Optional[SandboxEnv]:
@@ -803,6 +921,17 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
       reaching into ``session.services[HANDLES_SERVICE]``.
 
     The record key in the store is ``"<session id>/<key>"``.
+
+    Suspend / hydrate (ADR 0001): on ``root.suspend()`` the effect cleanup
+    (``use_cleanup_reason() == "suspend"``) snapshots or pauses the sandbox
+    per ``on_close`` (:func:`resolve_policy`: never an implicit destroy) and
+    its record (snapshot ref, id) is dehydrated -- by the
+    :func:`SandboxProvider` for session-scoped sandboxes, by this hook
+    (slice ``"sandbox"`` / ``"sandbox:<key>"`` of the calling component) for
+    ``scope="component"`` or without a provider. ``hydrate_root`` hands the
+    record back, so the sandbox restores from its snapshot (or reattaches);
+    if that fails a fresh sandbox boots and a ``hydration.mismatch`` (plus
+    ``session.resume.degraded``) is reported.
     """
     if scope not in ("session", "component"):
         raise ValueError("scope must be 'session' or 'component'")
@@ -810,11 +939,22 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
     session = hooks.get_service("session", lambda: None)
     sid = str(getattr(session, "id", None) or "default")
     env = hooks.use_context(_SandboxCtx)
+    provided = env is not None
     if env is None:
         env = _session_env(bus)
     ctx = runtime.current_component()
     path = use_path()
     k = key or ("default" if scope == "session" else path)
+    # who dehydrates this sandbox: the provider (session scope under one), else
+    # this hook, in the calling component (stable: the tree shape decides)
+    owns_slice = scope == "component" or not provided
+    slice_key = "sandbox" if key is None else f"sandbox:{key}"
+    current = hooks.use_ref(None)
+    hydrated = None
+    if owns_slice:
+        hydrated = use_dehydrate(
+            slice_key, hydrate=lambda rec: dict(rec) if isinstance(rec, Mapping) else None,
+            dehydrate=lambda: current.current.adehydrate() if current.current else None)
 
     if isinstance(spec, SandboxSpec):
         eff_spec = spec
@@ -838,8 +978,14 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
             on_close=on_close or env.on_close,
             autosnapshot=autosnapshot if autosnapshot is not None else env.autosnapshot,
             bus=bus, owner=ctx, source=path, home_loop=loop, session=session)
-        h.restore_record = restore.pop(h.store_key, None)
-        registry[h.store_key] = h  # for a SandboxParticipant
+        legacy = restore.pop(h.store_key, None)  # a deprecated SandboxParticipant
+        if owns_slice:
+            rec, origin = hydrated, (path, slice_key)
+        else:
+            rec, origin = env.restore.pop(k, None), (env.path, "sandboxes")
+        h.restore_record = rec or legacy
+        h.restore_origin = origin if rec else None
+        registry[h.store_key] = h  # deprecated: for a SandboxParticipant
         return h
 
     local = hooks.use_ref(None)
@@ -853,12 +999,23 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
         if handle is None or handle.closed:
             handle = local.current = make()
 
+    current.current = handle
+
     def _lifecycle():
         if eager:
             handle.start_nowait()
-        if scope == "component":
-            return lambda: handle.close_nowait()
-        return None
+
+        def _cleanup(reason):
+            if reason == "hidden":  # Activity: keep it running
+                return
+            if reason == "suspend":
+                if owns_slice:  # else the provider closes it
+                    handle.close_nowait(handle.suspend_close_policy())
+                return
+            if scope == "component":
+                handle.close_nowait()
+
+        return _cleanup
 
     hooks.use_effect(_lifecycle, [id(handle)])
     use_imperative_handle(ref, lambda: handle, [id(handle)])
