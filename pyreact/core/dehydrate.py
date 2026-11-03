@@ -71,6 +71,7 @@ __all__ = [
     "dehydrate_tree",
     "finish_hydration",
     "hydration_of",
+    "report_hydration_mismatch",
     "use_dehydrate",
 ]
 
@@ -201,6 +202,42 @@ def finish_hydration(root: Any) -> List[Dict[str, Any]]:
 def hydration_of(ctx: Any) -> Optional[HydrationState]:
     root = getattr(ctx, "_root", None)
     return getattr(root, "_hydration", None) if root is not None else None
+
+
+def report_hydration_mismatch(key: str, message: str, *, kind: str = "error",
+                              ctx: Any = None, path: Optional[str] = None,
+                              **info: Any) -> Dict[str, Any]:
+    """Report a hydration mismatch found by a library *after* its slice was
+    hydrated (e.g. the sandbox snapshot a slice points at is gone, so a fresh
+    sandbox boots): recorded on the root's hydration (``root.mismatches``),
+    published as ``hydration.mismatch {kind, path, key, message, **info}``
+    and warned (:class:`HydrationWarning`). Never raises.
+
+    ``ctx``: the component the slice belongs to (default: the one running
+    now, see ``runtime.current_component``); ``path`` defaults to its path.
+    Works after hydration finished and on a tree that was not hydrated (then
+    only the event and the warning)."""
+    if ctx is None:
+        from .runtime import current_component
+
+        ctx = current_component()
+    if path is None:
+        path = getattr(ctx, "path", None) or "?"
+    state = hydration_of(ctx) if ctx is not None else None
+    if state is not None:
+        state.mismatch(kind, path, key, message, **info)
+        return state.mismatches[-1]
+    rec = {"kind": kind, "path": path, "key": key, "message": message, **info}
+    warnings.warn(HydrationWarning(f"hydration mismatch: {message}"), stacklevel=2)
+    root = getattr(ctx, "_root", None) if ctx is not None else None
+    services = getattr(root, "_session_services", None) or {}
+    bus = services.get("event_bus")
+    if bus is not None:
+        try:
+            bus.publish("hydration.mismatch", rec, source=path)
+        except Exception:
+            pass
+    return rec
 
 
 # ---------------------------------------------------------------------------
