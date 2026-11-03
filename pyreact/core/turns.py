@@ -89,12 +89,18 @@ class TurnManager:
         policy: TurnPolicy = "queue",
         input_bus: Any = None,
         event_bus: Optional[EventBus] = None,
+        id_factory: Optional[Callable[[int], str]] = None,
     ) -> None:
+        """``id_factory(index) -> str`` builds turn ids (default
+        ``f"t{index}"``); the session's ``id_prefix`` is prepended either
+        way. Use it (or :meth:`advance_to`) to keep ids unique across
+        restarts, e.g. ``id_factory=lambda i: f"t-{run_id}-{i}"``."""
         self.policy: str = policy
         self._input_bus = input_bus
         self._event_bus = event_bus
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
+        self._id_factory: Optional[Callable[[int], str]] = id_factory
         self._queue: Deque[Turn] = deque()
         self._active: Optional[Turn] = None
         self._latest: Optional[Turn] = None
@@ -124,6 +130,7 @@ class TurnManager:
         id_prefix: Optional[str] = None,
         owner: Any = None,
         owner_filter: Optional[Callable[[Any], bool]] = None,
+        id_factory: Optional[Callable[[int], str]] = None,
     ) -> "TurnManager":
         """Configure the manager. Session wiring:
 
@@ -136,6 +143,8 @@ class TurnManager:
         """
         if id_prefix is not None:
             self.id_prefix = id_prefix
+        if id_factory is not None:
+            self._id_factory = id_factory
         if owner is not None:
             self._owner = owner
         if owner_filter is not None:
@@ -208,11 +217,20 @@ class TurnManager:
     # ------------------------------------------------------------------
     # submission
     # ------------------------------------------------------------------
+    def advance_to(self, index: int) -> None:
+        """Make the next allocated turn index at least ``index`` (never goes
+        back). Lets a persistence layer continue numbering after a restart so
+        turn ids journaled by an earlier run are not reused."""
+        with self._lock:
+            nxt = next(self._counter)
+            self._counter = itertools.count(max(nxt, int(index)))
+
     def new_turn(self, text: str, *, source: str = "term") -> Turn:
         """Allocate a Turn (thread-safe) without queueing it."""
         with self._lock:
             idx = next(self._counter)
-        return Turn(id=f"{self.id_prefix}t{idx}", index=idx, text=text, source=source)
+        tid = self._id_factory(idx) if self._id_factory is not None else f"t{idx}"
+        return Turn(id=f"{self.id_prefix}{tid}", index=idx, text=text, source=source)
 
     def submit(self, text: str, *, source: str = "term") -> Turn:
         """Queue ``text`` as a new turn. Callable from any thread."""
