@@ -40,6 +40,26 @@ from pyreact.tools import Tool, resolve_tools, use_tools
 from . import telemetry as tm
 from .dspy_integration import DSPyEnv
 
+# Session service filled by integrations.stateful.CompiledModulesParticipant
+# on resume: {module key tuple: dspy state}, applied when the module is built.
+RESTORE_SERVICE = "dspy.compiled.restore"
+
+
+def _apply_restored(restore: Dict[Any, Any], env: Optional[DSPyEnv], key: Any, mod: Any) -> Any:
+    """Load a learned state a resumed manifest recorded for ``key`` into the
+    freshly built ``mod`` and mark it compiled (so the next suspend keeps it)."""
+    state = restore.pop(key, None) if restore else None
+    if state is None:
+        return mod
+    try:
+        mod.load_state(state)
+    except Exception as exc:
+        tm.publish("error", {"phase": "restore", "key": repr(key), "error": repr(exc)})
+        return mod
+    if env is not None:
+        env.compiled[key] = mod
+    return mod
+
 __all__ = [
     "Call",
     "StreamCall",
@@ -186,8 +206,9 @@ def use_module(
         except Exception:
             pass
         env.caches[key] = mod
-        return mod
+        return _apply_restored(restore, env, key, mod)
 
+    restore = hooks.get_service(RESTORE_SERVICE, dict)
     mod = hooks.use_memo(_factory, deps=[key, deps_key, id(env.caches), kw_sig])
 
     if compile_with_optimizer and env.optimizer is not None:
@@ -1030,8 +1051,21 @@ def use_agent(
         react._pyreact_signature = signature
         if env is not None:
             env.caches[key] = react
-        return react
+        return _apply_restored(restore, env, key, react)
 
+    restore = hooks.get_service(RESTORE_SERVICE, dict)
     # Rebuild only when signature, tool set, limits, or name change.
     react = hooks.use_memo(_build, deps=[key, tools_key, max_iters])
+    compiled = env.compiled.get(key) if env is not None else None
+    if compiled is not None and compiled is not react:
+        # A learned program was hot-swapped in for this agent: take its state
+        # (instructions, demos) and keep the live tool bindings.
+        try:
+            react.load_state(compiled.dump_state())
+            for attr in ("_pyreact_result_path", "_pyreact_optimizer"):
+                if hasattr(compiled, attr):
+                    setattr(react, attr, getattr(compiled, attr))
+            env.compiled[key] = env.caches[key] = react
+        except Exception as exc:
+            tm.publish("error", {"phase": "hot_swap", "key": repr(key), "error": repr(exc)})
     return use_call(react, model=model, lm=lm, policy=policy, name=name, turn_id=turn_id)
