@@ -46,6 +46,12 @@ Inspect any log while the app runs: `uv run python -m pyreact_durable show <file
 
 See [Error recovery](../README.md#error-recovery) in the main README.
 
+## Sandboxes (`examples/sandbox/`, library: [`pyreact_sandbox`](../pyreact_sandbox/README.md))
+
+| Example | Idea | LLM |
+|---|---|---|
+| `sandbox.01_coding_agent` | A ReAct agent writes and runs code in a Docker sandbox (`sandbox_tools`); `--resume` restores the sandbox after a restart (`--driver local` = no Docker, not isolated) | yes |
+
 ## Learning: architectures & optimizers (`examples/learn/`)
 
 | Example | Idea |
