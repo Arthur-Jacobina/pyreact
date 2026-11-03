@@ -26,7 +26,9 @@ class _ContextKey:
 
 def provider(ctx_key, *, prop="value"):
     def decorator(body_fn):
-        @component
+        # Providers are transparent: they don't add a segment to the paths of
+        # the components below them (see HookContext.path).
+        @component(transparent=True)
         @wraps(body_fn)
         def wrapper(*, key=None, **props):
             try:

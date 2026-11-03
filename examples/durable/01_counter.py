@@ -65,7 +65,7 @@ async def main() -> None:
     log = ap.parse_args().log
 
     @component
-    def App():  # stable key= props keep the state address stable: App/.../Counter[counter]
+    def App():  # address: App/Counter[counter] (providers add no path segment)
         return [Durable(key="durable", log=log, children=[Counter(key="counter")])]
 
     app = bootstrap(App)

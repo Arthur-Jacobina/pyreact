@@ -2,7 +2,7 @@
 
 Everything here is built on pyreact's *public* surface only:
 ``hooks.use_state / use_memo / use_effect / use_callback / use_context``,
-``hooks.provide``, ``hooks.path``, ``hooks.get_service`` and the session's
+``hooks.provide``, ``hooks.path`` / ``hooks.full_path``, ``hooks.get_service`` and the session's
 ``EventBus``. Nothing in ``pyreact`` knows this module exists.
 
     @component
@@ -114,7 +114,7 @@ def _jsonable(obj: Any) -> Any:
         return repr(obj)
 
 
-@component
+@component(transparent=True)
 def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
     """Provide a :class:`SessionLog` to the subtree and journal bus events.
 
@@ -207,6 +207,17 @@ def _check_json(value: Any, path: str, key: str) -> None:
         ) from None
 
 
+def _restore(log: SessionLog, path: str, full_path: str, key: str) -> Any:
+    """Value at ``(path, key)``; falls back to ``full_path`` (where logs
+    written before providers became transparent stored it, e.g.
+    ``App/Durable[d]/DSPyProvider[dspy]/_Provider[#0]/Chat[chat]``). The next
+    set writes under ``path``, so old logs migrate on first write."""
+    restored = log.get_state(path, key, _MISSING)
+    if restored is _MISSING and full_path != path:
+        restored = log.get_state(full_path, key, _MISSING)
+    return restored
+
+
 def _use_box(hook: str, key: str, make_initial: Callable[[], Any]) -> Tuple[dict, Callable]:
     """Shared machinery: a per-component box holding the current value, kept
     in sync with the log position, and a ``commit(new)`` that persists."""
@@ -226,7 +237,7 @@ def _use_box(hook: str, key: str, make_initial: Callable[[], Any]) -> Tuple[dict
     with box["lock"]:
         if box["sync"] != sync:
             if log is not None:
-                restored = log.get_state(path, key, _MISSING)
+                restored = _restore(log, path, hooks.full_path, key)
                 box["value"] = make_initial() if restored is _MISSING else restored
             elif box["sync"] is _UNSET:
                 box["value"] = make_initial()
@@ -266,7 +277,11 @@ def use_persistent_state(initial: Any, *, key: str):
     """``use_state`` whose value survives restarts.
 
     Addressed by ``(hooks.path, key)``: give components stable ``key=`` props
-    so their path does not depend on sibling order. On first render (and after
+    so their path does not depend on sibling order. Providers (``Durable``,
+    ``DSPyProvider``, context providers...) add no path segment, so wrapping
+    the tree in more providers later keeps the address (``App/Chat[chat]``).
+    Values stored by older versions under the every-node path
+    (``hooks.full_path``) are still found. On first render (and after
     a checkout) the value is restored from ``log.state_at(leaf)``; setting it
     appends a ``state`` entry (values must be JSON-serializable, else
     :class:`DurableStateError`). Without a :func:`Durable` above, behaves like

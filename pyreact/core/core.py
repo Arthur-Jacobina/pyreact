@@ -25,11 +25,23 @@ class VNode:
         self.key = key
 
 
-def component(fn):
+def component(fn=None, *, transparent: bool = False):
+    """Turn a function into a component (``@component``).
+
+    ``@component(transparent=True)`` marks a *provider-like* component: it
+    has its own path, but contributes no segment to its descendants' paths
+    (see :attr:`HookContext.path`). Use it for components that only provide
+    context / wrap ``children``, so inserting or removing them later does not
+    change the address of the components below (durable state, traces).
+    """
+    if fn is None:
+        return lambda f: component(f, transparent=transparent)
+
     @wraps(fn)
     def wrapper(*, key=None, __internal=False, **props):
         if __internal:
             return fn(**props)
         return VNode(wrapper, props=props, key=key)
 
+    wrapper._pyreact_transparent = bool(transparent)
     return wrapper

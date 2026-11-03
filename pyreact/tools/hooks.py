@@ -20,7 +20,7 @@ def _registry_from(tools):
     return registry
 
 
-@component
+@component(transparent=True)
 def ToolProvider(*, tools: Optional[Iterable[ToolLike]] = None, children=None):
     # Inject a registry of tools into the subtree (mirrors DSPyProvider).
     registry = _registry_from(tools)

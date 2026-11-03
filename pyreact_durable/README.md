@@ -62,10 +62,10 @@ append-only JSONL file. Line 1 is the header; every other line is an entry.
 {"type":"session","version":1,"id":"4f8185e0-80f3-42f1-8ab4-d702bc1ce8f4","timestamp":"2026-11-03T04:40:01.120Z"}
 {"type":"event","id":"9a1c0b7e","parentId":null,"timestamp":"…","kind":"turn.start","payload":{"index":1,"text":"my favorite color is teal"},"turn_id":"t1","source":"term","ts":1793680801.1}
 {"type":"llm","id":"7e667548","parentId":"9a1c0b7e","timestamp":"…","key":"54dde7d9a0c4e1f2","occurrence":0,"model":"claude-cli/haiku","response":{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"[[ ## answer ## ]]\nGot it…"}}],"usage":{},"model":"claude-cli/haiku"},"latency":4.1,"request":{"prompt":null,"messages":[…],"kwargs":{}}}
-{"type":"state","id":"45ef500d","parentId":"7e667548","timestamp":"…","path":"App/Durable[durable]/Chat[chat]","key":"history","value":[{"role":"user","content":"my favorite color is teal"},{"role":"assistant","content":"Got it…"}]}
+{"type":"state","id":"45ef500d","parentId":"7e667548","timestamp":"…","path":"App/Chat[chat]","key":"history","value":[{"role":"user","content":"my favorite color is teal"},{"role":"assistant","content":"Got it…"}]}
 {"type":"label","id":"1a582c79","parentId":"45ef500d","timestamp":"…","targetId":"45ef500d","label":"base"}
 {"type":"leaf","id":"0df787b2","parentId":"60ec4dc4","timestamp":"…","targetId":"45ef500d"}
-{"type":"checkpoint","id":"c0ffee01","parentId":"45ef500d","timestamp":"…","state":{"App/Durable[durable]/Chat[chat]":{"history":[…]}},"summary":"after onboarding"}
+{"type":"checkpoint","id":"c0ffee01","parentId":"45ef500d","timestamp":"…","state":{"App/Chat[chat]":{"history":[…]}},"summary":"after onboarding"}
 {"type":"session_info","id":"5b2e9d10","parentId":"c0ffee01","timestamp":"…","name":"support chat"}
 {"type":"custom","id":"6d3a4f21","parentId":"c0ffee01","timestamp":"…","customType":"note","data":{"any":"json"}}
 ```
@@ -193,7 +193,16 @@ log.close()                               # also a context manager
 
 - **`use_persistent_state(initial, *, key)`** → `(value, set_value)`, like
   `use_state`. Address = `(hooks.path, key)`; give components stable `key=`
-  props so the path does not depend on sibling order. First render restores
+  props so the path does not depend on sibling order. **Providers are
+  transparent**: `Durable`, `DSPyProvider`, `ToolProvider`, `HarnessProvider`,
+  every `create_context` provider and your own `@component(transparent=True)`
+  components add no path segment, so `Chat(key="chat")` under `App` is
+  `App/Chat[chat]` no matter which providers sit in between — wrapping the
+  tree in another provider later does not orphan its state. Logs written
+  before this rule stored state under the every-node path
+  (`App/Durable[durable]/DSPyProvider[dspy]/_Provider[#0]/Chat[chat]`,
+  `hooks.full_path`); restore falls back to it and the next set rewrites it
+  under the new path, so old logs keep working without a migration. First render restores
   from the leaf; each effective set appends a `state` entry. Non-JSON values
   raise `DurableStateError` naming the component path and key. **Without a
   `Durable` above** it behaves exactly like `use_state` and warns once.
@@ -288,8 +297,11 @@ session 4f8185e0-…  v1  52 entries  2 branch point(s)  leaf=50072721
 ## Known gaps
 
 - Persistent addresses are component paths: renaming a component, changing a
-  `key` or reordering unkeyed siblings orphans its state (it stays in the
-  file; write a migration or move it with `set_state`).
+  `key`, reordering unkeyed siblings or moving it under another non-provider
+  component orphans its state (it stays in the file; write a migration or
+  move it with `set_state`). Adding/removing providers does not. Two
+  components with the same name and key under the same visible parent (e.g.
+  in two sibling providers) share an address: keep keys unique there.
 - Values must be JSON. Each set writes the whole value (fine for transcripts
   of normal size; checkpoints bound reload cost, not file size). No
   compaction that drops old lines yet.

@@ -72,7 +72,7 @@ def _identity_key(mapping: Optional[Dict[str, Any]]) -> Tuple:
     return tuple(sorted((str(k), id(v)) for k, v in mapping.items()))
 
 
-@component
+@component(transparent=True)
 def DSPyProvider(
     *,
     lm: Optional[Any] = None,

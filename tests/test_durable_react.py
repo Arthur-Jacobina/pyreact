@@ -78,7 +78,7 @@ def test_persistent_hooks_restore_across_two_runners(tmp_path, run_app):
 
     log = SessionLog.open(path, readonly=True)
     assert log.state_at() == {
-        "App/Durable[durable]/Counter[counter]": {"n": 3, "total": {"sum": 10}}
+        "App/Counter[counter]": {"n": 3, "total": {"sum": 10}}
     }
     kinds = [e["kind"] for e in log.events()]
     assert kinds.count("turn.start") == 3 and kinds.count("turn.end") == 3
@@ -95,7 +95,7 @@ def test_json_error_names_path_and_key(tmp_path, run_app):
     app = run_app(_counter_app(str(tmp_path / "e.jsonl"), seen, errors))
     app.invoke("bad", wait=True, timeout=5)
     assert len(errors) == 1
-    assert "'n'" in errors[0] and "App/Durable[durable]/Counter[counter]" in errors[0]
+    assert "'n'" in errors[0] and "App/Counter[counter]" in errors[0]
     assert "JSON-serializable" in errors[0]
 
 
@@ -162,7 +162,7 @@ def test_checkout_from_component_reloads_branch_state(tmp_path, run_app):
         # labels taken mid-turn mark that moment: later turn events branch off it
         assert log.branch_points()
         assert log.labels["main"] in {e["id"] for e in log.path_to()}
-        hist = log.get_state("App/Durable[d]/Chat[chat]", "history")
+        hist = log.get_state("App/Chat[chat]", "history")
         assert [m["content"] for m in hist] == ["one", "ONE", "two", "TWO"]
 
 
@@ -195,7 +195,7 @@ def test_log_object_and_factory_per_session(tmp_path):
         runner.shutdown()
     for sid, n in (("alice", 2), ("bob", 1)):
         with SessionLog.open(tmp_path / f"{sid}.jsonl", readonly=True) as log:
-            assert log.get_state("App/Durable[d]/Who[w]", "n") == n
+            assert log.get_state("App/Who[w]", "n") == n
 
     # a caller-owned SessionLog is not closed on unmount
     own = SessionLog.open(tmp_path / "own.jsonl")
@@ -207,7 +207,7 @@ def test_log_object_and_factory_per_session(tmp_path):
     r2 = AppRunner(App2)
     r2.invoke("x", wait=True, timeout=5)
     r2.shutdown()
-    assert not own.closed and own.get_state("App2/Durable[d]/Who[w]", "n") == 1
+    assert not own.closed and own.get_state("App2/Who[w]", "n") == 1
     assert not own.events()  # journal disabled
     own.close()
 
@@ -249,3 +249,69 @@ def test_conversation_as_dspy_history():
     assert h.messages == [{"question": "q1", "answer": "a1"}, {"question": "q2", "answer": "a2"}]
     assert conv.as_chat_messages()[2] == {"role": "system", "content": "note"}
     assert len(conv) == 6
+
+
+def test_providers_do_not_change_state_paths(tmp_path, run_app):
+    """Wrapping the tree in more providers later keeps durable state."""
+    from pyreact.core import HarnessProvider, create_context
+    from pyreact.tools import ToolProvider
+
+    Extra = create_context(default=None, name="Extra")
+    path = str(tmp_path / "wrap.jsonl")
+    seen = []
+
+    @component
+    def Who():
+        n, set_n = use_persistent_state(0, key="n")
+        _on_submit(lambda _t: set_n(lambda v: v + 1))
+        seen.append((hooks.path, n))
+        return []
+
+    @component
+    def App():
+        return [Durable(key="d", log=path, children=[Who(key="w")])]
+
+    app = run_app(App)
+    app.invoke("x", wait=True, timeout=5)
+    app.shutdown()
+    assert seen[-1] == ("App/Who[w]", 1)
+
+    @component
+    def App():  # noqa: F811 - same root name, more (unkeyed) providers in between
+        return [Durable(key="d", log=path, children=[
+            HarnessProvider(children=[
+                Extra(value=1, children=[ToolProvider(tools=[], children=[Who(key="w")])]),
+            ]),
+        ])]
+
+    seen.clear()
+    app = run_app(App)
+    app.wait_idle(timeout=5)
+    assert seen[-1] == ("App/Who[w]", 1)
+
+
+def test_state_stored_under_legacy_full_path_is_restored(tmp_path, run_app):
+    """Logs written before providers became transparent keep working."""
+    path = tmp_path / "old.jsonl"
+    with SessionLog.open(path) as log:
+        log.set_state("App/Durable[d]/Who[w]", "n", 41)
+    seen = []
+
+    @component
+    def Who():
+        n, set_n = use_persistent_state(0, key="n")
+        _on_submit(lambda _t: set_n(lambda v: v + 1))
+        seen.append((hooks.path, hooks.full_path, n))
+        return []
+
+    @component
+    def App():
+        return [Durable(key="d", log=str(path), journal=None, children=[Who(key="w")])]
+
+    app = run_app(App)
+    app.invoke("x", wait=True, timeout=5)
+    app.shutdown()
+    assert seen[0] == ("App/Who[w]", "App/Durable[d]/Who[w]", 41)
+    assert seen[-1][2] == 42
+    with SessionLog.open(path, readonly=True) as log:  # migrated on first write
+        assert log.get_state("App/Who[w]", "n") == 42

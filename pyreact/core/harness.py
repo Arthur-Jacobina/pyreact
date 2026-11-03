@@ -231,7 +231,7 @@ def uninstall(mw: Middleware) -> None:
 HarnessContext = create_context(default=None, name="Harness")
 
 
-@component
+@component(transparent=True)
 def HarnessProvider(*, middleware: Sequence[Middleware] = (), children=None):
     """Wrap a subtree with middleware. Nested providers compose: the outer
     provider's middleware wraps the inner one's."""
