@@ -17,6 +17,10 @@ Quick start::
     print(result.report()); print(result.diff())
     result.save("artifacts/router.json")
     result.hot_swap(app, "supervisor")
+
+Importing this package also registers the ``:modules``, ``:inspect``,
+``:explain``, ``:feedback`` and ``:optimize`` terminal commands.
+
 """
 
 from integrations.architectures import (
@@ -27,8 +31,17 @@ from integrations.architectures import (
     unregister_architecture,
 )
 from integrations.hooks import use_agent_call, use_module
+from integrations.telemetry import set_debug
 
 from .datasets import call_records, dataset_from_events, iter_events, split
+from .debug import explain, inspect_program
+from .devtools import (
+    LAST_RESULTS,
+    configure_learning,
+    install_commands,
+    run_optimization,
+    wait_optimizations,
+)
 from .hmr import find_envs, hot_swap_into, list_modules, resolve_module
 from .metrics import Metric, MetricError, as_metric, contains, exact_match, llm_judge
 from .optimizers import (
@@ -43,6 +56,8 @@ from .optimizers import (
     unregister_optimizer,
 )
 from .result import OptimizationResult, diff_states, load
+
+install_commands()
 
 __all__ = [
     # architectures
@@ -78,9 +93,17 @@ __all__ = [
     "call_records",
     "iter_events",
     "split",
-    # hot swap
+    # debugging / dev tools
+    "inspect_program",
+    "explain",
+    "set_debug",
+    "configure_learning",
     "find_envs",
     "list_modules",
     "resolve_module",
     "hot_swap_into",
+    "run_optimization",
+    "wait_optimizations",
+    "install_commands",
+    "LAST_RESULTS",
 ]
