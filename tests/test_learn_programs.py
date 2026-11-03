@@ -395,3 +395,47 @@ def test_use_learned_registry_swaps_from_inside_and_unmount_unregisters():
     assert seen[-1] == "INSIDE"
     assert [r for _p, r in box["regs"]] == [box["reg"]]
     assert box["reg"] not in [r for _p, r in find_registries(None)]
+
+
+# ---------------------------------------------------------------------------
+# Dehydration hook-in point: the provider's state is one JSON-able value
+# ---------------------------------------------------------------------------
+def test_provider_state_dehydrates_to_json_and_hydrates_back(tmp_path):
+    import json
+
+    from integrations.learn import dehydrate_programs, hydrate_programs
+
+    path = str(tmp_path / "qa.json")
+    res = OptimizationResult(program=learned("FILED"), optimizer="gepa", arch="predict")
+    res.save(path)
+    unsaved = learned("INLINE")
+    unsaved._pyreact_optimizer = "manual"
+    slice_ = dehydrate_programs({"file": path, "result": res, "inline": unsaved, "none": None})
+    assert json.loads(json.dumps(slice_)) == slice_
+    assert slice_["file"] == slice_["result"] == path and slice_["none"] is None
+    assert slice_["inline"]["optimizer"] == "manual"
+
+    back = hydrate_programs(json.loads(json.dumps(slice_)))
+    assert back["file"] == path and isinstance(back["inline"], SavedProgram)
+
+    # a provider started from the hydrated value serves the same programs
+    seen = {}
+
+    @component
+    def Leaf():
+        for n in ("file", "inline", "none"):
+            qa = use_module(QA, name=n, program=use_learned(n))
+            seen[n] = qa.signature.instructions
+        return []
+
+    regs = {}
+
+    @component
+    def Root():
+        return [DSPyProvider(key="dspy", lm=DummyLM([]), children=[
+            LearnedPrograms(key="lp", programs=back, children=[Leaf(key="leaf")])])]
+
+    run(Root, lambda: regs.update(find_registries(None)))
+    assert seen == {"file": "FILED", "inline": "INLINE", "none": "Answer the question."}
+    [reg] = [r for p, r in regs.items() if p.endswith("LearnedPrograms[lp]")]
+    assert reg.dehydrate() == slice_
