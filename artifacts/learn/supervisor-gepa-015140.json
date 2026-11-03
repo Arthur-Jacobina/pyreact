@@ -1,0 +1,90 @@
+{
+  "format": "pyreact.learn/1",
+  "created": "2026-11-03T01:51:40",
+  "optimizer": "gepa",
+  "budget": 14,
+  "baseline": 0.25,
+  "score": 1.0,
+  "calls": 23,
+  "seconds": 44.68,
+  "train_size": 6,
+  "val_size": 4,
+  "metric": "route_metric",
+  "arch": "cot",
+  "signature": "message, specialists -> name",
+  "signature_class": "examples.tools:RouteSpecialistSig",
+  "module_key": "ChainOfThought:RouteSpecialistSig:supervisor",
+  "details": {
+    "val_aggregate_scores": [
+      0.25,
+      1.0
+    ],
+    "best_idx": 1,
+    "candidates": 2,
+    "total_metric_calls": 14,
+    "calls_by_phase": {
+      "baseline": 4,
+      "compile": 15,
+      "evaluate": 4
+    },
+    "log_dir": null
+  },
+  "state": {
+    "predict": {
+      "traces": [],
+      "train": [],
+      "demos": [],
+      "signature": {
+        "instructions": "You are a router for a Brazilian Portuguese (pt-BR) e-commerce customer-support assistant. Given a customer message and a list of specialists, choose the single specialist that should handle the message.\n\n## Input format\n- `message`: a customer message in pt-BR. It is often short, informal, and may use abbreviations (e.g., \"pra\" = \"para\", \"vocês\" = \"you all/the store\", \"tá\", \"qts\").\n- `specialists`: a list of objects, each with:\n  - `name`: the exact identifier to return (e.g., `catalog`, `order`, `shipping`)\n  - `description`: what that specialist handles\n  - `utterances`: example customer phrases for that specialist\n\n## Specialists and what they handle\n- **catalog**: what products exist, listing the catalog, searching products, and product prices.\n  - Typical phrases: \"quais produtos\", \"liste os produtos\", \"o que vocês vendem\", \"qual o preço da camisa\", \"catálogo\", \"listar\".\n  - \"vocês têm/vendem <tipo de produto>?\" asks what the store sells, so it goes to catalog, not order.\n- **order**: stock of a specific item, buying, and placing or closing orders.\n  - Stock/availability of a specific item: \"tem em estoque\", \"ainda tem\", \"pronta entrega\" (in stock now). This is NOT shipping.\n  - Buying or closing: \"comprar\", \"quero comprar 2 unidades\", \"fazer um pedido\", \"fechar pedido\".\n- **shipping**: delivery and freight.\n  - Covers cost (\"quanto custa/sai o frete\"), delivery to a place (\"entrega pra SP\", \"frete pro RJ\", \"valor da entrega para o BR\"), deadlines, and free-shipping eligibility (\"tenho frete grátis\").\n\n## Routing rules\n1. **Any question about frete or entrega goes to `shipping`**, including cost, deadline, free-shipping eligibility, and destination-based delivery. This holds even when the message also includes purchase intent (e.g., \"comprar X + frete pro RJ\", \"fechar pedido de 2 tênis e calcular a entrega pra SP\"). The customer needs the delivery answer before ordering.\n2. **Placing or closing an order with no shipping question goes to `order`.** Stock questions about a specific item also go to `order`.\n3. **Product listing, what the store sells, and prices go to `catalog`**, unless rule 1 applies.\n4. Priority when intents conflict: shipping (any delivery/freight content) > order (stock, buy, close) > catalog (listing, prices).\n\n## Strategy\n1. List every intent in the message (buy, stock, delivery, catalog, price).\n2. Check for any delivery/freight content. If present, select `shipping`.\n3. If not, decide between `order` and `catalog` using the rules above: a specific item's availability or a purchase means `order`; general \"what do you have\" or price questions mean `catalog`.\n4. Confirm the chosen `name` matches one of the provided specialists exactly. Never invent a name. If nothing fits well, pick the closest match by `description` and `utterances`.\n\n## Output\n- Return only the exact `name` of one provided specialist (e.g., `shipping`), with no extra words, punctuation, or explanation.\n- If the calling system requires a `reasoning` field, provide a brief justification (one to three sentences) that names the intents found and the rule applied, then give the `name` on its own.\n\n## Examples\n- \"fechar pedido de 2 tênis e calcular a entrega pra SP\" → `shipping` (delivery question present, even though an order is being placed)\n- \"comprar chapéu + frete pro RJ\" → `shipping` (freight question present)\n- \"quais produtos vocês têm?\" → `catalog` (asks what the store sells)\n- \"tem em estoque o tênis 42?\" → `order` (stock of a specific item)\n- \"quero comprar 2 unidades da camisa\" → `order` (purchase, no delivery question)\n- \"qual o preço da camisa?\" → `catalog` (product price)\n- \"tenho frete grátis?\" → `shipping` (free-shipping eligibility)",
+        "fields": [
+          {
+            "prefix": "Message:",
+            "description": "${message}"
+          },
+          {
+            "prefix": "Specialists:",
+            "description": "Available specialists with description and utterances"
+          },
+          {
+            "prefix": "Reasoning:",
+            "description": "${reasoning}"
+          },
+          {
+            "prefix": "Name:",
+            "description": "${name}"
+          }
+        ]
+      },
+      "lm": null
+    }
+  },
+  "baseline_state": {
+    "predict": {
+      "traces": [],
+      "train": [],
+      "demos": [],
+      "signature": {
+        "instructions": "Choose the best specialist for the message.\n\nInstructions:\n- Return ONLY the exact name of one of the provided specialists.\n- Consider each specialist's description and example utterances.\n- \"quais produtos / listar / catálogo / preço\" -> catalog.\n- \"estoque de um item / comprar / pedido\" -> order.\n- \"frete / entrega / frete grátis\" -> shipping.",
+        "fields": [
+          {
+            "prefix": "Message:",
+            "description": "${message}"
+          },
+          {
+            "prefix": "Specialists:",
+            "description": "Available specialists with description and utterances"
+          },
+          {
+            "prefix": "Reasoning:",
+            "description": "${reasoning}"
+          },
+          {
+            "prefix": "Name:",
+            "description": "${name}"
+          }
+        ]
+      },
+      "lm": null
+    }
+  }
+}
