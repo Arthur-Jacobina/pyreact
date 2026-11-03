@@ -1,0 +1,23 @@
+{
+  "context_chars": 193930,
+  "answer": "schedule_rerender, _enqueued",
+  "error": null,
+  "llm_end": {
+    "call_id": "c357d8bc3a2d",
+    "module": "rlm",
+    "iterations": 3,
+    "sub_llm_calls": 0,
+    "trajectory_len": 3,
+    "latency": 14.473
+  },
+  "events": [
+    "llm.start",
+    "rlm.iteration",
+    "rlm.iteration",
+    "rlm.iteration",
+    "llm.end"
+  ],
+  "cli_llm_calls": 3,
+  "seconds": 14.5,
+  "mentions_expected": true
+}
