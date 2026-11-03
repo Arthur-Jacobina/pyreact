@@ -6,8 +6,8 @@ import json
 import time
 from typing import Literal, Optional
 
-from pyreact.core.core import component, hooks, use_path
-from pyreact.core.events import EventBus
+from pyreact.core.core import component, hooks
+from pyreact.core.io_hooks import use_emit
 from pyreact.core.message_buffer import MessageBuffer
 
 LEGACY_PREFIX = "__MESSAGE__:"
@@ -55,8 +55,9 @@ def Message(
 
         message  {"text", "sender", "message_type", "timestamp"}
 
-    on the app ``EventBus`` (source = component path, turn_id = current turn
-    when known). When it publishes depends on ``trigger``:
+    on the app ``EventBus`` with :func:`~pyreact.core.io_hooks.use_emit`
+    (source = component path, turn_id = current turn when known). When it
+    publishes depends on ``trigger``:
 
     - ``"change"`` (default): on mount and whenever ``text`` changes;
     - ``"mount"``: once;
@@ -68,9 +69,8 @@ def Message(
     """
     from pyreact.observability._base import current_turn_id
 
-    bus = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
     console = hooks.get_service("console_buffer", MessageBuffer)
-    source = use_path()
     if trigger == "mount":
         deps = []
     elif trigger == "turn":
@@ -85,12 +85,7 @@ def Message(
             "message_type": message_type,
             "timestamp": time.time(),
         }
-        bus.publish(
-            "message",
-            payload,
-            turn_id=current_turn_id(),
-            source=source,
-        )
+        emit("message", payload)
         if _legacy_bridge if legacy is None else legacy:
             console.append(legacy_line(payload))
 

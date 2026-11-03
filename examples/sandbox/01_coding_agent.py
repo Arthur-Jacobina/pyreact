@@ -41,7 +41,7 @@ import dspy
 import pyreact_sandbox as ps
 from integrations import DSPyProvider, use_agent
 from pyreact.boot import bootstrap
-from pyreact.core import component, hooks, use_turn
+from pyreact.core import component, hooks, use_emit, use_turn
 from pyreact_durable import Durable, use_conversation
 from pyreact_sandbox import SandboxProvider, SandboxSpec, sandbox_tools, use_sandbox
 from pyreact_sandbox.contrib.durable import use_durable_snapshot_store
@@ -77,7 +77,7 @@ def CodingAgent():
     tools = hooks.use_memo(lambda: sandbox_tools(sb, timeout=30), [id(sb)])
     agent = use_agent(Coder, tools=tools, max_iters=MAX_ITERS)
     turn = use_turn()
-    bus = hooks.get_service("event_bus", lambda: None)
+    emit = use_emit()
 
     def ask():
         if turn is not None:
@@ -89,12 +89,12 @@ def CodingAgent():
         if not agent.ver or turn is None:
             return
         if agent.error is not None:
-            bus.publish("message", {"text": f"error: {agent.error!r}", "sender": "system"})
+            emit("message", {"text": f"error: {agent.error!r}", "sender": "system"})
             return
         answer = agent.result.answer
         conv.extend([{"role": "user", "content": turn.text},
                      {"role": "assistant", "content": answer}])
-        bus.publish("message", {"text": answer, "sender": "assistant"})
+        emit("message", {"text": answer, "sender": "assistant"})
 
     hooks.use_effect(answered, [agent.ver])
     return []

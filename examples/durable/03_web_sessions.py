@@ -45,7 +45,7 @@ import dspy
 from examples._lm import OFFLINE, example_lm
 from integrations import DSPyProvider, use_agent_call
 from pyreact.boot import make_web_app, run_web
-from pyreact.core import EventBus, component, hooks, use_on_turn
+from pyreact.core import component, hooks, use_emit, use_on_turn
 from pyreact_durable import Durable, use_conversation
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -63,11 +63,11 @@ class ChatSig(dspy.Signature):
 @component
 def Chat():
     conv = use_conversation()  # this session's transcript, restored from its file
-    events = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
     call = use_agent_call(ChatSig)
 
     def say(text: str, sender: str = "assistant") -> None:
-        events.publish("message", {"text": text, "sender": sender, "message_type": "chat"})
+        emit("message", {"text": text, "sender": sender, "message_type": "chat"})
 
     def show_restored():  # on mount; the web layer replays it to the tab
         for m in conv.messages:

@@ -52,7 +52,7 @@ from integrations.learn import OptimizationResult
 from integrations.learn.hmr import resolve_module
 from integrations.stateful import CompiledModulesParticipant
 from pyreact.boot import AppRunner, DirectoryManifestStore
-from pyreact.core import component, hooks, use_turn
+from pyreact.core import component, hooks, use_emit, use_turn
 from pyreact_durable import (
     Durable,
     DurableParticipant,
@@ -117,10 +117,10 @@ def CodingAgent():
     tools = hooks.use_memo(lambda: sandbox_tools(sb, timeout=30), [id(sb)])
     agent = use_agent(Coder, tools=tools, max_iters=MAX_ITERS, name="coder")
     turn = use_turn()
-    bus = hooks.get_service("event_bus", lambda: None)
+    emit = use_emit()
 
     def mounted():  # what the first render saw (restored before it, on resume)
-        bus.publish("message", {"text": f"(mounted with {len(conv)} messages in the "
+        emit("message", {"text": f"(mounted with {len(conv)} messages in the "
                                         "conversation)", "sender": "system"})
 
     hooks.use_effect(mounted, [])
@@ -135,12 +135,12 @@ def CodingAgent():
         if not agent.ver or turn is None:
             return
         if agent.error is not None:
-            bus.publish("message", {"text": f"error: {agent.error!r}", "sender": "system"})
+            emit("message", {"text": f"error: {agent.error!r}", "sender": "system"})
             return
         answer = agent.result.answer
         conv.extend([{"role": "user", "content": turn.text},
                      {"role": "assistant", "content": answer}])
-        bus.publish("message", {"text": answer, "sender": "assistant"})
+        emit("message", {"text": answer, "sender": "assistant"})
 
     hooks.use_effect(answered, [agent.ver])
     return []

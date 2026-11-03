@@ -26,7 +26,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from pyreact.core import EventBus, TurnManager, component, create_context, hooks
+from pyreact.core import TurnManager, component, create_context, hooks, use_event
 
 from .log import SessionLog, archive_log, delete_log, kind_matches, safe_session_id
 
@@ -252,24 +252,17 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
 
     hooks.use_effect(_watch, [slog])
 
-    kinds = tuple(journal) if journal else ()
-    bus = hooks.get_service("event_bus", EventBus)
+    kinds = tuple(journal) if journal else ()  # () subscribes to nothing
 
-    def _journal():
-        if not kinds:
-            return None
+    def _journal(ev) -> None:
+        if slog.closed:
+            return
+        slog.append(
+            "event", kind=ev.kind, payload=_jsonable(ev.payload), turn_id=ev.turn_id,
+            source=ev.source, ts=ev.ts,
+        )
 
-        def on_event(ev) -> None:
-            if slog.closed:
-                return
-            slog.append(
-                "event", kind=ev.kind, payload=_jsonable(ev.payload), turn_id=ev.turn_id,
-                source=ev.source, ts=ev.ts,
-            )
-
-        return bus.subscribe(on_event, kinds)
-
-    hooks.use_effect(_journal, [slog, bus, kinds])
+    use_event(kinds, _journal)
 
     turns = hooks.get_service("turns", TurnManager)
 

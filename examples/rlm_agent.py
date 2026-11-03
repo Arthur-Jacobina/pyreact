@@ -20,9 +20,8 @@ from typing import Any, Dict, Iterable, List, Optional
 from examples.message import Message
 from integrations.dspy_integration import DSPyProvider
 from integrations.rlm import use_rlm
-from pyreact.core import use_turn
+from pyreact.core import use_event, use_turn
 from pyreact.core.core import component, hooks
-from pyreact.core.events import EventBus
 
 from examples._lm import OFFLINE, example_models
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -103,12 +102,7 @@ def make_app(models: Dict[str, Any], context: str, sink: Dict[str, Any], **agent
 
     @component
     def App():
-        bus = hooks.get_service("event_bus", EventBus)
-        hooks.use_effect(
-            lambda: bus.subscribe(lambda ev: sink.setdefault("events", []).append(ev),
-                                  kinds=["llm.*", "rlm.*"]),
-            [],
-        )
+        use_event(["llm.*", "rlm.*"], lambda ev: sink.setdefault("events", []).append(ev))
         return [DSPyProvider(key="dspy", models=models, children=[Home(key="home")])]
 
     return App

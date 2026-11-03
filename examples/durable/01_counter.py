@@ -28,7 +28,7 @@ import asyncio
 
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.keystroke import Keystroke
-from pyreact.core import EventBus, component, hooks
+from pyreact.core import component, hooks, use_emit
 from pyreact_durable import Durable, use_persistent_reducer, use_persistent_state
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -43,7 +43,7 @@ def reducer(count: int, action: str) -> int:
 def Counter():
     count, dispatch = use_persistent_reducer(reducer, 0, key="count")
     presses, set_presses = use_persistent_state(0, key="presses")
-    events = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
 
     def on_submit(text: str) -> None:
         action = text.strip()
@@ -52,7 +52,7 @@ def Counter():
             set_presses(lambda n: n + 1)
 
     def show():  # runs on mount (restored values) and after every change
-        events.publish("message", {"sender": "assistant",
+        emit("message", {"sender": "assistant",
                                    "text": f"count={count}  (presses so far: {presses})"})
 
     hooks.use_effect(show, [count, presses])

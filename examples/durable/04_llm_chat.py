@@ -39,7 +39,7 @@ import dspy
 
 from integrations import DSPyProvider, use_call, use_predict
 from pyreact.boot import bootstrap, read_terminal_and_invoke
-from pyreact.core import EventBus, component, hooks, use_on_turn
+from pyreact.core import component, hooks, use_emit, use_on_turn
 from pyreact_durable import (
     Durable,
     SessionLogError,
@@ -69,13 +69,13 @@ class ChatSig(dspy.Signature):
 def DurableChat():
     conv = use_conversation()  # persisted transcript (this branch)
     log = use_durable()
-    events = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
     chat = use_predict(ChatSig)
     call = use_call(chat)
     hooks_path = hooks.path
 
     def say(text: str, sender: str = "assistant") -> None:
-        events.publish("message", {"text": text, "sender": sender, "message_type": "chat"})
+        emit("message", {"text": text, "sender": sender, "message_type": "chat"})
 
     def command(line: str) -> None:
         cmd, _, arg = line[1:].partition(" ")
