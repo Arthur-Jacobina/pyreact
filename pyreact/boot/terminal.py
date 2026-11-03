@@ -4,8 +4,6 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from pyreact.observability import ConsoleSink, format_event
 
-from .app_runner import AppRunner
-
 BOLD = "\x1b[1m"
 CYAN = "\x1b[36m"
 RESET = "\x1b[0m"
@@ -25,7 +23,8 @@ HELP = """\
 
 
 # Extension point: ``register_command("name", fn, "help")`` adds ``:name``;
-# ``fn(app, args_str)`` gets the AppRunner (or Session) and the raw arguments.
+# ``fn(target, args_str)`` gets the AppRunner or Session (a Root is passed as
+# its session) and the raw arguments.
 CommandFn = Callable[[Any, str], Any]
 _COMMANDS: Dict[str, Tuple[CommandFn, str]] = {}
 
@@ -55,8 +54,20 @@ def _header(title: str) -> None:
     print(f"\n{BOLD}{CYAN}=== {title} ==={RESET}")
 
 
-def handle_command(app: AppRunner, cmd: str, args_str: str = "") -> bool:
-    """Run a built-in ``:command``. Returns False for unknown commands."""
+def _resolve(target: Any) -> Any:
+    """The object terminal commands drive: a :class:`~pyreact.boot.root.Root`
+    is driven through its session (its devtools side: events, usage,
+    timeline, tree, route); an AppRunner / Session is used as is."""
+    from .root import Root
+
+    return target.session if isinstance(target, Root) else target
+
+
+def handle_command(target: Any, cmd: str, args_str: str = "") -> bool:
+    """Run a ``:command`` (built-in or registered) against ``target``: a
+    ``Root``, an ``AppRunner`` or a ``Session``. Returns False for unknown
+    commands."""
+    app = _resolve(target)
     color = sys.stdout.isatty()
     if cmd == "help":
         print(help_text())
@@ -161,7 +172,7 @@ def parse_command(
 
 
 async def read_terminal_and_invoke(
-    app: AppRunner,
+    target: Any,
     *,
     prompt: str = ">> ",
     wait: bool = True,
@@ -169,7 +180,8 @@ async def read_terminal_and_invoke(
     console_kinds: Optional[Iterable[str]] = ConsoleSink.DEFAULT_KINDS,
     command_prefixes: Iterable[str] = (":",),
 ):
-    """Minimal async loop that reads lines from stdin and forwards to app.invoke().
+    """Minimal async loop that reads lines from stdin and sends each one as a
+    turn of ``target`` (a ``Root``, an ``AppRunner`` or a ``Session``).
 
     With ``console=True`` a :class:`ConsoleSink` renders ``console_kinds``
     events (default: chat messages and errors) as they are published,
@@ -186,6 +198,7 @@ async def read_terminal_and_invoke(
     - Reading happens via run_in_executor to avoid blocking the event loop.
     - Stop the loop by sending :q / :quit / :exit (case-sensitive) or Ctrl+C.
     """
+    app = _resolve(target)
     prefixes = tuple(command_prefixes)
     sink = None
     if console and app.events is not None:
@@ -214,7 +227,7 @@ async def read_terminal_and_invoke(
             except Exception as exc:
                 # Keep the loop resilient, but don't hide the problem
                 print(f"\x1b[31m[pyreact]\x1b[0m input not delivered: {exc}")
-                if not app.is_running:
+                if not getattr(app, "is_running", not getattr(app, "closed", False)):
                     break
     except (KeyboardInterrupt, SystemExit, EOFError):
         pass

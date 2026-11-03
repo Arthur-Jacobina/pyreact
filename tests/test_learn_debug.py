@@ -222,3 +222,37 @@ def test_live_feedback_optimize_hot_swap(capsys, learn_cfg, tmp_path, provider):
         assert "Words like 'great' are pos." in capsys.readouterr().out
     finally:
         app.shutdown()
+
+
+def test_learn_commands_accept_a_root(capsys):
+    from pyreact.boot import create_root
+
+    answers = []
+
+    @component
+    def Clf():
+        turn = use_turn()
+        call = use_agent_call("text -> label", arch="predict", program=use_learned("clf"))
+        hooks.use_effect(lambda: turn and call.run(text=turn.text), [turn and turn.id])
+        hooks.use_effect(lambda: call.ver and answers.append(call.result.label), [call.ver])
+        return []
+
+    @component
+    def App():
+        return [DSPyProvider(key="dspy", lm=RuleLM(), children=[
+            LearnedProgram(key="clf", src=None, children=[Clf(key="clf")])])]
+
+    root = create_root(App, session_id="learn-root")
+    try:
+        root.send("good day", wait=True, timeout=10)
+        root.wait_idle(timeout=10)
+        assert answers == ["pos"]
+        for cmd, args in [("feedback", "+"), ("modules", ""), ("inspect", "clf"),
+                          ("explain", ""), ("optimize", "")]:
+            assert handle_command(root, cmd, args), cmd
+        out = capsys.readouterr().out
+        assert "feedback 1 on turn learn-root/t1" in out
+        assert "Predict:text -> label:" in out and ">>> USER" in out
+        assert "usage: :optimize" in out and "\x1b[31m[:" not in out  # no command crashed
+    finally:
+        root.unmount()

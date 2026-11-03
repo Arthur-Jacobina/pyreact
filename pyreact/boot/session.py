@@ -565,6 +565,25 @@ class Session:
         except Exception:
             pass
 
+    def print_render_trace(self) -> None:
+        """Print the last render trace (``pyreact.core.debug``; the trace is
+        loop-wide: the last render on this session's runner)."""
+        if self.closed:
+            return
+
+        async def _task():
+            try:
+                from pyreact.core.debug import print_last_trace
+
+                print_last_trace()
+            except Exception:
+                print("\x1b[90m[debug]\x1b[0m Render trace not available.")
+
+        try:
+            self.runner._submit(_task()).result(timeout=1.0)
+        except Exception:
+            pass
+
     def close(self) -> None:
         """Unmount this session (same as ``runner.close_session(id)``)."""
         self.runner.close_session(self.id)

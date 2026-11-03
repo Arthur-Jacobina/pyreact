@@ -75,11 +75,7 @@ def command(root: Any, line: str) -> bool:
         return False
     cmd, args = parsed
     try:
-        # the built-in commands read the session's observability (events,
-        # usage, timeline, route): the root's low-level side, devtools only.
-        if cmd == "trace" and args.strip().lower() not in ("on", "off"):
-            root.runner.print_render_trace()  # the last render trace (loop-wide)
-        elif not handle_command(root.session, cmd, args):
+        if not handle_command(root, cmd, args):
             return False
     except Exception as exc:  # a dev command must never kill the prompt
         print(f"\x1b[31m[:{cmd}] {type(exc).__name__}: {exc}\x1b[0m", flush=True)

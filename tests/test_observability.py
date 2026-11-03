@@ -327,3 +327,44 @@ def test_claude_cli_lm_reports_estimated_usage():
     assert u["estimated"] and u["total_tokens"] == u["prompt_tokens"] + u["completion_tokens"] > 0
     assert normalize_usage(dict(_wrap("ok", "m", u).usage))["estimated"]
     assert ClaudeCLILM("haiku", approx_usage=False)._usage("s", "u", "o") == {}
+
+
+def test_terminal_commands_accept_a_root_or_a_session(capsys, monkeypatch):
+    from pyreact.boot import create_root, read_terminal_and_invoke, register_command
+    from pyreact.boot.terminal import unregister_command
+    from pyreact.core import use_on_turn
+
+    got = []
+
+    @component
+    def App():
+        async def on_turn(turn):
+            got.append(turn.text)
+
+        use_on_turn(on_turn)
+        return [Message(key="w", text="welcome!", sender="assistant", legacy=False)]
+
+    seen = []
+    register_command("who", lambda target, args: seen.append(target), "test")
+    root = create_root(App, session_id="cmd")
+    try:
+        root.wait_idle(timeout=5)
+        root.send("hi", wait=True, timeout=5)
+        for target in (root, root.session):
+            # :trace used to raise on a Session (no print_render_trace)
+            for cmd, args in [("events", "message"), ("usage", ""), ("turns", ""),
+                              ("tree", ""), ("trace", ""), ("route", ""), ("nav", "/x"),
+                              ("who", "")]:
+                assert handle_command(target, cmd, args), cmd
+        out = capsys.readouterr().out
+        assert "[ASSISTANT] welcome!" in out and "Usage" in out and "Turns" in out
+        assert "Route" in out
+        assert seen == [root.session, root.session]  # registered: the root's session
+
+        lines = iter(["typed", ":usage", ":q"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(lines))
+        asyncio.run(read_terminal_and_invoke(root, console=False))
+        assert got == ["hi", "typed"]
+    finally:
+        unregister_command("who")
+        root.unmount()
