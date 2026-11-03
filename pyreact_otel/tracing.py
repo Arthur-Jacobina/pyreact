@@ -391,16 +391,22 @@ def otel_middleware(
     capture_content: bool = False,
     max_content_length: int = 8192,
     enrichers: Sequence[Enricher] = (),
+    meter_provider: Any = None,
     metrics: Any = None,
 ) -> Middleware:
     """Harness middleware that opens one span per boundary.
 
     ``tracer_provider`` defaults to the global one. ``enrichers`` add
-    vendor-specific attributes when a span ends. ``metrics`` is an optional
-    recorder with ``record(boundary, duration_s, error)`` (see
-    :class:`pyreact_otel.metrics.BoundaryMetrics`).
+    vendor-specific attributes when a span ends. Pass ``meter_provider`` to
+    also record :class:`~pyreact_otel.metrics.BoundaryMetrics`, or ``metrics``
+    for any recorder with ``record(boundary, duration_s, error)``.
     """
     from . import __version__
+
+    if metrics is None and meter_provider is not None:
+        from .metrics import BoundaryMetrics
+
+        metrics = BoundaryMetrics(meter_provider)
 
     tracer = trace.get_tracer("pyreact_otel", __version__, tracer_provider=tracer_provider)
     enrichers = tuple(enrichers)
