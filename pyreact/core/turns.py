@@ -12,7 +12,12 @@ processes turns one at a time:
    with :func:`pyreact.core.runtime.spawn`) is attributed to that turn.
 3. The turn ends when the app is idle with respect to it: no queued renders
    and no pending tasks tagged with the turn. ``turn.end`` is published with
-   ``{"status": "done" | "interrupted" | "error", "duration": seconds}``.
+   ``{"status": "done" | "interrupted" | "error" | "blocked", "duration": seconds}``.
+
+Steps 1-3 run as one ``"turn"`` harness boundary (``pyreact.core.harness``;
+process-wide middleware, attrs ``turn_id``/``index``/``source``, then
+``status``/``duration``). A middleware raising ``Blocked`` ends the turn as
+``blocked`` (``turn.blocked`` event) before anything starts.
 
 Policies (what a new input does while a turn is in flight):
 
@@ -292,11 +297,33 @@ class TurnManager:
                 runtime.report_error(exc, None, "turn", turn=None)
 
     async def _process(self, turn: Turn) -> None:
+        from .harness import Blocked, through
+
         t0 = time.time()
         self._active = turn
         self._latest = turn
         runtime.set_active_turn(turn.id, scope=self)
-        status = "done"
+        status = None
+        try:
+            # The whole lifecycle (start -> settle) is a "turn" boundary.
+            status = await through(
+                "turn", "turn", {"text": turn.text}, lambda b: self._lifecycle(turn, b, t0),
+                ctx=self._owner, turn_id=turn.id, index=turn.index, source=turn.source,
+            )
+        except Blocked as exc:
+            status = "blocked"
+            self.event_bus.publish(
+                "turn.blocked",
+                {"index": turn.index, "reason": exc.reason, "by": exc.by, "message": str(exc)},
+                turn_id=turn.id, source=turn.source,
+            )
+        except Exception as exc:  # a failing middleware
+            runtime.report_error(exc, None, "turn", turn=turn.id)
+        if status not in ("done", "interrupted", "error", "blocked"):
+            status = self._status(turn)  # short-circuited / failed: settle as usual
+        self._finish(turn, status, t0)
+
+    async def _lifecycle(self, turn: Turn, b: Any, t0: float) -> str:
         try:
             self.event_bus.publish(
                 "turn.start",
@@ -321,11 +348,17 @@ class TurnManager:
             await self._wait_settled(turn)
         except Exception as exc:
             runtime.report_error(exc, None, "turn", turn=turn.id)
+        status = self._status(turn)
+        b.attrs["status"] = status
+        b.attrs["duration"] = round(time.time() - t0, 4)
+        return status
+
+    def _status(self, turn: Turn) -> str:
         if turn.id in self._interrupted:
-            status = "interrupted"
-        elif runtime.pop_turn_errors(turn.id):
-            status = "error"
-        self._finish(turn, status, t0)
+            return "interrupted"
+        if runtime.pop_turn_errors(turn.id):
+            return "error"
+        return "done"
 
     async def _wait_settled(self, turn: Turn, poll: float = 0.02) -> None:
         tid = turn.id
