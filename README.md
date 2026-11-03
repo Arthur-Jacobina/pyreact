@@ -57,7 +57,7 @@ Key pieces:
 
 ### 9) Turns ↔ Conversation steps
 - Every submitted input (`AppRunner.invoke`, terminal, web) becomes a `Turn(id, index, text, source, ts)`; `invoke`/`ainvoke` return the turn id and InputBus events carry `turn_id`.
-- The `TurnManager` service (`"turns"`, `pyreact/core/turns.py`) publishes `turn.start` / `turn.end` (`{"status": "done"|"interrupted"|"error", "duration"}`) on the `EventBus`. A turn ends when there are no queued renders and no pending tasks spawned during it (`runtime.spawn(..., turn=...)` tags tasks; default: the current turn; `turn=None` opts out).
+- The `TurnManager` service (`"turns"`, `pyreact/core/turns.py`) publishes `turn.start` / `turn.end` (`{"status": "done"|"interrupted"|"error"|"blocked", "duration"}`) on the `EventBus`. A turn ends when there are no queued renders and no pending tasks spawned during it (`runtime.spawn(..., turn=...)` tags tasks; default: the current turn; `turn=None` opts out).
 - Policy: `bootstrap(App, turn_policy="queue")` (default; inputs are answered one at a time, in order) or `"interrupt"` (a new input cancels the in-flight turn). A component overrides it for its own (and its descendants') work with `use_turn(policy="interrupt"|"queue")`.
 - `use_turn()` (from `pyreact.core`) returns the latest turn and rerenders on each new one, so a repeated identical message still triggers effects keyed on the turn. `Keystroke(on_submit=fn)` calls `fn(text)` or `fn(text, turn)`.
 - `app.invoke(text, wait=True)` blocks until that turn ends; `app.wait_turn(turn_id)` waits for an earlier one.
@@ -74,6 +74,125 @@ Key pieces:
 2. State changes or context updates call `schedule_rerender`.
 3. The loop `run_renders` renders contexts, reconciles children, then runs effects.
 4. On unmount, `HookContext.unmount()` runs effect cleanups, removes context subscriptions, and unmounts the subtree.
+
+## Harness: guards, verification, recovery, telemetry
+
+Every call that leaves the render tree is a **boundary** and runs through one
+middleware pipeline, the *harness* (`pyreact/core/harness.py`). A middleware
+is an async function `(b, call_next)` — like ASGI middleware — that can
+observe, time, rewrite, retry, short-circuit or refuse the call, without
+touching component code. With no middleware the call is a plain call (an
+empty pipeline adds ~2.5 µs per boundary).
+
+### Boundary kinds
+
+| kind | name | `b.inputs` | wired in |
+|------|------|------------|----------|
+| `turn` | `"turn"` | `{"text": ...}` | `TurnManager` (start → settle of every turn) |
+| `llm` | module label (`name=` or e.g. `Predict(question -> answer)`) | the module's inputs | `invoke_module`, so `use_call` / `use_stream` / `use_agent` / `use_agent_call` / RLM runs |
+| `tool` | tool name | named arguments | ReAct tools (`to_dspy_tool`, `call_tool`), RLM REPL tools (`call_tool_sync`) |
+
+Any dotted kind works for your own boundaries (`sandbox.exec`, `llm.judge`):
+`await through("sandbox.exec", "python", {"code": code}, run)`.
+
+Every `Boundary` has `kind`, `name`, `inputs`, `component` (path),
+`session_id`, `turn_id`, `attempt`, `id`, `parent_id` and a free-form
+`attrs` dict. `parent_id` links nested boundaries — turn → llm → tool
+(and llm → `llm.judge` when a middleware calls another model). It comes from
+a ContextVar set while a boundary runs, which follows spawned tasks,
+`asyncio.to_thread` workers and RLM REPL threads; read it with
+`pyreact.core.current_boundary()` (e.g. for tracing span parents).
+
+### Attrs reference (stable names)
+
+| kind | before the call | after `call_next` returns (or raises) |
+|------|-----------------|---------------------------------------|
+| `turn` | `turn_id`, `index`, `source` | `status` (`done`/`interrupted`/`error`), `duration` (s) |
+| `llm` | `call_id`, `module_key`, `arch`, `model` | `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`; cumulative across retries), `cost`, `latency` (s, of the last module run), `outputs` (preview), `lm_calls` (prompts + completions) |
+| `tool` | `call_id` (of the LLM call that asked for it) | `result` (preview), `latency` (s) |
+
+### Ordering and scope
+
+Process-wide middleware (`install(mw)`, returns an uninstall function) is
+outermost, then `HarnessProvider(middleware=[...])` from the root down, then
+the innermost provider's list in order. `@middleware(kinds=["llm", "tool.*"])`
+restricts one to some kinds.
+
+- `llm` calls use the providers above the calling component (captured at
+  render) plus the process-wide list *at call time*;
+- `tool` calls use the providers of the component that owns the LLM call;
+- `turn` boundaries belong to the session, not to a subtree: only
+  process-wide middleware sees them.
+
+### What a middleware can do
+
+- **observe / annotate**: read `b.inputs` / `b.attrs`, add your own attrs;
+- **transform**: replace `b.inputs` before `call_next`, or the result after;
+- **retry**: call `call_next(b)` again (bump `b.attempt`) — the module/tool
+  runs again;
+- **short-circuit**: return without calling `call_next` (a cache, a canned
+  answer: an `llm` middleware returns a `dspy.Prediction`);
+- **refuse**: `raise Blocked(reason)`. The message names the boundary and
+  the guard: `llm 'qa' blocked by no-pii: <reason>`.
+  - `llm`: the `Call` settles with `call.error` = the `Blocked`;
+    `llm.blocked` then `llm.error` are published;
+  - `tool`: the agent gets `"Error: tool 'x' blocked by ...: <reason>"` as
+    the tool's result (so it can adapt); `tool.blocked` is published;
+  - `turn`: the turn ends as `blocked` before it starts (`turn.blocked`).
+
+### Writing a middleware
+
+```python
+import time
+from pyreact.core.harness import Blocked, HarnessProvider, install, middleware
+
+async def timing(b, call_next):                    # 1. timing (any kind)
+    t0 = time.perf_counter()
+    try:
+        return await call_next(b)
+    finally:
+        print(f"{b.kind} {b.name} {time.perf_counter() - t0:.3f}s parent={b.parent_id}")
+
+@middleware(kinds=["tool"], name="no-orders")      # 2. a guard
+async def no_orders(b, call_next):
+    if b.name == "place_order" and b.inputs.get("quantity", 0) > 10:
+        raise Blocked("orders above 10 units need a human")
+    return await call_next(b)
+
+@middleware(kinds=["llm"])                         # 3. a retry
+async def retry_once(b, call_next):
+    try:
+        return await call_next(b)
+    except Exception:
+        b.attempt += 1
+        return await call_next(b)                  # re-runs the module
+
+install(timing)                                     # process-wide (telemetry libs)
+HarnessProvider(middleware=[no_orders, retry_once], children=[Store()])  # one subtree
+```
+
+### Events vs middleware
+
+Events (`llm.*`, `tool.*`, `turn.*` on the `EventBus`) are **observations**:
+published after the fact, consumed by logs, `:usage`, datasets; a listener
+cannot change what happens. Middleware sits **in** the call path: it can
+act — block, retry, rewrite, answer. Both stay in sync: the events are
+published by the same code that owns the boundary, whatever the middleware
+did (a blocked call still closes its `llm.start` with `llm.error`). Use
+events to watch; use middleware to guard, verify, recover and trace.
+
+### Call identity
+
+`Call.inputs` are the inputs of the in-flight (then settled) call and
+`Call.tag` the value passed with them as `run(..., tag=...)` (not sent to
+the module, unless its signature has a `tag` input). Tie a result to the
+turn that asked for it without extra state:
+
+```python
+check.run(comment=text, tag=turn.id)
+if check.tag == turn.id and not check.loading:
+    verdict = check.result.verdict
+```
 
 ## Running the examples
 

@@ -9,7 +9,7 @@ from .events import Event, EventBus
 from .turns import Turn, TurnManager, use_turn
 from . import runtime
 from . import harness
-from .harness import Blocked, Boundary, HarnessProvider, through, use_harness
+from .harness import Blocked, Boundary, HarnessProvider, current_boundary, through, use_harness
 
 __all__ = [
     "HookContext",
@@ -30,6 +30,7 @@ __all__ = [
     "Blocked",
     "Boundary",
     "HarnessProvider",
+    "current_boundary",
     "through",
     "use_harness",
 ]
