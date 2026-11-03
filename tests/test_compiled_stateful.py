@@ -17,6 +17,7 @@ from integrations import DSPyProvider, use_agent, use_dspy_env, use_module
 from integrations.learn import (
     LearnedProgram,
     OptimizationResult,
+    find_registries,
     use_learned,
     use_learned_registry,
 )
@@ -85,8 +86,8 @@ def _seen(root):
 
 def test_compiled_modules_come_back_before_the_first_render(roots):
     root = create_root(App, session_id="a")
-    _swap(root.session, "qa", "LEARNED QA")
-    _swap(root.session, "coder", "LEARNED AGENT")
+    _swap(root, "qa", "LEARNED QA")  # a Root is resolved through its session
+    _swap(root, "coder", "LEARNED AGENT")
     assert _seen(root)[-1] == ("LEARNED QA", "LEARNED AGENT")
     snap = root.suspend()
     mods = {e["key_str"]: e for e in snap["slices"][DSPY]["compiled"]}
@@ -103,11 +104,11 @@ def test_compiled_modules_come_back_before_the_first_render(roots):
 
 def test_result_path_is_reused_and_missing_file_is_a_mismatch(roots, tmp_path):
     root = create_root(App, session_id="p")
-    _env, key, mod = resolve_module(root.session, "qa")
+    _env, key, mod = resolve_module(root, "qa")
     res = OptimizationResult(program=_learned(mod, "FROM FILE"), optimizer="gepa",
                              module_key=key)
     res.save(str(tmp_path / "qa.json"))
-    res.hot_swap(root.session, key)
+    res.hot_swap(root, key)
     root.wait_idle(timeout=5)
     snap = root.suspend()
     [e] = snap["slices"][DSPY]["compiled"]
@@ -160,10 +161,17 @@ def test_learned_program_swap_survives_suspend(roots, tmp_path):
     one, two = _result(tmp_path, "one", "ONE"), _result(tmp_path, "two", "TWO")
     root = create_root(learned_app(one), session_id="lp")
     assert _seen(root)[-1] == "ONE"
-    reg = root.session.services["learn.programs"]["App/LearnedProgram[qa]"]
+    [(path, reg)] = find_registries(root)  # a Root, resolved through its session
+    assert path == "App/LearnedProgram[qa]"
     reg.set("qa", two)  # a hot swap: the provider's state changes
     root.wait_idle(timeout=5)
     assert _seen(root)[-1] == "TWO"
+    res = OptimizationResult(program=_learned(dspy.Predict(QA), "THREE"), optimizer="gepa")
+    assert res.hot_swap(root, "qa") == ["App/Leaf[leaf]"]
+    root.wait_idle(timeout=5)
+    assert _seen(root)[-1] == "THREE"
+    reg.set("qa", two)
+    root.wait_idle(timeout=5)
     snap = root.suspend()
     assert snap["slices"]["App/LearnedProgram[qa]"] == {"programs": {"qa": two}}
     # the DSPy env does not carry it twice (the LearnedProgram owns it)

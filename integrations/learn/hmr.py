@@ -1,6 +1,6 @@
 """Hot module replacement by key: find modules in a running app and swap them.
 
-    find_envs(app)              [(provider_path, DSPyEnv)] of an AppRunner / Session
+    find_envs(app)              [(provider_path, DSPyEnv)] of a Root / AppRunner / Session
     list_modules(app)           every cached module: key, arch, compiled?, swaps
     resolve_module(app, key)    (env, key_tuple, module) for a key / scope / label
     hot_swap_into(app, key, p)  integrations.optimize.hot_swap on the app's loop
@@ -19,11 +19,19 @@ __all__ = ["find_envs", "list_modules", "resolve_module", "hot_swap_into"]
 # ---------------------------------------------------------------------------
 # Finding modules
 # ---------------------------------------------------------------------------
+def _session_of_root(target: Any) -> Any:
+    """A ``pyreact.boot.Root`` is resolved to its session; anything else as is."""
+    from pyreact.boot.root import Root
+
+    return target.session if isinstance(target, Root) else target
+
+
 def _services_of(target: Any) -> List[Dict[str, Any]]:
     from pyreact.core.hook import HookContext
 
     if target is None:
         return [HookContext._services]
+    target = _session_of_root(target)
     sessions = getattr(target, "sessions", None)
     if callable(sessions):  # AppRunner
         return [s.services for s in sessions()]
@@ -34,7 +42,8 @@ def _services_of(target: Any) -> List[Dict[str, Any]]:
 
 
 def find_envs(target: Any = None) -> List[Tuple[str, Any]]:
-    """``[(provider_path, DSPyEnv)]`` for an AppRunner / Session / env / None (headless)."""
+    """``[(provider_path, DSPyEnv)]`` for a Root / AppRunner / Session / env / None
+    (headless)."""
     from integrations.dspy_integration import ENVS_SERVICE, DSPyEnv
 
     if isinstance(target, DSPyEnv):

@@ -234,8 +234,8 @@ class OptimizationResult:
     def hot_swap(self, target: Any, key: Any = None) -> List[Any]:
         """Make :attr:`program` the live program for ``key`` (HMR).
 
-        A thin wrapper: when ``target`` (an ``AppRunner`` / ``Session``, or
-        ``None`` for headless trees) mounts a ``LearnedProgram`` /
+        A thin wrapper: when ``target`` (a ``Root``, an ``AppRunner`` /
+        ``Session``, or ``None`` for headless trees) mounts a ``LearnedProgram`` /
         ``LearnedPrograms`` provider that declares ``key`` (or whose
         ``use_learned`` users match it), that provider's state is updated
         and its subtree re-renders with this program -- the same thing as
