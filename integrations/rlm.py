@@ -12,12 +12,15 @@ synchronous (its sandbox and ``llm_query`` callbacks block), so the call runs
 in a worker thread; cancellation (a superseding call or unmount) is checked
 between REPL iterations and before every sub-LM call.
 
-Events on the app ``EventBus``::
+It is the ``"rlm"`` architecture (``integrations.architectures``): use it
+like any other program -- ``use_module(sig, arch="rlm", ...)`` +
+``use_call``, or ``use_agent_call(sig, arch="rlm", ...)``. Events on the app
+``EventBus`` (the usual ``llm.*`` lifecycle, plus progress)::
 
-    llm.start      {"module": "rlm", "call_id", "signature", "input_chars"}
-    rlm.iteration  {"call_id", "iteration", "max_iterations", "sub_llm_calls"}
-    llm.end        {"call_id", "iterations", "sub_llm_calls", "trajectory_len", "latency"}
-    llm.error      {"call_id", "error", "iterations", "latency"}
+    llm.start      {call_id, module, arch: "rlm", inputs, input_chars, ...}
+    rlm.iteration  {call_id, iteration, max_iterations, sub_llm_calls}
+    llm.end        {call_id, ..., iterations, sub_llm_calls, trajectory_len, latency}
+    llm.error      {call_id, error, latency}     llm.cancel {call_id, latency}
 
 Sandbox: the default interpreter is DSPy's ``PythonInterpreter`` (Deno +
 Pyodide/WASM). If Deno is missing, the call fails with
@@ -30,21 +33,16 @@ call, so concurrent calls never share one.
 
 from __future__ import annotations
 
-import asyncio
 import contextvars
 import re
 import shutil
 import threading
-import time
-import uuid
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Optional, Union
 
 import dspy
 
 from pyreact.core.core import hooks
-from pyreact.core.events import EventBus
-from pyreact.core.runtime import spawn
 
 try:  # dspy >= 3.1
     from dspy.predict.rlm import RLM as _RLM
@@ -242,6 +240,14 @@ def use_rlm(
 ):
     """RLM agent hook. Returns ``(run, (result, ver), loading, error)``.
 
+    Compatibility wrapper over the unified path::
+
+        call = use_agent_call(signature, arch="rlm", max_iterations=..., sub_model=...)
+
+    (same module cache, ``llm.*`` / ``rlm.iteration`` events, worker thread
+    and cancellation as every other architecture). ``run(**inputs)`` returns
+    the call id.
+
     - ``signature``: e.g. ``"context, question -> answer"`` or a Signature.
     - ``tools``: Tools / callables / ToolProvider names, callable from the REPL.
     - ``model`` / ``lm``: the root LM (``DSPyEnv.models[model]`` or default).
@@ -249,150 +255,33 @@ def use_rlm(
     - ``interpreter``: zero-arg factory for a CodeInterpreter (default: Deno).
     - ``adapter``: DSPy adapter (default :class:`LenientRLMAdapter`).
 
-    Policy is the same as ``use_dspy_call``: the last call wins, a superseded
-    call is cancelled; ``ver`` increments when a call settles.
+    Policy: the last call wins, a superseded call is cancelled (``llm.cancel``)
+    and its worker thread stops at the next REPL checkpoint.
     """
     if PyreactRLM is None:  # pragma: no cover
         raise RLMSandboxError("This DSPy version has no dspy.RLM (needs dspy>=3.1).")
 
-    from integrations.dspy_integration import DSPyContext
-    from pyreact.tools import resolve_tools, use_tools
+    from integrations import telemetry as tm
+    from integrations.hooks import use_call, use_module
 
-    env = hooks.use_context(DSPyContext)
-    bus: EventBus = hooks.get_service("event_bus", EventBus)
-    registry = use_tools()  # always called: hook order must be stable
-    resolved = resolve_tools(tools, registry) if tools else []
-    tools_key = tuple(t.name for t in resolved)
-    sig_key = signature if isinstance(signature, str) else signature.__name__
-
-    sub_lm = None
+    arch_kw: dict = dict(max_iterations=max_iterations, max_llm_calls=max_llm_calls,
+                         max_output_chars=max_output_chars, verbose=verbose)
+    if tools:
+        arch_kw["tools"] = tools
     if sub_model is not None:
-        models = getattr(env, "models", None) or {}
-        if sub_model not in models:
-            raise KeyError(
-                f"sub_model {sub_model!r} not in DSPyProvider models ({sorted(models)})"
-            )
-        sub_lm = models[sub_model]
-
-    # Latest interpreter factory, read at call time, so an inline lambda does
-    # not rebuild the module on every render.
-    factory_ref = hooks.use_memo(lambda: {"f": None}, [])
-    factory_ref["f"] = interpreter
-
-    module = hooks.use_memo(
-        lambda: PyreactRLM(
-            signature,
-            max_iterations=max_iterations,
-            max_llm_calls=max_llm_calls,
-            max_output_chars=max_output_chars,
-            verbose=verbose,
-            tools=[_tool_to_dspy(t) for t in resolved] or None,
-            sub_lm=sub_lm,
-            interpreter_factory=(lambda: factory_ref["f"]()) if interpreter else None,
-        ),
-        deps=[sig_key, tools_key, max_iterations, max_llm_calls, sub_model,
-              id(sub_lm), interpreter is None, max_output_chars, name],
-    )
-
-    def reducer(state, action):
-        typ = action["type"]
-        if typ == "start":
-            return {**state, "status": "loading", "error": None}
-        if typ == "success":
-            return {"status": "idle", "result": action["result"], "error": None,
-                    "ver": state["ver"] + 1}
-        if typ == "error":
-            return {"status": "idle", "result": None, "error": action["error"],
-                    "ver": state["ver"] + 1}
-        return state
-
-    state, dispatch = hooks.use_reducer(
-        reducer, {"status": "idle", "result": None, "error": None, "ver": 0}
-    )
-    refs = hooks.use_memo(lambda: {"alive": True, "task": None, "ctrl": None}, [])
-
-    def _mount():
-        def _unmount():
-            refs["alive"] = False
-            if refs["ctrl"] is not None:
-                refs["ctrl"].cancelled.set()
-            t = refs["task"]
-            if t is not None and not t.done():
-                t.cancel()
-
-        return _unmount
-
-    hooks.use_effect(_mount, [])
-
-    def _select_lm():
-        if lm is not None:
-            return lm
-        models = getattr(env, "models", None) or {}
-        if model is not None:
-            return models.get(model, models.get("default"))
-        return models.get("default")  # None -> dspy global default
-
-    async def _do_call(inputs: dict, ctrl: _RunControl):
-        me = asyncio.current_task()
-        t0 = time.time()
-        src = f"rlm:{name or sig_key}"
-        bus.publish("llm.start", {"module": "rlm", "call_id": ctrl.call_id,
-                                  "signature": sig_key, "input_chars": _input_chars(inputs)},
-                    source=src)
-
-        def _on_iter(c: _RunControl, _result):
-            bus.publish("rlm.iteration", {"call_id": c.call_id, "iteration": c.iterations,
-                                          "max_iterations": max_iterations,
-                                          "sub_llm_calls": c.sub_llm_calls}, source=src)
-
-        ctrl.on_iteration = _on_iter
-        try:
-            result = await asyncio.to_thread(
-                run_rlm_sync, module, inputs, lm=_select_lm(),
-                adapter=adapter if adapter is not None else _DEFAULT_ADAPTER, ctrl=ctrl,
-            )
-        except asyncio.CancelledError:
-            ctrl.cancelled.set()  # the worker stops at its next checkpoint
-            bus.publish("llm.error", {"call_id": ctrl.call_id, "error": "cancelled",
-                                      "iterations": ctrl.iterations,
-                                      "latency": round(time.time() - t0, 3)}, source=src)
-            raise
-        except Exception as exc:
-            err = exc
-            if not isinstance(exc, RLMSandboxError) and "Deno" in str(exc):
-                err = RLMSandboxError(f"{exc}\n{SANDBOX_HELP}")
-            bus.publish("llm.error", {"call_id": ctrl.call_id,
-                                      "error": f"{type(err).__name__}: {err}",
-                                      "iterations": ctrl.iterations,
-                                      "latency": round(time.time() - t0, 3)}, source=src)
-            if refs["alive"] and refs["task"] is me:
-                dispatch({"type": "error", "error": err})
-            return
-        traj = getattr(result, "trajectory", None) or []
-        bus.publish("llm.end", {"call_id": ctrl.call_id, "module": "rlm",
-                                "iterations": ctrl.iterations or len(traj),
-                                "sub_llm_calls": ctrl.sub_llm_calls,
-                                "trajectory_len": len(traj),
-                                "latency": round(time.time() - t0, 3)}, source=src)
-        if refs["alive"] and refs["task"] is me:
-            dispatch({"type": "success", "result": result})
+        arch_kw["sub_model"] = sub_model
+    if interpreter is not None:
+        arch_kw["interpreter"] = interpreter
+    if adapter is not None:
+        arch_kw["adapter"] = adapter
+    module = use_module(signature, arch="rlm", name=name, **arch_kw)
+    call = use_call(module, model=model, lm=lm, name=name)
+    submit = call.submit
 
     def _run(**inputs):
-        prev_t, prev_c = refs["task"], refs["ctrl"]
-        if prev_c is not None:
-            prev_c.cancelled.set()
-        if prev_t is not None and not prev_t.done():
-            prev_t.cancel()
-        ctrl = _RunControl(uuid.uuid4().hex[:12])
-        refs["ctrl"] = ctrl
-        dispatch({"type": "start"})
-        refs["task"] = spawn(_do_call(inputs, ctrl), name=f"rlm:{sig_key}")
-        return ctrl.call_id
+        cid = tm.new_call_id("rlm")
+        submit(_call_id=cid, **inputs)
+        return cid
 
-    run = hooks.use_callback(_run, deps=[id(module)])
-    return (
-        run,
-        (state["result"], state["ver"]),
-        state["status"] == "loading",
-        state["error"],
-    )
+    run = hooks.use_callback(_run, deps=[])
+    return run, (call.result, call.ver), call.loading, call.error

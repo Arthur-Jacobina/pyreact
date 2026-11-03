@@ -20,6 +20,8 @@ which is a contextvar, so concurrent calls never mix their usage).
 from __future__ import annotations
 
 import itertools
+import threading
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -35,13 +37,33 @@ def new_call_id(prefix: str = "llm") -> str:
 
 
 def event_bus() -> EventBus:
-    """The app-wide EventBus service (same instance as ``hooks.get_service``)."""
+    """The process-global EventBus service (``HookContext.get_service``)."""
     return HookContext.get_service("event_bus", EventBus)
 
 
-def publish(kind: str, payload: Dict[str, Any], *, turn_id=None, source=None) -> None:
+def session_bus() -> Optional[EventBus]:
+    """The calling component's *session* bus (``app.events`` / ``:events``
+    observe it), or ``None`` outside a component/task."""
     try:
-        event_bus().publish(kind, payload, turn_id=turn_id, source=source)
+        from pyreact.core import runtime
+
+        ctx = runtime.current_component()
+        if ctx is not None and hasattr(ctx, "get_service"):
+            return ctx.get_service("event_bus", EventBus)
+    except Exception:
+        pass
+    return None
+
+
+def publish(kind: str, payload: Dict[str, Any], *, turn_id=None, source=None) -> None:
+    """Publish on the session bus of the calling component and on the global
+    bus (once when they are the same object, e.g. headless trees/tests)."""
+    try:
+        glob = event_bus()
+        sess = session_bus()
+        if sess is not None and sess is not glob:
+            sess.publish(kind, payload, turn_id=turn_id, source=source)
+        glob.publish(kind, payload, turn_id=turn_id, source=source)
     except Exception:  # observability must never break a call
         pass
 
@@ -176,3 +198,71 @@ def outputs_of(result: Any) -> Any:
 
 def model_name(lm: Any) -> Optional[str]:
     return getattr(lm, "model", None) if lm is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Debug: what exactly did the LM see? (``integrations.learn.explain``)
+# ---------------------------------------------------------------------------
+# The last CALL_BUFFER_SIZE calls keep their LM history entries (prompt
+# messages + raw completions) in memory, keyed by call id. Event payloads stay
+# small; with DEBUG on (``set_debug(True)`` or ``DSPyProvider(settings=
+# {"debug": True})``) ``llm.end`` also carries them as ``lm_calls``.
+CALL_BUFFER_SIZE = 64
+DEBUG = False
+_calls: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_calls_lock = threading.Lock()
+
+
+def set_debug(on: bool = True) -> None:
+    """Attach full prompts/completions (``lm_calls``) to every ``llm.end``."""
+    global DEBUG
+    DEBUG = bool(on)
+
+
+def _content(c: Any) -> Any:
+    if isinstance(c, list):  # multimodal / content blocks
+        return "\n".join(str(p.get("text", p)) if isinstance(p, dict) else str(p) for p in c)
+    return c
+
+
+def lm_calls_of(history: List[dict]) -> List[Dict[str, Any]]:
+    """LM history entries -> ``[{model, messages, completion, usage}]`` (plain data)."""
+    out = []
+    for e in history:
+        msgs = e.get("messages")
+        if msgs is None and e.get("prompt") is not None:
+            msgs = [{"role": "user", "content": e.get("prompt")}]
+        outs = e.get("outputs") or []
+        completion = outs[0] if outs else e.get("response")
+        if isinstance(completion, dict):
+            completion = completion.get("text", completion)
+        usage = e.get("usage") or {}
+        out.append({
+            "model": e.get("model"),
+            "messages": [{"role": m.get("role"), "content": _content(m.get("content"))}
+                         for m in (msgs or []) if isinstance(m, dict)],
+            "completion": completion if isinstance(completion, (str, type(None))) else str(completion),
+            "usage": dict(usage) if isinstance(usage, dict) else {},
+        })
+    return out
+
+
+def record_call(record: Dict[str, Any]) -> None:
+    with _calls_lock:
+        _calls[record["call_id"]] = record
+        _calls.move_to_end(record["call_id"])
+        while len(_calls) > CALL_BUFFER_SIZE:
+            _calls.popitem(last=False)
+
+
+def get_call(call_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """A recorded call by id, or the most recent one when ``call_id`` is None."""
+    with _calls_lock:
+        if call_id is None:
+            return next(reversed(_calls.values()), None) if _calls else None
+        return _calls.get(call_id)
+
+
+def recorded_calls() -> List[Dict[str, Any]]:
+    with _calls_lock:
+        return list(_calls.values())
