@@ -1,0 +1,193 @@
+"""Durable chat: memory that survives restarts, with branches you can switch.
+
+- the transcript is ``use_conversation()`` — persisted in a pi-style JSONL
+  session log through the ``Durable`` provider (``pyreact_durable``)
+- every LM call goes through ``durable_lm``: re-running a turn on the same
+  branch replays the journaled answer instead of calling the model again
+- commands (handled by the agent itself, via ``Keystroke``):
+
+    /label <name>        bookmark the current position
+    /fork <label|id>     branch from a bookmark (next message starts a branch)
+    /checkout <label|id> switch to another branch / position
+    /history             print the conversation on the current branch
+    /tree                print the session tree
+    /help
+
+Run from the repo root (Ctrl+C / ``:q`` to quit; kill it any way you like,
+then start it again — it remembers):
+
+    uv run python -m examples.durable_chat [--log artifacts/durable_chat.jsonl]
+
+Inspect the file from another terminal:
+
+    uv run python -m pyreact_durable show artifacts/durable_chat.jsonl
+
+Uses OpenAI when OPENAI_API_KEY is set, otherwise the ``claude -p`` dev LM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+
+import dspy
+
+from integrations import DSPyProvider, use_call, use_predict
+from pyreact.boot import bootstrap
+from pyreact.components.keystroke import Keystroke
+from pyreact.core import EventBus, component, hooks
+from pyreact_durable import (
+    Durable,
+    SessionLogError,
+    use_conversation,
+    use_durable,
+    use_durable_lm,
+)
+from pyreact_durable.__main__ import render_tree
+
+DEFAULT_LOG = "artifacts/durable_chat.jsonl"
+
+
+class ChatSig(dspy.Signature):
+    """You are a friendly, concise assistant with a long memory. Use the
+    conversation history. Answer in at most two sentences."""
+
+    question: str = dspy.InputField()
+    history: dspy.History = dspy.InputField()
+    answer: str = dspy.OutputField()
+
+
+@component
+def DurableChat():
+    conv = use_conversation()  # persisted transcript (this branch)
+    log = use_durable()
+    events = hooks.get_service("event_bus", EventBus)
+    chat = use_predict(ChatSig)
+    call = use_call(chat)
+    pending, set_pending = hooks.use_state(None)  # (seq, question), in-memory
+    hooks_path = hooks.path
+
+    def say(text: str, sender: str = "assistant") -> None:
+        events.publish("message", {"text": text, "sender": sender, "message_type": "chat"})
+
+    def command(line: str) -> None:
+        cmd, _, arg = line[1:].partition(" ")
+        arg = arg.strip()
+        try:
+            if cmd == "label" and arg:
+                e = log.label(arg)
+                say(f"labelled {e['targetId']} as {arg!r}", "system")
+            elif cmd in ("fork", "checkout") and arg:
+                leaf = log.checkout(arg)
+                verb = "branching from" if cmd == "fork" else "switched to"
+                say(f"{verb} {arg!r} ({leaf}); conversation has "
+                    f"{len(log.get_state(hooks_path, 'history', []))} message(s)", "system")
+            elif cmd == "history":
+                lines = [f"{m['role']}: {m['content']}" for m in conv.messages]
+                say("\n".join(lines) if lines else "(empty)", "system")
+            elif cmd == "tree":
+                say("\n".join(render_tree(log)), "system")
+            else:
+                say("commands: /label <name>, /fork <label>, /checkout <label|id>, "
+                    "/history, /tree", "system")
+        except SessionLogError as exc:
+            say(f"error: {exc}", "system")
+
+    def on_submit(text: str) -> None:
+        line = text.strip()
+        if not line:
+            return
+        if line.startswith("/"):
+            command(line)
+        else:
+            set_pending(lambda p: ((p[0] + 1) if p else 1, line))
+
+    def _ask():
+        if pending is not None:
+            call.run(question=pending[1], history=conv.as_dspy_history())
+
+    hooks.use_effect(_ask, [pending])
+
+    def _remember():
+        if call.ver and call.result is not None and pending is not None:
+            answer = call.result.answer
+            # one state entry for the pair: a crash never leaves half a turn
+            conv.extend([{"role": "user", "content": pending[1]},
+                         {"role": "assistant", "content": answer}])
+            say(answer)
+        elif call.ver and call.error is not None:
+            say(f"LM error: {call.error}", "system")
+
+    hooks.use_effect(_remember, [call.ver])
+
+    return [Keystroke(key="input", on_submit=on_submit)]
+
+
+@component
+def LMLayer(lm=None, lm_mode="replay_or_record", children=None):
+    dlm = use_durable_lm(lm, mode=lm_mode)  # journaled / replayed LM calls
+    return [DSPyProvider(key="dspy", lm=dlm, children=children or [])]
+
+
+@component
+def DurableChatApp(log=None, lm=None, lm_mode="replay_or_record"):
+    return [
+        Durable(key="durable", log=log, children=[
+            LMLayer(key="lm", lm=lm, lm_mode=lm_mode, children=[DurableChat(key="chat")]),
+        ])
+    ]
+
+
+def default_lm():
+    if os.getenv("OPENAI_API_KEY"):
+        return dspy.LM("openai/gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"))
+    from integrations.claude_cli_lm import ClaudeCLILM
+
+    return ClaudeCLILM("haiku")
+
+
+def start(log, lm, lm_mode="replay_or_record"):
+    """Boot the app on ``log`` (path or SessionLog); returns the AppRunner."""
+
+    @component
+    def App():
+        return [DurableChatApp(key="app", log=log, lm=lm, lm_mode=lm_mode)]
+
+    return bootstrap(App)
+
+
+async def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--log", default=DEFAULT_LOG)
+    args = ap.parse_args()
+    try:
+        import dotenv
+
+        dotenv.load_dotenv()
+    except ImportError:  # pragma: no cover
+        pass
+
+    app = start(args.log, default_lm())
+
+    def show(ev):
+        color = "\x1b[32m" if ev.payload.get("sender") == "assistant" else "\x1b[90m"
+        print(f"{color}{ev.payload.get('text')}\x1b[0m", flush=True)
+
+    app.event_bus.subscribe(show, ["message"])
+    print(f"durable chat on {args.log} — /help for commands, :q to quit")
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            line = await loop.run_in_executor(None, input, "> ")
+            if line.strip() in (":q", ":quit", ":exit"):
+                break
+            await app.ainvoke(line, wait=True)
+    except (KeyboardInterrupt, EOFError):
+        pass
+    finally:
+        app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
