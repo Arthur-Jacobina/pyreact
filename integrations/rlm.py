@@ -34,6 +34,7 @@ call, so concurrent calls never share one.
 from __future__ import annotations
 
 import contextvars
+import functools
 import re
 import shutil
 import threading
@@ -213,10 +214,21 @@ def run_rlm_sync(
 
 
 def _tool_to_dspy(t: Any) -> Any:
-    fn = getattr(t, "fn", None)
-    if fn is not None and hasattr(t, "name"):
-        return dspy.Tool(fn, name=t.name, desc=getattr(t, "description", None))
-    return t
+    """Tool / callable -> dspy.Tool whose calls (from the REPL, in the worker
+    thread) run as ``"tool"`` boundaries on the call's loop."""
+    if isinstance(t, dspy.Tool) or not callable(t):
+        return t
+    from pyreact.tools import make_tool
+
+    from .hooks import call_tool_sync
+
+    tool = make_tool(t)
+
+    @functools.wraps(tool.fn)
+    def _call(*args, **kwargs):
+        return call_tool_sync(tool, args, kwargs)
+
+    return dspy.Tool(_call, name=tool.name, desc=tool.description or None)
 
 
 def _input_chars(inputs: dict) -> int:
