@@ -433,7 +433,12 @@ def test_use_agent_runs_sync_tools_off_the_loop_and_emits_tool_events():
     assert c.error is None and c.result.answer == "10"
     assert c.usage["lm_calls"] == 3
     gaps = [b - a for a, b in zip(ticks, ticks[1:])]
-    assert len(ticks) > 20 and max(gaps) < 0.1, gaps  # loop never blocked by the 0.3s tool
+    # The property: the loop is never blocked by the 0.3s tool (it runs in a
+    # worker thread). A blocked loop shows a gap >= 0.3s; under load
+    # (parallel test runs, Docker) scheduler jitter alone can exceed 0.1s,
+    # so the bound is 0.25s -- still well under the sleep -- and many ticks
+    # during the call show the loop kept turning.
+    assert len(ticks) > 20 and max(gaps) < 0.25, gaps
     kinds = [e.kind for e in events]
     assert kinds == ["llm.start", "tool.start", "tool.end", "tool.start", "tool.end", "llm.end"] or (
         kinds[0] == "llm.start" and kinds[-1] == "llm.end" and "tool.end" in kinds
