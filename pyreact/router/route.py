@@ -2,8 +2,7 @@
 from typing import Dict, List, Optional, Any
 from pyreact.core.core import component, hooks
 from pyreact.core.provider import create_context
-from .nav_service import NavService
-from .router import use_route  # function that reads RouterContext
+from .router import use_route, use_location  # read router context
 from .match import compile_route_pattern
 
 RouteParamsContext = create_context(default={}, name="RouteParams")
@@ -14,9 +13,17 @@ def use_route_params():
 
 
 def use_query_params() -> Dict[str, str]:
-    """Hook to get query parameters from current URL"""
-    navsvc = hooks.get_service("nav_service", NavService)
-    return navsvc.get_query_params()
+    """Query parameters of the current location.
+
+    Read from router context (same render as :func:`use_route_params`), so a
+    component never sees new query params with stale route params.
+    """
+    return dict(use_location()["query"])
+
+
+def use_fragment() -> str:
+    """Fragment (``#...``) of the current location, from router context."""
+    return use_location()["fragment"]
 
 
 def use_navigate():
