@@ -38,13 +38,14 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
+from examples._lm import example_lm
 from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_examples
 from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
-from examples._lm import example_lm
-from integrations.feedback import send_feedback
+from integrations.feedback import FEEDBACK
 from integrations.learn import (
     LearnedProgram,
     build_module,
@@ -52,8 +53,8 @@ from integrations.learn import (
     optimize,
     use_learned,
 )
-from pyreact.boot import bootstrap
-from pyreact.core import component, hooks, use_turn
+from pyreact.boot import create_root
+from pyreact.core import component, hooks, use_emit, use_imperative_handle, use_turn
 from pyreact_durable import Durable, SessionLog
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -66,29 +67,42 @@ KEY = "supervisor"  # module name + learned program name -> the handle datasets 
 
 # ---------------------------------------------------------------- the app
 @component
-def StoreRouter(results):
+def StoreRouter():
     """Routes each turn's message to a specialist. Knows nothing about
     journaling, datasets or optimizers."""
     turn = use_turn()
     # program=: the learned program the LearnedProgram above provides (None: baseline)
     router = use_module(RouteSpecialistSig, arch="cot", name=KEY, program=use_learned(KEY))
     call = use_call(router)
+    routes = hooks.use_ref({})  # turn id -> route
+    emit = use_emit()
 
     def route():
         if turn is not None and turn.text.strip():
-            call.run(message=turn.text, specialists=SPECIALISTS)
+            call.run(message=turn.text, specialists=SPECIALISTS, tag=turn.id)
 
     hooks.use_effect(route, [turn and turn.id])
 
     def record():
-        if turn is not None and call.result is not None:
-            results[turn.id] = normalize(getattr(call.result, "name", ""))
+        if call.result is not None and call.tag:
+            routes.current[call.tag] = normalize(getattr(call.result, "name", ""))
 
     hooks.use_effect(record, [call.ver])
+
+    def rate(turn_id: str, score: float, text: str = "", expected: Optional[dict] = None):
+        """The user's rating of a turn: just another event (the journal keeps it)."""
+        payload = {"score": float(score), "text": text, "target": turn_id}
+        if expected is not None:
+            payload["expected"] = expected
+        emit(FEEDBACK, payload, turn_id=None)
+
+    # the handle outside code uses: root.ref("router").route_of(tid) / .rate(...)
+    use_imperative_handle("router", lambda: SimpleNamespace(route_of=routes.current.get,
+                                                            rate=rate), [])
     return []
 
 
-def make_app(lm, log_path: str, results: dict, program: Optional[str] = None):
+def make_app(lm, log_path: str, program: Optional[str] = None):
     @component
     def App():
         # The ONLY durable-specific line: wrap the tree, pick what to journal.
@@ -104,7 +118,7 @@ def make_app(lm, log_path: str, results: dict, program: Optional[str] = None):
                         children=[
                             # the learned program is a prop: a saved artifact, or None
                             LearnedProgram(key=KEY, src=program, children=[
-                                StoreRouter(key="router", results=results),
+                                StoreRouter(key="router"),
                             ]),
                         ],
                     )
@@ -130,31 +144,23 @@ def serve(
     optimization result as its learned program from the first render.
     """
     lm = lm or example_lm()
-    results: dict = {}
-    app = bootstrap(make_app(lm, log_path, results, program))
-    try:
+    with create_root(make_app(lm, log_path, program), session_id="store") as root:
         if program:
             print(f"  serving with LearnedProgram(key={KEY!r}, src={program!r})")
+        router = root.ref("router")
         correct = 0
         for message, gold in rows:
-            tid = app.invoke(message, wait=True, timeout=180)
-            got = results.get(tid, "?")
+            tid = root.send(message, wait=True, timeout=180)
+            got = router.route_of(tid, "?")
             ok = got == gold
             correct += ok
             print(f"  {'✓' if ok else '✗'} {got:<9} gold={gold:<9} {message}")
             if rate:
-                # Feedback is just another event; the journal keeps it.
-                send_feedback(
-                    tid,
-                    1.0 if ok else 0.0,
-                    "correct" if ok else f"wrong: {message!r} is a {gold} question",
-                    expected=None if ok else {"name": gold},
-                    bus=app.event_bus,
-                )
-        app.wait_idle(timeout=30)
-        return correct / max(1, len(rows))
-    finally:
-        app.shutdown()
+                router.rate(tid, 1.0 if ok else 0.0,
+                            "correct" if ok else f"wrong: {message!r} is a {gold} question",
+                            expected=None if ok else {"name": gold})
+        root.wait_idle(timeout=30)
+    return correct / max(1, len(rows))
 
 
 def learn(*, log_path: str, out: str, budget: int = 24, lm=None):
