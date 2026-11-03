@@ -35,13 +35,14 @@ def build_url(
         for key, value in params.items():
             path = path.replace(f":{key}", str(value))
 
-    query_string = ""
-    if query:
-        clean_query = {k: str(v) for k, v in query.items() if v is not None}
-        if clean_query:
-            query_string = urlencode(clean_query)
-
     parsed = urlparse(path)
+    # A query/fragment already in ``path`` ("/x?tab=a#top", e.g. ``:nav``) is
+    # kept; the ``query`` dict / ``fragment`` arguments override it.
+    merged = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
+    if query:
+        merged.update({k: str(v) for k, v in query.items() if v is not None})
+    query_string = urlencode(merged) if merged else ""
+
     return urlunparse(
         (
             parsed.scheme,
@@ -49,7 +50,7 @@ def build_url(
             parsed.path,
             parsed.params,
             query_string,
-            fragment or "",
+            fragment or parsed.fragment,
         )
     )
 
