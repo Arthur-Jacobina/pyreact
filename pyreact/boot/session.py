@@ -31,11 +31,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-from dataclasses import replace
+import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pyreact.core import runtime
-from pyreact.core.dehydrate import SnapshotError, adehydrate_tree, begin_hydration
+from pyreact.core.dehydrate import begin_hydration
 from pyreact.core.events import EventBus
 from pyreact.core.hook import HookContext
 from pyreact.core.turns import TurnManager
@@ -64,6 +64,15 @@ NAV_SERVICE = "nav_service"
 EVENT_BUS = "event_bus"
 TURNS = "turns"
 SESSION = "session"
+
+
+ADR_0001 = "docs/adr/0001-look-like-react.md"
+
+
+def _deprecated(old: str, new: str, stacklevel: int = 3) -> None:
+    warnings.warn(f"{old} is deprecated: use {new} -- the tree dehydrates itself "
+                  f"(use_dehydrate), no participants or manifests (see {ADR_0001})",
+                  DeprecationWarning, stacklevel=stacklevel)
 
 
 def session_of(ctx: Any) -> Optional["Session"]:
@@ -284,74 +293,54 @@ class Session:
 
     async def _suspend_on_loop(self, on_active: str, timeout: Optional[float],
                                store: Optional[ManifestStore], reason: str) -> Dict[str, Any]:
-        if on_active not in ("wait", "interrupt"):
-            raise ValueError(f"on_active must be 'wait' or 'interrupt', got {on_active!r}")
-        self._check_open()
+        """The legacy manifest suspend, on the root machinery
+        (:func:`pyreact.boot.root.suspend_session`): participants give their
+        fragments before the tree is hidden; the manifest carries the
+        snapshot's slices and turns."""
+        from .root import suspend_session
+
         store = store if store is not None else self.runner.manifest_store
-        self.suspending = True
-        self._suspend_carry = []
-        self.event_bus.publish("session.suspending", {
-            "session_id": self.id, "reason": reason, "on_active": on_active})
-        self.turns.hold()
-        t0 = time.time()
-        try:
-            await self._settle_active(on_active, timeout)
-            await self._drain()
-            fragments: Dict[str, Any] = {}
-            for p in self.participants:
+        legacy = [p for p in self.participants if p.name != "turns"]
+
+        async def fragments() -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            for p in legacy:
                 try:
                     frag = await p.suspend(self)
                 except Exception as exc:
                     raise SuspendError(f"participant {p.name!r} failed to suspend: "
                                        f"{type(exc).__name__}: {exc}") from exc
-                fragments[p.name] = _jsonable(frag if frag is not None else {}, p.name)
-            # use_dehydrate slices ride along (hydrated by AppRunner.resume)
-            try:
-                slices = (await adehydrate_tree(self.root, session_id=self.id))["slices"]
-            except SnapshotError as exc:
-                raise SuspendError(str(exc)) from exc
+                out[p.name] = _jsonable(frag if frag is not None else {}, p.name)
+            return out
+
+        box: Dict[str, Any] = {}
+
+        def save(snap: Dict[str, Any], frags: Dict[str, Any]) -> str:
+            turns = snap.get("turns") or {}
             app = self.app_component_fn
-            manifest = {
+            manifest = box["manifest"] = {
                 "format": MANIFEST_FORMAT,
                 "session_id": self.id,
                 "created_at": self.created_at,
                 "suspended_at": time.time(),
                 "reason": reason,
-                "turn_seq": self.turns.next_index() - 1,
-                "turn_policy": self.turns.policy,
+                "turn_seq": int(turns.get("next_index", 1)) - 1,
+                "turn_policy": turns.get("policy", self.turns.policy),
                 "app": f"{getattr(app, '__module__', '?')}:{getattr(app, '__qualname__', app)}",
-                "participants": fragments,
-                "slices": slices,
+                "participants": {"turns": {"next_index": turns.get("next_index", 1),
+                                           "carry": list(turns.get("carry") or [])},
+                                 **frags},
+                "slices": snap["slices"],
                 "versions": versions(self.participants),
             }
-            try:
-                ref = store.save(manifest)
-            except Exception as exc:
-                raise SuspendError(f"could not save the manifest: {type(exc).__name__}: {exc}"
-                                   ) from exc
-        except BaseException as exc:
-            # The session goes on: let queued turns start again and re-run
-            # the turn we cut short.
-            self.suspending = False
-            carry, self._suspend_carry = self._suspend_carry, []
-            self.turns.release()
-            for t in carry:
-                try:
-                    self.turns.enqueue(replace(t, resumed=True, ts=time.time()))
-                except Exception:
-                    pass
-            self.event_bus.publish("session.suspend.failed", {
-                "session_id": self.id, "reason": reason, "error": f"{type(exc).__name__}: {exc}"})
-            if isinstance(exc, SuspendError) or not isinstance(exc, Exception):
-                raise
-            raise SuspendError(f"suspend of session {self.id!r} failed: {exc}") from exc
+            return store.save(manifest)
+
+        _snap, ref = await suspend_session(
+            self, on_active=on_active, timeout=timeout, reason=reason, save=save,
+            before_hide=fragments,
+            payload=lambda frags: {"participants": ["turns", *frags]})
+        manifest = box["manifest"]
         manifest["ref"] = ref
-        self.event_bus.publish("session.suspended", {
-            "session_id": self.id, "ref": ref, "turn_seq": manifest["turn_seq"],
-            "participants": list(fragments), "carried_turns": [
-                t["id"] for t in fragments.get("turns", {}).get("carry", [])],
-            "duration": round(time.time() - t0, 4)})
-        self.runner._close_on_loop(self.id, "suspend")
         for p in self.participants:
             fn = getattr(p, "suspended", None)
             if callable(fn):
@@ -363,13 +352,20 @@ class Session:
 
     def suspend(self, *, on_active: str = "wait", timeout: Optional[float] = None,
                 store: Optional[ManifestStore] = None, reason: str = "manual") -> Dict[str, Any]:
-        """Suspend this agent: one explicit, observable operation.
+        """Deprecated (``DeprecationWarning``): use :meth:`Root.suspend
+        <pyreact.boot.root.Root.suspend>` (``create_root`` / ``hydrate_root``),
+        which needs no participants. A wrapper over the same machinery
+        (``pyreact.boot.root.suspend_session``), kept for one release.
+
+        Suspend this agent: one explicit, observable operation.
 
         1. ``session.suspending``; new input is refused, queued turns are held;
         2. the active turn ends: ``on_active="wait"`` (default) lets it finish
            (after ``timeout`` seconds it is interrupted), ``"interrupt"``
            cancels it now -- an interrupted turn is *carried*: re-run on resume;
-        3. every participant's ``suspend(session)`` returns its fragment;
+        3. every participant's ``suspend(session)`` returns its fragment; the
+           tree is hidden (cleanups: ``"suspend"``) and dehydrated (its
+           ``use_dehydrate`` slices go in ``manifest["slices"]``);
         4. the manifest is saved to ``store`` (default: the runner's
            ``manifest_store``), ``session.suspended`` is published;
         5. the tree unmounts (``close_reason == "suspend"``, ``session.closed``),
@@ -382,6 +378,7 @@ class Session:
         raised. Do not call from inside one of this session's turns with
         ``on_active="wait"`` (it would wait for itself).
         """
+        _deprecated("Session.suspend()", "root.suspend()")
         if self.runner._on_loop_thread():
             raise RuntimeError("Session.suspend() blocks; use 'await session.asuspend()' on the loop")
         return self.runner._submit(self._suspend_on_loop(on_active, timeout, store, reason)).result()
@@ -389,7 +386,8 @@ class Session:
     async def asuspend(self, *, on_active: str = "wait", timeout: Optional[float] = None,
                        store: Optional[ManifestStore] = None,
                        reason: str = "manual") -> Dict[str, Any]:
-        """Async :meth:`suspend`."""
+        """Async :meth:`suspend` (deprecated: ``await root.asuspend()``)."""
+        _deprecated("Session.asuspend()", "await root.asuspend()")
         fut = self.runner._submit(self._suspend_on_loop(on_active, timeout, store, reason))
         return await asyncio.wrap_future(fut)
 
