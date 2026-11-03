@@ -31,12 +31,14 @@ import os
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Union
 
 from pyreact.core import runtime
 from pyreact.core.activity import hide_tree, reveal_tree
 from pyreact.core.dehydrate import (
+    HydrationWarning,
     Snapshot,
     SnapshotError,
     adehydrate_tree,
@@ -409,13 +411,16 @@ SnapshotSource = Union[Snapshot, str, "os.PathLike[str]", None]
 
 
 def _resolve_snapshot(session_id: str, snapshot: SnapshotSource,
-                      store: Optional[SnapshotStore]) -> tuple:
-    """-> (snapshot, store it was loaded from or None)."""
+                      store: Optional[SnapshotStore], if_missing: str = "raise") -> tuple:
+    """-> (snapshot, store it was loaded from or None); ``(None, None)`` when
+    ``store`` has no snapshot and ``if_missing="create"``."""
     if snapshot is None:
         if store is None:
             raise ValueError("hydrate_root needs snapshot= or store=")
         found = store.load(session_id)
         if found is None:
+            if if_missing == "create":
+                return None, None
             raise KeyError(f"no snapshot for session {session_id!r} in {store!r}")
         return check_snapshot(found), store
     if isinstance(snapshot, dict):
@@ -497,11 +502,19 @@ async def _hydrate_on_loop(runner: "AppRunner", session_id: str, app: Callable,
 def hydrate_root(app: Callable, *, session_id: str, store: Optional[SnapshotStore] = None,
                  snapshot: SnapshotSource = None, runner: Optional["AppRunner"] = None,
                  resume_turns: bool = True, consume: bool = True, wait: bool = False,
-                 timeout: Optional[float] = None, turn_policy: Optional[str] = None) -> Root:
+                 timeout: Optional[float] = None, turn_policy: Optional[str] = None,
+                 if_missing: str = "create") -> Root:
     """Mount ``app`` hydrated from a snapshot and return its root.
 
     ``snapshot``: a snapshot dict, a path to one, or ``None`` to load
-    ``session_id``'s from ``store`` (``KeyError`` if there is none).
+    ``session_id``'s from ``store``. When ``store`` has none,
+    ``if_missing="create"`` (default; React's ``hydrateRoot`` on an empty
+    container just renders) mounts a fresh tree, as :func:`create_root`, and
+    reports it -- a :class:`~pyreact.core.HydrationWarning` and a
+    ``session.resume.degraded {participant: "snapshot", reason: "no
+    snapshot"}`` event (``root.session.degraded``); with ``resume_turns`` the
+    turns its ``TurnStore`` saw start but never end still re-run.
+    ``if_missing="raise"`` raises ``KeyError`` instead.
     ``use_dehydrate`` hooks get their slice **during their first render**;
     then (async hydrates resolved) mismatches are reported
     (``hydration.mismatch``, never fatal), turn numbering continues and, with
@@ -510,7 +523,13 @@ def hydrate_root(app: Callable, *, session_id: str, store: Optional[SnapshotStor
     (``consume``); the root suspends into ``store`` again. ``wait=True``
     blocks until the re-run turns end. Returns once hydrated.
     """
-    snap, src = _resolve_snapshot(session_id, snapshot, store)
+    if if_missing not in ("create", "raise"):
+        raise ValueError(f"if_missing must be 'create' or 'raise', got {if_missing!r}")
+    snap, src = _resolve_snapshot(session_id, snapshot, store, if_missing)
+    if snap is None:
+        return _create_missing(app, session_id=session_id, store=store, runner=runner,
+                               resume_turns=resume_turns, wait=wait, timeout=timeout,
+                               turn_policy=turn_policy)
     if snap.get("session_id") not in (None, session_id):
         raise SnapshotError(f"snapshot is for session {snap.get('session_id')!r}, "
                             f"not {session_id!r}")
@@ -531,6 +550,25 @@ def hydrate_root(app: Callable, *, session_id: str, store: Optional[SnapshotStor
             runner.shutdown()
         raise
     return Root(runner, sess, store=store, owns_runner=owns)
+
+
+def _create_missing(app: Callable, *, session_id: str, store: SnapshotStore,
+                    runner: Optional["AppRunner"], resume_turns: bool, wait: bool,
+                    timeout: Optional[float], turn_policy: Optional[str]) -> Root:
+    """``hydrate_root(if_missing="create")`` with nothing in ``store``."""
+    warnings.warn(HydrationWarning(
+        f"hydration mismatch: no snapshot for session {session_id!r} in {store!r}; "
+        "mounting a fresh tree"), stacklevel=3)
+    opts = {"turn_policy": turn_policy} if turn_policy is not None else {}
+    root = create_root(app, session_id=session_id, store=store, runner=runner, **opts)
+    try:
+        root.session.degrade("snapshot", "no snapshot", store=repr(store))
+        if resume_turns:
+            root.resume_pending(wait=wait, timeout=timeout)
+    except BaseException:
+        root.unmount()
+        raise
+    return root
 
 
 async def ahydrate_root(app: Callable, **kw: Any) -> Root:
