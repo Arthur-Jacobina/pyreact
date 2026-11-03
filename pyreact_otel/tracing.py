@@ -104,7 +104,8 @@ def _trace_name_of(trace_id: int) -> Optional[str]:
 def trace_name(b: Boundary) -> str:
     """Display name of a trace rooted at ``b`` (``pyreact.turn <name>`` for turns)."""
     if b.kind == "turn":
-        return f"pyreact.turn {b.name}" if b.name else "pyreact.turn"
+        label = b.name if b.name and b.name != "turn" else b.component
+        return f"pyreact.turn {label}" if label else "pyreact.turn"
     return span_name(b)
 
 
@@ -255,6 +256,11 @@ def _kind_attributes(b: Boundary) -> Dict[str, Any]:
     if b.kind == "turn":
         out[A.GEN_AI_OPERATION_NAME] = A.OP_INVOKE_AGENT
         out[A.GEN_AI_AGENT_NAME] = b.component or b.name
+        for key, attr in (("status", A.TURN_STATUS), ("index", A.TURN_INDEX),
+                          ("source", A.TURN_SOURCE)):
+            v = _scalar(b.attrs.get(key))
+            if v is not None:
+                out[attr] = v
     elif b.kind == "llm":
         model = _scalar(b.attrs.get("model"))
         provider = provider_of(model, b.attrs.get("provider"))
@@ -499,6 +505,10 @@ def _finish(span: Span, b: Boundary, result: Any, has_result: bool,
         attrs[A.ERROR_TYPE] = type(error).__qualname__
         span.record_exception(error)
         span.set_status(Status(StatusCode.ERROR, f"{type(error).__name__}: {error}"))
+    elif b.kind == "turn" and b.attrs.get("status") == "error":
+        # the turn itself returned, but work it spawned failed (runtime errors)
+        attrs[A.ERROR_TYPE] = "TurnError"
+        span.set_status(Status(StatusCode.ERROR, "turn ended with errors"))
     content = _content_attributes(b, result, has_result, limit) if capture_content else {}
     attrs.update(content)
     for enrich in enrichers:
