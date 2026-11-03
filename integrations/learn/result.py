@@ -241,6 +241,13 @@ class OptimizationResult:
         """
         from .hmr import hot_swap_into
 
+        for attr, val in (("_pyreact_result_path", self.path),
+                          ("_pyreact_optimizer", self.optimizer)):
+            if val:
+                try:
+                    setattr(self.program, attr, val)  # a suspend can point at the file
+                except Exception:
+                    pass
         return hot_swap_into(target, key if key is not None else self.module_key, self.program)
 
 
