@@ -1,12 +1,12 @@
 {
   "format": "pyreact.learn/1",
-  "created": "2026-11-03T01:49:56",
+  "created": "2026-11-03T10:27:04",
   "optimizer": "instruction_menu",
   "budget": "light",
-  "baseline": 0.3333333333333333,
-  "score": 1.0,
+  "baseline": 0.0,
+  "score": 0.0,
   "calls": 12,
-  "seconds": 15.17,
+  "seconds": 0.14,
   "train_size": 3,
   "val_size": 3,
   "metric": "team_match",
@@ -16,8 +16,8 @@
   "module_key": null,
   "details": {
     "menu_scores": [
-      0.3333333333333333,
-      1.0
+      0.0,
+      0.0
     ],
     "calls_by_phase": {
       "baseline": 3,
@@ -31,7 +31,7 @@
     "train": [],
     "demos": [],
     "signature": {
-      "instructions": "Route the support ticket to one team: billing, tech, account or retention. House rules: refunds and charge disputes -> account; login, password and 2FA -> tech; invoices, receipts, payment methods -> billing; any wish to cancel or switch provider -> retention.",
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
       "fields": [
         {
           "prefix": "Ticket:",

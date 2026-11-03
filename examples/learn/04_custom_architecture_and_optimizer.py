@@ -24,10 +24,13 @@ import dspy
 
 from integrations import DSPyProvider, use_agent_call
 from integrations.architectures import build_module
-from integrations.claude_cli_lm import ClaudeCLILM
+from examples._lm import example_lm
 from integrations.learn import evaluate, optimize, register_architecture, register_optimizer
 from pyreact.boot import bootstrap
 from pyreact.core import component, hooks, use_turn
+
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": []}
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +121,7 @@ def team_match(example, pred):
 
 
 def main() -> None:
-    lm = ClaudeCLILM("haiku")
+    lm = example_lm()
 
     print("1) custom architecture 'majority' inside a component")
 

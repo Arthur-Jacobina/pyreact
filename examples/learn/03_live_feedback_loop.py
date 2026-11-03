@@ -31,11 +31,14 @@ import asyncio
 from examples.optimize_router import TRAIN, VAL, normalize, route_metric, to_examples
 from examples.tools import SPECIALISTS, RouteSpecialistSig
 from integrations import DSPyProvider, use_call, use_module
-from integrations.claude_cli_lm import ClaudeCLILM
+from examples._lm import example_lm
 from integrations.learn import configure_learning, wait_optimizations
 from pyreact.boot import bootstrap, handle_command, read_terminal_and_invoke
 from pyreact.components.message import Message
 from pyreact.core import component, hooks, use_turn
+
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": ["--demo"]}
 
 
 @component
@@ -142,7 +145,7 @@ def main() -> None:
     ap.add_argument("--demo", action="store_true", help="scripted run")
     ap.add_argument("--model", default="haiku")
     args = ap.parse_args()
-    lm = ClaudeCLILM(args.model)
+    lm = example_lm(args.model)
     if args.demo:
         demo(lm)
         return

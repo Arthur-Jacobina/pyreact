@@ -24,6 +24,10 @@ from pyreact.components.keystroke import Keystroke
 from pyreact.core.core import component, hooks
 from pyreact.core.events import EventBus
 
+from examples._lm import OFFLINE, example_models
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": []}
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE_DIRS = ("pyreact", "integrations", "examples")
 
@@ -115,9 +119,7 @@ def ask(question: str, *, models: Optional[Dict[str, Any]] = None,
     from pyreact.boot import bootstrap
 
     if models is None:
-        from integrations.claude_cli_lm import ClaudeCLILM
-
-        models = {"default": ClaudeCLILM("haiku"), "fast": ClaudeCLILM("haiku")}
+        models = example_models()
     context = repo_source()
     sink: Dict[str, Any] = {"context_chars": len(context)}
     app = bootstrap(make_app(models, context, sink, **agent_kw))
@@ -129,6 +131,9 @@ def ask(question: str, *, models: Optional[Dict[str, Any]] = None,
 
 
 if __name__ == "__main__":
+    if OFFLINE:  # the RLM needs a real model writing code in the sandbox
+        print("rlm_agent: skipped with PYREACT_EXAMPLE_LM=offline")
+        sys.exit(0)
     q = " ".join(sys.argv[1:]) or (
         "Which function schedules component rerenders, and which data structure "
         "prevents a component from being enqueued twice?"

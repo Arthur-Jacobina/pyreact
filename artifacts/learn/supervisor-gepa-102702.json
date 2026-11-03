@@ -1,0 +1,89 @@
+{
+  "format": "pyreact.learn/1",
+  "created": "2026-11-03T10:27:02",
+  "optimizer": "gepa",
+  "budget": 14,
+  "baseline": 0.0,
+  "score": 0.0,
+  "calls": 26,
+  "seconds": 0.23,
+  "train_size": 6,
+  "val_size": 4,
+  "metric": "route_metric",
+  "arch": "cot",
+  "signature": "message, specialists -> name",
+  "signature_class": "examples.tools:RouteSpecialistSig",
+  "module_key": "ChainOfThought:RouteSpecialistSig:supervisor",
+  "details": {
+    "val_aggregate_scores": [
+      0.0
+    ],
+    "best_idx": 0,
+    "candidates": 1,
+    "total_metric_calls": 16,
+    "calls_by_phase": {
+      "baseline": 4,
+      "compile": 18,
+      "evaluate": 4
+    },
+    "log_dir": null
+  },
+  "state": {
+    "predict": {
+      "traces": [],
+      "train": [],
+      "demos": [],
+      "signature": {
+        "instructions": "Choose the best specialist for the message.\n\nInstructions:\n- Return ONLY the exact name of one of the provided specialists.\n- Consider each specialist's description and example utterances.\n- \"quais produtos / listar / catálogo / preço\" -> catalog.\n- \"estoque de um item / comprar / pedido\" -> order.\n- \"frete / entrega / frete grátis\" -> shipping.",
+        "fields": [
+          {
+            "prefix": "Message:",
+            "description": "${message}"
+          },
+          {
+            "prefix": "Specialists:",
+            "description": "Available specialists with description and utterances"
+          },
+          {
+            "prefix": "Reasoning:",
+            "description": "${reasoning}"
+          },
+          {
+            "prefix": "Name:",
+            "description": "${name}"
+          }
+        ]
+      },
+      "lm": null
+    }
+  },
+  "baseline_state": {
+    "predict": {
+      "traces": [],
+      "train": [],
+      "demos": [],
+      "signature": {
+        "instructions": "Choose the best specialist for the message.\n\nInstructions:\n- Return ONLY the exact name of one of the provided specialists.\n- Consider each specialist's description and example utterances.\n- \"quais produtos / listar / catálogo / preço\" -> catalog.\n- \"estoque de um item / comprar / pedido\" -> order.\n- \"frete / entrega / frete grátis\" -> shipping.",
+        "fields": [
+          {
+            "prefix": "Message:",
+            "description": "${message}"
+          },
+          {
+            "prefix": "Specialists:",
+            "description": "Available specialists with description and utterances"
+          },
+          {
+            "prefix": "Reasoning:",
+            "description": "${reasoning}"
+          },
+          {
+            "prefix": "Name:",
+            "description": "${name}"
+          }
+        ]
+      },
+      "lm": null
+    }
+  }
+}

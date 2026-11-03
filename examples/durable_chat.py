@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 
 import dspy
 
@@ -45,6 +44,10 @@ from pyreact_durable import (
     use_durable_lm,
 )
 from pyreact_durable.__main__ import render_tree
+
+from examples._lm import example_lm
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": ["--log", "{tmp}/chat.jsonl"], "stdin": "my name is Ada\n/label base\nwhat is my name?\n/history\n/tree\n:q\n"}
 
 DEFAULT_LOG = "artifacts/durable_chat.jsonl"
 
@@ -140,11 +143,7 @@ def DurableChatApp(log=None, lm=None, lm_mode="replay_or_record"):
 
 
 def default_lm():
-    if os.getenv("OPENAI_API_KEY"):
-        return dspy.LM("openai/gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"))
-    from integrations.claude_cli_lm import ClaudeCLILM
-
-    return ClaudeCLILM("haiku")
+    return example_lm()
 
 
 def start(log, lm, lm_mode="replay_or_record"):

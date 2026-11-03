@@ -32,6 +32,9 @@ from integrations.optimize import hot_swap, instructions_of, load_compiled, modu
 from pyreact.components.keystroke import Keystroke
 from pyreact.core.core import component, hooks
 
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": []}
+
 ROUTER_KEY = module_key_for(dspy.ChainOfThought, RouteSpecialistSig, "supervisor")
 CLASSES = ("catalog", "shipping", "order")
 
@@ -278,9 +281,9 @@ def main(argv=None):
     ap.add_argument("--model", default="haiku")
     args = ap.parse_args(argv)
 
-    from integrations.claude_cli_lm import ClaudeCLILM
+    from examples._lm import example_lm
 
-    lm = ClaudeCLILM(args.model)
+    lm = example_lm(args.model)
     compiled = load_compiled(dspy.ChainOfThought, RouteSpecialistSig, args.compiled)
     print(demo_hot_swap(lm, compiled, args.message))
 

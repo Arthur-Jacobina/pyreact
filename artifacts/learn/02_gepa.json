@@ -1,12 +1,12 @@
 {
   "format": "pyreact.learn/1",
-  "created": "2026-11-03T01:51:56",
+  "created": "2026-11-03T10:27:00",
   "optimizer": "gepa",
   "budget": 14,
-  "baseline": 0.5,
-  "score": 1.0,
+  "baseline": 0.0,
+  "score": 0.0,
   "calls": 22,
-  "seconds": 32.55,
+  "seconds": 0.01,
   "train_size": 6,
   "val_size": 4,
   "metric": "route_metric",
@@ -16,12 +16,11 @@
   "module_key": null,
   "details": {
     "val_aggregate_scores": [
-      0.5,
-      1.0
+      0.0
     ],
-    "best_idx": 1,
-    "candidates": 2,
-    "total_metric_calls": 17,
+    "best_idx": 0,
+    "candidates": 1,
+    "total_metric_calls": 16,
     "calls_by_phase": {
       "compile": 18,
       "evaluate": 4
@@ -33,7 +32,7 @@
     "train": [],
     "demos": [],
     "signature": {
-      "instructions": "You are a support ticket router. Read one customer support ticket and route it to exactly one of four teams: billing, tech, account, or retention. Output only the team name in lowercase, with no explanation, punctuation, or extra text.\n\nInput: a single free-text support ticket written by a customer. It may be informal, may describe several problems, and may not state the request directly.\n\nRouting rules, in priority order:\n\n1. retention: If the customer expresses any intent to cancel, leave, end their subscription, or switch to another provider, route to retention. This applies regardless of the reason given. A bug, crash, slowness, or price complaint that is paired with a cancellation or switching intent still goes to retention. Example: \"I want to cancel, your app keeps crashing\" -> retention.\n\n2. account: Refunds, duplicate or incorrect charges that the customer wants reversed, and charge disputes go to account, not billing. Example: \"I was charged twice this month, please refund one of them\" -> account.\n\n3. tech: Login, password, and 2FA problems go to tech, even when the symptom looks account-related. This includes password reset emails that never arrive, being locked out, and verification codes that fail. Bugs, crashes, errors, and slowness also go to tech. Example: \"I can't log in, the password reset email never arrives\" -> tech.\n\n4. billing: Payment and invoice questions that are not refunds or charge disputes, such as requests for invoice copies or updates to a payment method. Use billing only when no higher-priority rule applies and the customer's request is about what they pay or how they pay, not about reversing a charge.\n\nMethod:\n- First, check for any cancel, leave, or switch intent. If present, route to retention.\n- Otherwise, identify the customer's main request, meaning what they want done, not just the topic they mention. A mention of a bug does not make a ticket tech if the request is a refund, and a mention of money does not make a ticket billing if the request is a refund or dispute.\n- If a ticket contains several issues, route by the one with the highest priority in the list above.\n- Do not route based on keywords alone. Read the whole ticket.\n- If the ticket is genuinely ambiguous between two teams, choose the team that owns the customer's stated end goal.",
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
       "fields": [
         {
           "prefix": "Ticket:",

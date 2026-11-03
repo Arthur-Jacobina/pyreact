@@ -25,8 +25,11 @@ import sys
 import dspy
 
 from integrations.architectures import build_module
-from integrations.claude_cli_lm import ClaudeCLILM
+from examples._lm import example_lm
 from integrations.learn import evaluate, optimize
+
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"args": ["bootstrap", "gepa"]}
 
 
 class TicketSig(dspy.Signature):
@@ -90,7 +93,7 @@ PLAN = {
 
 
 def main(names: list[str]) -> None:
-    lm = ClaudeCLILM("haiku")
+    lm = example_lm()
     train, val = examples(TRAIN), examples(VAL)
     program = build_module(TicketSig, "predict")
 

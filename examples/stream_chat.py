@@ -13,7 +13,6 @@ the ``claude -p`` dev LM (no streaming: the answer appears at once).
 """
 
 import asyncio
-import os
 
 import dotenv
 import dspy
@@ -22,6 +21,10 @@ from integrations import DSPyProvider, use_chain_of_thought, use_stream
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.keystroke import Keystroke
 from pyreact.core import EventBus, HookContext, component, hooks
+
+from examples._lm import example_lm
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"stdin": "hi\nand again\n:q\n"}
 
 
 class ChatSig(dspy.Signature):
@@ -69,11 +72,7 @@ def Root(lm=None):
 
 def _default_lm():
     dotenv.load_dotenv()
-    if os.getenv("OPENAI_API_KEY"):
-        return dspy.LM("openai/gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY"))
-    from integrations.claude_cli_lm import ClaudeCLILM
-
-    return ClaudeCLILM("haiku")
+    return example_lm()
 
 
 def _print_stream_events():

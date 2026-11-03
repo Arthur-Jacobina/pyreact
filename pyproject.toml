@@ -29,3 +29,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 include = ["pyreact", "pyreact_durable"]
+
+[tool.pytest.ini_options]
+markers = [
+    "examples: runs every example end to end offline (deselect with -m 'not examples')",
+]
