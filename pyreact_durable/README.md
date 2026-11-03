@@ -290,32 +290,37 @@ again, so commit results atomically at the end of the turn. Proven by
 `tests/test_resume_turns.py` (SIGKILL mid-turn, then resume) and
 `examples/harness/02_resilient_agent.py`.
 
-## Suspend / resume a whole agent (`pyreact_durable.stateful`)
+## Suspend / resume a whole agent (roots)
 
-`DurableParticipant` takes part in pyreact's stateful sessions
-(`session.suspend()` / `app.resume(session_id)`, see "Stateful agents" in the
-main README). Its manifest fragment says where each mounted `Durable` log is
-and where its leaf was:
+`Durable` owns its state (ADR 0001): it dehydrates a reference to its log
+through the core's `use_dehydrate`, so `root.suspend()` carries it with no
+participant. Its slice in the snapshot (at the provider's path):
 
 ```json
-"durable": {"logs": [{"path": "/abs/runs/agent.jsonl", "log_id": "0f3c…", "leaf": "a1b2c3d4",
-                      "entries": 42, "version": 1, "pending_turns": []}]}
+"slices": {"App/Durable[durable]": {"log": {"path": "/abs/runs/agent.jsonl", "log_id": "0f3c…",
+                                            "leaf": "a1b2c3d4", "entries": 42, "version": 1,
+                                            "pending_turns": []}}}
 ```
 
 ```python
-app = AppRunner(App, participants=[DurableParticipant],
-                manifest_store=DirectoryManifestStore("runs/manifests"))
-m = app.open_session("agent").suspend()     # ... later, another process:
-app.resume("agent")                          # state, conversation, turn ids as they were
+store = DirectorySnapshots("runs/state")
+root = create_root(App, session_id="agent", store=store)
+root.send("hello", wait=True)
+root.suspend()                                       # ... later, another process:
+root = hydrate_root(App, session_id="agent", store=store)  # state, conversation, turn ids
 ```
 
-On resume, before the first render, it checks each log still exists and is
-the same log (header id); the `Durable` provider then checks the log out at
-the recorded leaf, so persistent state restores exactly as suspended even if
+On hydrate, before the children's first render, the log must still exist
+and be the same log (header id); the provider then checks it out at the
+recorded leaf, so persistent state restores exactly as suspended even if
 something appended to the file meanwhile. Turns the suspend cut short re-run
 with their recorded LLM calls replayed by `durable_lm`. A missing or
-replaced log, or a vanished leaf, is reported as `session.resume.degraded`
-(`participant: "durable"`) and the provider opens the file as usual.
+replaced log is a `hydration.mismatch` (`kind: "error"`, also
+`session.resume.degraded`, `participant: "durable"`) and the provider opens
+the file as usual (a fresh log if it is gone); a vanished leaf only degrades.
+
+`DurableParticipant` is deprecated (a `DeprecationWarning`): the legacy
+`session.suspend()` manifest carries the same slice, so its fragment is empty.
 
 ## CLI
 

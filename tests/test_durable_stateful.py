@@ -1,12 +1,19 @@
-"""DurableParticipant: durable logs in suspend manifests, restored on resume."""
+"""Durable dehydrates its log reference (use_dehydrate): roots carry it.
+
+No participants: ``root.suspend()`` puts ``{path, log_id, leaf, ...}`` in the
+snapshot (the Durable provider's slice) and ``hydrate_root`` reopens the
+log at that leaf before the children's first render.
+"""
 
 import asyncio
 import time
+import warnings
 
 import pytest
 
-from pyreact.boot import AppRunner, DirectoryManifestStore
-from pyreact.core import EventBus, component, hooks, use_turn
+from pyreact.boot import AppRunner, DirectoryManifestStore, DirectorySnapshots, hydrate_root
+from pyreact.boot import create_root
+from pyreact.core import HydrationWarning, component, hooks, use_turn
 from pyreact_durable import (
     Durable,
     DurableParticipant,
@@ -16,6 +23,7 @@ from pyreact_durable import (
 )
 
 SLOW = {"long": 30.0}
+SLICE = "App/Durable[d]"
 
 
 @component
@@ -47,43 +55,41 @@ def make_app(tmp_path):
 
 
 @pytest.fixture
-def runners():
+def roots():
     made = []
-
-    def _make(tmp_path, **kw):
-        r = AppRunner(make_app(tmp_path), default_session=False,
-                      participants=[DurableParticipant],
-                      manifest_store=DirectoryManifestStore(tmp_path / "manifests"), **kw)
-        made.append(r)
-        return r
-
-    yield _make
+    yield made
     for r in made:
-        r.shutdown()
+        try:
+            r.unmount()
+        except Exception:
+            pass
 
 
-def _seen(sess):
-    return sess.services["seen"]
+def _seen(root):
+    return root.session.services["seen"]
 
 
-def test_manifest_records_log_and_resume_restores_state(runners, tmp_path):
-    app = runners(tmp_path)
-    s = app.open_session("agent")
-    s.invoke("hello", wait=True, timeout=5)
-    s.invoke("world", wait=True, timeout=5)
-    m = s.suspend()
-    frag = m["participants"]["durable"]
-    [rec] = frag["logs"]
+def _store(tmp_path):
+    return DirectorySnapshots(tmp_path / "state")
+
+
+def test_snapshot_carries_the_log_and_hydrate_restores_state(roots, tmp_path):
+    root = create_root(make_app(tmp_path), session_id="agent", store=_store(tmp_path))
+    root.send("hello", wait=True, timeout=5)
+    root.send("world", wait=True, timeout=5)
+    snap = root.suspend()
+    rec = snap["slices"][SLICE]["log"]
     assert rec["path"] == str((tmp_path / "agent.jsonl").resolve())
     assert rec["leaf"] and rec["log_id"] and rec["pending_turns"] == []
-    app.shutdown()
+    assert snap["turns"]["next_index"] == 3
 
-    # "new process": a new runner, same directory
-    app2 = runners(tmp_path)
-    r = app2.resume("agent")
+    # "new process": hydrate_root makes a new runner; same directory
+    r = hydrate_root(make_app(tmp_path), session_id="agent", store=_store(tmp_path))
+    roots.append(r)
     assert _seen(r)[0] == (2, 4)  # first render already has the state
-    assert r.degraded == []
-    r.invoke("again", wait=True, timeout=5)
+    assert r.mismatches == [] and r.session.degraded == []
+    assert r.send("again", wait=True, timeout=5) == "agent/t3"
+    r.unmount()
     log = SessionLog.open(tmp_path / "agent.jsonl", readonly=True)
     try:
         conv = log.get_state("App/Chat[chat]", "history")
@@ -94,73 +100,141 @@ def test_manifest_records_log_and_resume_restores_state(runners, tmp_path):
         log.close()
 
 
-def test_resume_puts_the_leaf_back(runners, tmp_path):
-    app = runners(tmp_path)
-    s = app.open_session("leafy")
-    s.invoke("one", wait=True, timeout=5)
-    m = s.suspend()
-    app.shutdown()
+def test_hydrate_puts_the_leaf_back(roots, tmp_path):
+    root = create_root(make_app(tmp_path), session_id="leafy")
+    root.send("one", wait=True, timeout=5)
+    snap = root.suspend()
     # Someone writes to the log after the suspend (e.g. a CLI): the leaf moves.
     log = SessionLog.open(tmp_path / "leafy.jsonl")
     log.set_state("App/Chat[chat]", "count", 99)
     log.close()
 
-    app2 = runners(tmp_path)
-    r = app2.resume("leafy", m)
+    r = hydrate_root(make_app(tmp_path), session_id="leafy", snapshot=snap)
+    roots.append(r)
     assert _seen(r)[0] == (1, 2)  # the suspended state, not 99
 
 
-def test_carried_turn_reruns_after_a_resume(runners, tmp_path):
-    app = runners(tmp_path)
-    s = app.open_session("cut")
-    s.invoke("long")
+def test_live_dehydrate_reads_the_open_log(roots, tmp_path):
+    root = create_root(make_app(tmp_path), session_id="live")
+    roots.append(root)
+    root.send("x", wait=True, timeout=5)
+    rec = root.dehydrate()["slices"][SLICE]["log"]
+    log = SessionLog.open(tmp_path / "live.jsonl", readonly=True)
+    try:
+        assert rec["leaf"] == log.leaf and rec["entries"] == len(log.entries)
+    finally:
+        log.close()
+
+
+def test_carried_turn_reruns_after_hydration(roots, tmp_path):
+    root = create_root(make_app(tmp_path), session_id="cut")
+    root.send("long")
     time.sleep(0.2)
-    m = s.suspend(on_active="interrupt")
-    assert [t["id"] for t in m["participants"]["turns"]["carry"]] == ["cut/t1"]
-    app.shutdown()
+    snap = root.suspend(on_active="interrupt")
+    assert [t["id"] for t in snap["turns"]["carry"]] == ["cut/t1"]
 
     SLOW["long"] = 0.01
     try:
-        app2 = runners(tmp_path)
-        events = []
-        app2.on_session(open=lambda sess: sess.event_bus.subscribe(
-            lambda ev: events.append((ev.kind, ev.turn_id, ev.payload)), ["turn.*"]))
-        r = app2.resume("cut", wait=True, timeout=10)
+        r = hydrate_root(make_app(tmp_path), session_id="cut", snapshot=snap,
+                         wait=True, timeout=10)
     finally:
         SLOW["long"] = 30.0
-    starts = [(t, p.get("resumed")) for k, t, p in events if k == "turn.start"]
+    roots.append(r)
+    starts = [(e.turn_id, e.payload.get("resumed")) for e in r.events.recent()
+              if e.kind == "turn.start"]
     assert starts == [("cut/t1", True)]
-    assert r.turns.pending_turns() == []
-    assert r.invoke("next", wait=True, timeout=5) == "cut/t2"
+    assert r.session.turns.pending_turns() == []
+    assert _seen(r)[-1] == (1, 2)
+    assert r.send("next", wait=True, timeout=5) == "cut/t2"
 
 
-def test_missing_log_degrades_to_a_fresh_one(runners, tmp_path):
-    app = runners(tmp_path)
-    s = app.open_session("gone")
-    s.invoke("x", wait=True, timeout=5)
-    m = s.suspend()
-    app.shutdown()
+def _hydrate_quiet(*a, **kw):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", HydrationWarning)
+        return hydrate_root(*a, **kw)
+
+
+def test_missing_log_is_a_mismatch_and_starts_fresh(roots, tmp_path):
+    root = create_root(make_app(tmp_path), session_id="gone")
+    root.send("x", wait=True, timeout=5)
+    snap = root.suspend()
     (tmp_path / "gone.jsonl").unlink()
 
-    app2 = runners(tmp_path)
-    deg = []
-    app2.on_session(open=lambda sess: sess.event_bus.subscribe(
-        lambda ev: deg.append(ev.payload), ["session.resume.degraded"]))
-    r = app2.resume("gone", m)
-    assert [(d["participant"], d["reason"]) for d in deg] == [("durable", "log missing")]
+    r = _hydrate_quiet(make_app(tmp_path), session_id="gone", snapshot=snap)
+    roots.append(r)
+    [m] = r.mismatches
+    assert (m["kind"], m["path"], m["key"]) == ("error", SLICE, "log")
+    assert "log missing" in m["message"]
+    assert [(d["participant"], d["reason"]) for d in r.session.degraded] == [
+        ("durable", "log missing")]
     assert _seen(r)[0] == (0, 0)
-    assert isinstance(r.event_bus, EventBus)
 
 
-def test_replaced_log_degrades(runners, tmp_path):
-    app = runners(tmp_path)
-    s = app.open_session("swap")
-    s.invoke("x", wait=True, timeout=5)
-    m = s.suspend()
-    app.shutdown()
+def test_replaced_log_is_a_mismatch(roots, tmp_path):
+    root = create_root(make_app(tmp_path), session_id="swap")
+    root.send("x", wait=True, timeout=5)
+    snap = root.suspend()
     (tmp_path / "swap.jsonl").unlink()
     SessionLog.open(tmp_path / "swap.jsonl").close()  # a different log, same path
 
-    app2 = runners(tmp_path)
-    r = app2.resume("swap", m)
-    assert [d["reason"] for d in r.degraded] == ["log replaced"]
+    r = _hydrate_quiet(make_app(tmp_path), session_id="swap", snapshot=snap)
+    roots.append(r)
+    assert [m["kind"] for m in r.mismatches] == ["error"]
+    assert [d["reason"] for d in r.session.degraded] == ["log replaced"]
+
+
+# ---------------------------------------------------------------------------
+# Deprecated: AppRunner(participants=[DurableParticipant]) keeps working
+# ---------------------------------------------------------------------------
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_deprecated_participant_still_round_trips(tmp_path):
+    with pytest.warns(DeprecationWarning, match="DurableParticipant is deprecated"):
+        DurableParticipant()
+    app = AppRunner(make_app(tmp_path), default_session=False,
+                    participants=[DurableParticipant],
+                    manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
+    try:
+        s = app.open_session("old")
+        s.invoke("hello", wait=True, timeout=5)
+        m = s.suspend()
+        assert m["participants"]["durable"] == {}
+        assert m["slices"][SLICE]["log"]["leaf"]  # Durable's own slice
+    finally:
+        app.shutdown()
+    app2 = AppRunner(make_app(tmp_path), default_session=False,
+                     participants=[DurableParticipant],
+                     manifest_store=DirectoryManifestStore(tmp_path / "manifests"))
+    try:
+        r = app2.resume("old")
+        assert r.services["seen"][0] == (1, 2) and r.degraded == []
+    finally:
+        app2.shutdown()
+
+
+def test_hidden_activity_keeps_the_log_open(roots, tmp_path):
+    from pyreact.core import Activity, use_imperative_handle
+    from pyreact_durable import use_durable
+
+    @component
+    def Peek():
+        log = use_durable()
+        use_imperative_handle("log", lambda: log, [id(log)])
+        return []
+
+    @component
+    def App():
+        mode, set_mode = hooks.use_state("visible")
+        use_imperative_handle("app", lambda: set_mode, [])
+        return [Activity(mode=mode, children=[
+            Durable(key="d", log=tmp_path / "hidden.jsonl", children=[Peek(key="p")])])]
+
+    root = create_root(App, session_id="h")
+    roots.append(root)
+    log = root.ref("log")
+    root.ref("app")("hidden")
+    root.wait_idle(timeout=5)
+    assert not log.closed  # state is kept while hidden
+    root.ref("app")("visible")
+    root.wait_idle(timeout=5)
+    root.unmount()
+    assert log.closed
