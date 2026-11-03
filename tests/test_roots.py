@@ -236,3 +236,48 @@ def test_async_root_api():
         return tid, root2.closed
 
     assert asyncio.run(main()) == ("as/t2", True)
+
+
+class PendingStore:
+    """A TurnStore that saw ``pending`` start but never end (a crashed run)."""
+
+    def __init__(self, pending=()):
+        self._pending, self.ended = list(pending), []
+
+    def on_turn_start(self, turn):
+        pass
+
+    def on_turn_end(self, turn, result):
+        self.ended.append((turn.id, result["status"]))
+        self._pending = [t for t in self._pending if t.id != turn.id]
+
+    def pending(self):
+        return list(self._pending)
+
+    def get(self, turn_id):
+        return next((t for t in self._pending if t.id == turn_id), None)
+
+
+def test_root_resume_pending_reruns_unfinished_turns_from_the_turn_store(roots):
+    from pyreact.core import Turn
+
+    log = []
+    store = PendingStore([Turn(id="p/t3", index=3, text="unfinished", source="term")])
+
+    @component
+    def App():
+        def attach():  # a store attached on mount (like a Durable provider)
+            from pyreact.boot.session import current_session
+
+            current_session().turns.configure(store=store)
+
+        hooks.use_effect(attach, [])
+        return [make_app(log)(key="inner")]
+
+    root = create_root(App, session_id="p")
+    roots.append(root)
+    assert root.resume_pending(wait=True, timeout=5) == ["p/t3"]
+    assert ("start", "p/t3", "unfinished", True) in log
+    assert store.ended == [("p/t3", "done")]
+    assert root.resume_pending() == []
+    assert root.send("next", wait=True, timeout=5) == "p/t4"
