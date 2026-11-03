@@ -171,6 +171,9 @@ class HookContext:
         self._self_hidden: bool = False
         self._applied_hidden: bool = False
         self._hide_reason: str = "hidden"
+        self._render_suspended: bool = False
+        # Root only: slices this tree hydrates from (see core.dehydrate).
+        self._hydration = None
 
     @property
     def root(self) -> "HookContext":
@@ -189,6 +192,13 @@ class HookContext:
                 return True
             node = node.parent
         return False
+
+    def use_dehydrate(self, key, *, dehydrate, hydrate=None, initial=None):
+        """Same as :func:`pyreact.core.dehydrate.use_dehydrate`
+        (``hooks.use_dehydrate(...)``)."""
+        from .dehydrate import _use_dehydrate
+
+        return _use_dehydrate(self, key, dehydrate, hydrate, initial)
 
     def use_cleanup_reason(self) -> Optional[str]:
         """Same as :func:`use_cleanup_reason` (``hooks.use_cleanup_reason()``)."""
@@ -541,6 +551,10 @@ class HookContext:
             child.unmount(reason)
 
         # 4. GC
+        if "_dehydrators" in self.__dict__ or "_suspended_slots" in self.__dict__:
+            from .dehydrate import drop_registrations
+
+            drop_registrations(self)
         self.children.clear()
         self.hooks.clear()
         self.effects.clear()
@@ -577,10 +591,18 @@ class HookContext:
             # 2. execute component function. On failure keep the previous
             #    subtree mounted (last good render) instead of leaking it.
             try:
+                self._render_suspended = False
                 output = self.component_fn(__internal=True, **self.props)
             except BaseException:
                 self.children = old_children
                 raise
+            if self._render_suspended:
+                # A use_dehydrate is still hydrating (async): throw this
+                # render away; the component re-renders once it resolves.
+                from .dehydrate import discard_suspended_render
+
+                discard_suspended_render(self, old_children)
+                return
             vnodes = output if isinstance(output, list) else [output]
 
             # 3. reconciliation – reuse or create child contexts
