@@ -81,6 +81,9 @@ Key pieces:
 - Stateful across restarts: a `SnapshotStore` (memory, file, or the `pyreact_durable` log) records the sandbox; a new runner reattaches it or restores its snapshot (`autosnapshot="turn"`).
 - `sandbox_tools(sb)` → `run_shell` / `run_python` / `read_file` / `write_file` for `use_agent`; `SandboxInterpreter(sb)` runs RLM's REPL in the sandbox instead of Deno. Example: [`examples/sandbox/01_coding_agent.py`](examples/sandbox/01_coding_agent.py).
 
+### 12) Suspend / resume ↔ Stateful agents
+- An agent is a session's whole state (durable state + conversation, sandbox, pending turns, learned prompts). `session.suspend()` writes it as one manifest through *participants* the libraries register (`pyreact_durable`, `pyreact_sandbox`, `integrations`); `app.resume(session_id)` hands each its fragment before the first render and re-runs the turn that was cut short. `AppRunner(idle_policy="suspend")` makes idle reaping suspend instead of close. See [Stateful agents](#stateful-agents-suspend--resume).
+
 ### Lifecycle overview
 1. A root agent (component) is wrapped in a `HookContext` by the runner.
 2. State changes or context updates call `schedule_rerender`.
@@ -408,6 +411,193 @@ and global bus, with `turn_id` and the component path): `:events`,
 exporters see them. Middleware-level state is on the boundary
 (`b.attempt`, `retries`, `fallback`, `circuit`, `timed_out`).
 
+## Stateful agents: suspend / resume
+
+An **agent is a session's whole state**: durable component state and its
+conversation, its sandbox (and the files in it), the turns it has queued or
+was in the middle of, the prompts it learned. Making a long-running agent
+sleep and wake up — on idle, on deploy, on another machine — is one explicit,
+observable operation:
+
+```python
+from pyreact.boot import AppRunner, DirectoryManifestStore
+from pyreact_durable import DurableParticipant
+from pyreact_sandbox import SandboxParticipant
+from integrations.stateful import CompiledModulesParticipant
+
+app = AppRunner(App, default_session=False,
+                participants=[DurableParticipant, SandboxParticipant,
+                              lambda s: CompiledModulesParticipant(s, dir="runs/learned")],
+                manifest_store=DirectoryManifestStore("runs/manifests"))
+s = app.open_session("agent-1")
+s.invoke("write fib.py and run it", wait=True)
+manifest = s.suspend(on_active="wait")       # -> runs/manifests/agent-1.json, tree unmounted
+
+# ... later, in another process:
+s = app.resume("agent-1")                    # same id; state, sandbox, prompts, cut turns back
+```
+
+The core keeps the "libraries at the border" rule: `pyreact.boot` only
+defines lifecycle hooks, the participant protocol, manifests and their
+stores; `pyreact_durable`, `pyreact_sandbox` and `integrations` plug their
+state in; nothing in `pyreact/` imports them. Example (two processes, real
+LLM + Docker, or offline with `--driver local`):
+[`examples/stateful/01_suspend_resume.py`](examples/stateful/01_suspend_resume.py).
+
+### Session lifecycle hooks
+
+`app.on_session(open=fn, close=fn, replay=False)` calls `open(session)` on
+the runner loop when a session opens or is resumed — **before its first
+render**, so it can subscribe to `session.event_bus`, seed services or add
+participants — and `close(session)` after its tree unmounted
+(`session.close_reason` is `"closed"`, `"idle"`, `"shutdown"` or
+`"suspend"`). It returns a function removing the hooks. `pyreact_otel`'s
+`attach_app(app)` uses it to bridge sessions opened later.
+
+Events on the session bus: `session.opened {resumed}`,
+`session.suspending {reason, on_active}`, `session.suspended {ref, turn_seq,
+participants, carried_turns}`, `session.suspend.failed {error}`,
+`session.resumed {turn_seq, participants, degraded, turns}`,
+`session.resume.degraded {participant, reason, ...}`, `session.closed {reason}`.
+
+### Suspend and resume
+
+`session.suspend(on_active="wait", timeout=None, store=None, reason="manual")`
+(`asuspend` from a loop, `app.suspend_session(id)`):
+
+1. `session.suspending`; new input is refused, queued turns are held;
+2. the active turn ends — `on_active="wait"` lets it finish (after `timeout`
+   seconds it is interrupted), `"interrupt"` cancels all its tasks now. A turn
+   cut short is **carried**: it re-runs (same id, `resumed: true`) on resume;
+3. each participant's `suspend(session)` returns a JSON fragment;
+4. the manifest is saved to the store; `session.suspended`;
+5. the tree unmounts (`close_reason == "suspend"`): providers keep their
+   files (`Durable(on_close=...)` retention only applies to `idle`/`closed`);
+   then participants' optional `suspended(session)` (e.g. wait for sandbox
+   closes). Returns the manifest (plus `ref`).
+
+`app.resume(session_id, manifest=None, store=None, resume_turns=True,
+consume=True, wait=False)` (`aresume`): `manifest` is a dict, a path, or
+`None` to load it from the store. The session is created with the same id,
+`open` hooks register participants, `session.opened {resumed: true}`, each
+participant's `resume(session, fragment)` runs **before the first render**,
+the tree mounts, optional `resumed(session)` hooks run, carried turns are
+re-queued and so are turns a `TurnStore` saw cut short by a crash
+(`resume_pending`), then `session.resumed`. With `consume` the manifest is
+deleted from the store it came from (an old manifest must not be resumed
+twice). Turn numbering continues (`agent-1/t3` after `t2`).
+
+Policies:
+
+- `AppRunner(idle_policy="suspend")`: idle reaping (`close_idle_sessions(ttl)`,
+  the web server's reaper) suspends instead of closing (`reason: "idle"`);
+  a session that fails to suspend stays open.
+- `AppRunner(auto_resume=True)` (default with `idle_policy="suspend"`):
+  `open_session(id)` resumes a session that has a manifest — a browser tab
+  reconnecting after its session was reaped gets its agent back.
+- `on_active`: `"wait"` (default) / `"interrupt"`, with `timeout=` as the
+  wait's upper bound.
+- `SandboxParticipant(mode="snapshot"|"suspend"|"keep")`: snapshot + destroy
+  (survives a machine change), pause and reattach (fast), or leave running.
+
+### Manifest format
+
+```json
+{
+  "format": "pyreact.manifest/1",
+  "session_id": "coder-1",
+  "created_at": 1793720847.46, "suspended_at": 1793720877.92,
+  "reason": "manual", "turn_seq": 2, "turn_policy": "queue",
+  "app": "__main__:make_app.<locals>.App",
+  "participants": {
+    "turns": {"next_index": 3, "carry": [{"id": "coder-1/t2", "index": 2, "text": "Extend the fib.py ...", "source": "term", "ts": 1793720872.88}]},
+    "durable": {"logs": [{"path": "/abs/runs/stateful/logs/coder-1.jsonl", "log_id": "8089a346-…",
+                          "leaf": "d88b31a2", "entries": 25, "version": 1, "pending_turns": []}]},
+    "sandbox": {"mode": "snapshot", "sandboxes": [{"key": "default", "store_key": "coder-1/default",
+                "driver": "docker", "sandbox_id": null, "spec": {"image": "python:3.12-slim", "...": "..."},
+                "snapshot": {"driver": "docker", "id": "pyreact-sandbox:pyrsbx-e4835141d5-suspend",
+                             "sandbox_id": "pyrsbx-e4835141d5", "label": "suspend", "...": "..."}}]},
+    "dspy.compiled": {"modules": [{"key": ["ReAct", "Coder", "coder"], "key_str": "ReAct:Coder:coder",
+                      "provider": "App/DSPyProvider[dspy]", "arch": "react",
+                      "path": "runs/stateful/learned/coder.json"}]}
+  },
+  "versions": {"manifest": 1, "pyreact": "0.1.0", "python": "3.13.0",
+               "participants": {"turns": "1", "durable": "1", "sandbox": "1", "dspy.compiled": "1"}}
+}
+```
+
+(From the real run of the example: suspended while the follow-up turn
+`coder-1/t2` was in flight, so it is carried.)
+
+Stores: `MemoryManifestStore` (default; same process), `DirectoryManifestStore(dir)`
+(one `<id>.json` per session, atomic writes), or any `ManifestStore`
+(`save(manifest) -> ref`, `load(id)`, `delete(id)`, `list()`).
+`load_manifest(path)` reads and validates one; a newer `format` is refused
+(`ManifestError`).
+
+### Participants
+
+| Participant | Name | Fragment | On resume (before the first render) |
+|---|---|---|---|
+| built in | `turns` | next turn index, carried turns | numbering continues; carried turns re-run after the first render |
+| `pyreact_durable.DurableParticipant` | `durable` | per mounted `Durable` log: path, header id, leaf, pending turns | checks the log is there and the same; `Durable` checks it out at the leaf → persistent state + conversation as suspended; `durable_lm` replays a re-run turn's answered calls |
+| `pyreact_sandbox.SandboxParticipant` | `sandbox` | per `use_sandbox` handle: driver, spec, snapshot ref / live id | the record wins over the provider's `SnapshotStore`: restore from the snapshot, or reattach + unpause |
+| `integrations.stateful.CompiledModulesParticipant` | `dspy.compiled` | per program in `env.compiled`: its `integrations.learn` result path (or one saved under `dir`, or the state inline) | the state is loaded into the module `use_module` / `use_agent` builds for that key; the optimized prompt survives restarts |
+
+Writing one — any object with a `name` and two coroutines:
+
+```python
+class Scratchpad:
+    name = "scratchpad"            # its key in manifest["participants"]
+    version = "1"                  # optional, recorded in manifest["versions"]
+
+    def __init__(self, session):   # factories get the session
+        self.session = session
+
+    async def suspend(self, session) -> dict:      # JSON-able, or the suspend fails
+        return {"notes": session.services.get("notes", [])}
+
+    async def resume(self, session, fragment):     # before the first render
+        session.services["notes"] = fragment["notes"]   # components read it on mount
+
+    # optional: async def suspended(self, session)  -- after the tree unmounted
+    # optional: async def resumed(self, session)    -- after the first render
+
+app = AppRunner(App, participants=[Scratchpad])   # or app.add_participant(Scratchpad)
+```
+
+The pattern the bundled ones follow: a provider component registers its live
+object in a session service on mount (so `suspend` can find it); `resume`
+puts what it restored in another service that the provider reads on its
+first render.
+
+### Failure semantics
+
+- **Suspend is all or nothing.** If a participant raises, returns something
+  that is not JSON, or the store cannot save, nothing is unmounted: held
+  turns start again, a turn cut short is re-queued, `session.suspend.failed`
+  is published and `SuspendError` raised. (Side effects a participant already
+  made stay — e.g. a sandbox snapshot that is simply never referenced.)
+- **Resume degrades, it never fails because of one participant.** A fragment
+  no registered participant claims, a participant whose `resume` raises, or
+  one that reports a partial restore with `session.degrade(name, reason,
+  **info)` is recorded in `session.degraded` and published as
+  `session.resume.degraded`; the session goes on with what was restored:
+  - sandbox snapshot gone (or the paused container, or the driver changed) →
+    a **fresh sandbox** boots (`reason: "snapshot missing"`, `"sandbox gone"`,
+    `"restore failed"`, `"driver changed"`);
+  - durable log missing / replaced / leaf gone → the provider opens the file
+    as usual (a fresh log if it is gone);
+  - a learned program's result file missing → that module starts from its
+    signature (`reason: "result missing"`).
+- Resume fails outright only for the envelope: wrong `session_id`,
+  unsupported `format` (`ManifestError`), or the session is already open.
+- Re-running a carried turn is at-least-once for its side effects, like
+  `resume_pending`: answered LLM calls are replayed by `durable_lm`, tools
+  run again (make them idempotent).
+- Do not `await session.asuspend(on_active="wait")` from inside one of that
+  session's turns: it would wait for itself.
+
 ## Running the examples
 
 ### 1. Pick the LM
@@ -458,6 +648,9 @@ uv run python -m examples.durable.04_llm_chat
 # Sandboxes: a coding agent in Docker; --resume restores it after a restart
 uv run python -m examples.sandbox.01_coding_agent "What is the 30th Fibonacci number?"
 uv run python -m examples.sandbox.01_coding_agent --resume
+
+# Stateful agents: suspend mid-turn, resume in a new process (--driver local: no Docker)
+uv run python -m examples.stateful.01_suspend_resume --demo
 ```
 
 In your own code, `run_web(App)` serves an app (one session per browser tab);
@@ -566,7 +759,9 @@ exports every harness boundary as an OpenTelemetry span. A turn is the trace
 root (`pyreact.turn`), LLM calls become `chat <model>` spans with GenAI
 semantic conventions (model, tokens, cost), and tools become
 `execute_tool <name>` spans. It also exports token/latency/cost/error
-metrics and bridges `message`/`error`/`feedback` events. Like
+metrics and bridges `message`/`error`/`feedback`/`session.*` events
+(`otel.attach_app(app)` follows sessions opened or resumed later, through
+`app.on_session`). Like
 `pyreact_durable`, it lives at the border: `pyreact` never imports it.
 
 ```python
