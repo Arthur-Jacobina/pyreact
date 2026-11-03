@@ -10,7 +10,7 @@ from integrations.dspy_integration import DSPyProvider
 from integrations.use_dspy import use_dspy_call
 from pyreact.boot import bootstrap
 from pyreact.components.keystroke import Keystroke
-from pyreact.core import EventBus, HookContext, component, hooks, runtime, use_turn
+from pyreact.core import component, hooks, runtime, use_turn
 from pyreact.core.turns import TurnManager
 from pyreact.input.bus import InputBus
 
@@ -31,7 +31,7 @@ def run_app():
 
 def _record_turn_events(app):
     evs, lock = [], threading.Lock()
-    bus = HookContext.get_service("event_bus", EventBus)
+    bus = app.event_bus  # the default session's bus
 
     def _on(ev):
         with lock:

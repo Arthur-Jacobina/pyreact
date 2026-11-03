@@ -101,6 +101,10 @@ class TurnManager:
         self._listeners: List[TurnListener] = []
         self._pump: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Session scoping (set by pyreact.boot.session.Session):
+        self.id_prefix: str = ""  # turn ids are f"{id_prefix}t{n}"
+        self._owner: Any = None  # session root: owner of turn-processing work
+        self._owner_filter: Optional[Callable[[Any], bool]] = None
 
     # ------------------------------------------------------------------
     # configuration
@@ -112,7 +116,25 @@ class TurnManager:
         input_bus: Any = None,
         event_bus: Optional[EventBus] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        id_prefix: Optional[str] = None,
+        owner: Any = None,
+        owner_filter: Optional[Callable[[Any], bool]] = None,
     ) -> "TurnManager":
+        """Configure the manager. Session wiring:
+
+        - ``id_prefix``: prefix of turn ids (makes them unique across the
+          sessions sharing a loop, e.g. ``"s1/"`` -> ``"s1/t3"``);
+        - ``owner``: component (session root) owning the work done while a
+          turn's input is dispatched;
+        - ``owner_filter``: restricts "renders pending" checks to this
+          session's components, so busy sessions don't delay each other.
+        """
+        if id_prefix is not None:
+            self.id_prefix = id_prefix
+        if owner is not None:
+            self._owner = owner
+        if owner_filter is not None:
+            self._owner_filter = owner_filter
         if policy is not None:
             if policy not in POLICIES:
                 raise ValueError(f"turn policy must be one of {POLICIES}, got {policy!r}")
@@ -185,7 +207,7 @@ class TurnManager:
         """Allocate a Turn (thread-safe) without queueing it."""
         with self._lock:
             idx = next(self._counter)
-        return Turn(id=f"t{idx}", index=idx, text=text, source=source)
+        return Turn(id=f"{self.id_prefix}t{idx}", index=idx, text=text, source=source)
 
     def submit(self, text: str, *, source: str = "term") -> Turn:
         """Queue ``text`` as a new turn. Callable from any thread."""
@@ -255,6 +277,10 @@ class TurnManager:
             )
 
     async def _run(self) -> None:
+        # The pump runs in its own task/context: attribute its work (and
+        # errors) to the session that owns this manager.
+        if self._owner is not None:
+            runtime.current_owner.set(self._owner)
         while self._queue:
             turn = self._queue.popleft()
             try:
@@ -269,7 +295,7 @@ class TurnManager:
         t0 = time.time()
         self._active = turn
         self._latest = turn
-        runtime.set_active_turn(turn.id)
+        runtime.set_active_turn(turn.id, scope=self)
         status = "done"
         try:
             self.event_bus.publish(
@@ -284,11 +310,13 @@ class TurnManager:
                 except Exception as exc:
                     runtime.report_error(exc, None, "turn-listener")
             token = runtime._turn_var.set(turn.id)
+            owner_token = runtime.current_owner.set(self._owner)
             try:
                 base = {"value": turn.text, "source": turn.source, "ts": turn.ts, "turn_id": turn.id}
                 self.input_bus.emit({"type": "text", **base})
                 self.input_bus.emit({"type": "submit", **base})
             finally:
+                runtime.current_owner.reset(owner_token)
                 runtime._turn_var.reset(token)
             await self._wait_settled(turn)
         except Exception as exc:
@@ -308,19 +336,19 @@ class TurnManager:
             if pending:
                 await asyncio.wait(pending, timeout=poll * 10)
                 continue
-            if runtime.renders_pending():
+            if runtime.renders_pending(self._owner_filter):
                 await asyncio.sleep(poll / 4)
                 continue
             # Let callbacks scheduled by finishing tasks enqueue renders.
             await asyncio.sleep(0)
             await asyncio.sleep(0)
-            if runtime.is_turn_idle(tid):
+            if runtime.is_turn_idle(tid, self._owner_filter):
                 return
 
     def _finish(self, turn: Turn, status: str, t0: float) -> None:
         if self._active is turn:
             self._active = None
-            runtime.set_active_turn(None)
+            runtime.set_active_turn(None, scope=self)
         self._interrupted.discard(turn.id)
         self._interrupt_req.discard(turn.id)
         runtime.pop_turn_errors(turn.id)

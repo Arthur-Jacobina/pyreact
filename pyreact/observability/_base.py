@@ -11,6 +11,9 @@ def component_path(ctx: Any) -> Optional[str]:
     """``Root/App/StoreHome[store]/SupervisorAgent[supervisor]`` for a HookContext."""
     if ctx is None:
         return None
+    path = getattr(ctx, "path", None)  # HookContext.path (pyreact.persist)
+    if isinstance(path, str) and path:
+        return path
     parts = []
     node = ctx
     depth = 0
@@ -31,7 +34,12 @@ def current_turn_id() -> Optional[str]:
 
 
 def get_event_bus(ctx: Any = None) -> EventBus:
-    """The app's ``"event_bus"`` service (from ``ctx`` or the global registry)."""
+    """The ``"event_bus"`` service of ``ctx``'s session (default: the current
+    component's), else the global registry's."""
+    if ctx is None:
+        from pyreact.core import runtime
+
+        ctx = runtime.current_component()
     if ctx is not None and hasattr(ctx, "get_service"):
         return ctx.get_service("event_bus", EventBus)
     from pyreact.core.hook import HookContext
