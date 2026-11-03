@@ -10,6 +10,7 @@ from .turns import Turn, TurnManager, use_turn
 from .turn_hooks import use_on_turn
 from . import runtime
 from . import harness
+from . import recovery
 from .harness import Blocked, Boundary, HarnessProvider, current_boundary, through, use_harness
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "use_on_turn",
     "runtime",
     "harness",
+    "recovery",
     "Blocked",
     "Boundary",
     "HarnessProvider",
