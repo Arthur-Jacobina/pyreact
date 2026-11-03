@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Callable, NotRequired, Optional, Dict, Union, TypeAlias, TypedDict
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qs
 
 ParamValue: TypeAlias = Union[str, int, float, bool]
 QueryValue: TypeAlias = Union[str, int, float, bool]
@@ -24,8 +24,57 @@ NavigateFn: TypeAlias = Callable[
 ]
 
 
+def build_url(
+    path: str,
+    params: Optional[Dict[str, ParamValue]] = None,
+    query: Optional[Dict[str, QueryValue]] = None,
+    fragment: str = "",
+) -> str:
+    """Build a URL from a path pattern, path params, query dict and fragment."""
+    if params:
+        for key, value in params.items():
+            path = path.replace(f":{key}", str(value))
+
+    query_string = ""
+    if query:
+        clean_query = {k: str(v) for k, v in query.items() if v is not None}
+        if clean_query:
+            query_string = urlencode(clean_query)
+
+    parsed = urlparse(path)
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            query_string,
+            fragment or "",
+        )
+    )
+
+
+def parse_location(url: str) -> Dict[str, object]:
+    """Split ``url`` into ``{"url", "path", "query", "fragment"}``."""
+    parsed = urlparse(url or "/")
+    query = {k: (v[0] if v else "") for k, v in parse_qs(parsed.query).items()}
+    return {
+        "url": url or "/",
+        "path": parsed.path or "/",
+        "query": query,
+        "fragment": parsed.fragment,
+    }
+
+
 @dataclass
 class NavService:
+    """Per-session navigation state (``hooks.get_service("nav_service", ...)``).
+
+    ``navigate`` is installed by a mounted :func:`Router`; ``go`` works with or
+    without one (before a Router mounts it just commits the URL so the Router
+    picks it up as its initial location).
+    """
+
     subs: list[Callable[[str], None]] = field(default_factory=list)
     navigate: Optional["NavigateFn"] = None
     current: str = "/"
@@ -58,6 +107,19 @@ class NavService:
         """Get path portion of current URL (without query or fragment)"""
         parsed = urlparse(self.current)
         return parsed.path
+
+    def go(
+        self,
+        path: str,
+        params: Optional[Dict[str, ParamValue]] = None,
+        query: Optional[Dict[str, QueryValue]] = None,
+        fragment: str = "",
+    ) -> None:
+        """Navigate via the Router if mounted, else commit the URL directly."""
+        if callable(self.navigate):
+            self.navigate(path, params, query, fragment)
+        else:
+            self.commit(build_url(path, params, query, fragment))
 
     def commit(self, final_url: str) -> None:
         """Set current URL and notify subscribers."""

@@ -3,7 +3,6 @@ from typing import (
     Optional,
     Union,
 )
-from urllib.parse import urlencode, urlparse, urlunparse
 import warnings
 from pyreact.core.core import component, hooks
 from pyreact.core.provider import create_context
@@ -13,12 +12,16 @@ from .nav_service import (
     NavigateOptions,
     ParamValue,
     QueryValue,
+    build_url,
+    parse_location,
 )
 from .match import matches as route_matches
 
 
 RouteContext = create_context(default="/", name="Route")
 RoutesCatalogContext = create_context(default=[], name="RoutesCatalog")
+# {"url", "path", "query", "fragment"} of the location the Router rendered.
+LocationContext = create_context(default=None, name="Location")
 
 
 def use_routes_catalog():
@@ -28,37 +31,26 @@ def use_routes_catalog():
 def _build_url(
     path: str,
     params: Optional[Dict[str, ParamValue]] = None,
-    query: Optional[Dict[str, QueryValue]] = None,  # noqa: F821
+    query: Optional[Dict[str, QueryValue]] = None,
     fragment: str = "",
 ) -> str:
     """Build a URL with path parameters and query string"""
-    # Replace path parameters like :id with actual values
-    if params:
-        for key, value in params.items():
-            path = path.replace(f":{key}", str(value))
+    return build_url(path, params, query, fragment)
 
-    # Build query string
-    query_string = ""
-    if query:
-        # Filter out None values and convert everything to strings
-        clean_query = {k: str(v) for k, v in query.items() if v is not None}
-        if clean_query:
-            query_string = urlencode(clean_query)
 
-    # Combine everything
-    parsed = urlparse(path)
-    result = urlunparse(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            query_string,
-            fragment,
-        )
-    )
+def use_location() -> Dict[str, object]:
+    """Current location ``{"url", "path", "query", "fragment"}``.
 
-    return result
+    Inside a :func:`Router` this comes from router context, i.e. from the same
+    render pass that produced the route params, so query/fragment and params
+    are always consistent (no tearing during navigation). Outside a Router it
+    falls back to the session's NavService.
+    """
+    loc = hooks.use_context(LocationContext)
+    if loc is None:
+        navsvc = hooks.get_service("nav_service", NavService)
+        loc = parse_location(navsvc.current)
+    return loc
 
 
 def use_route():
@@ -104,9 +96,6 @@ def Router(*, initial=None, children):
 
     hooks.use_effect(_effect_subscribe, [_nav_handler, navsvc])
 
-    # Ensure RouteContext reflects the current initial path on first mount
-    hooks.use_effect(lambda: (RouteContext.set(navsvc.current), None)[1], [navsvc])
-
     # Ensure NavService has a stable navigate function
     def _make_navigate(svc) -> NavigateFn:
         def navigate(
@@ -133,9 +122,10 @@ def Router(*, initial=None, children):
                 path_str = new_path
 
             final_url = _build_url(path_str, params, query, fragment)
-            # Update RouteContext and notify subscribers
-            RouteContext.set(final_url)
-            # Commit and notify NavService subscribers (e.g., Router, server)
+            # Commit and notify NavService subscribers (this Router, server).
+            # The Router rerenders and provides the new location to its
+            # subtree via context; we deliberately do not touch the global
+            # RouteContext value, which is shared by every session.
             svc.commit(final_url)
 
         return navigate
@@ -143,10 +133,14 @@ def Router(*, initial=None, children):
     navigate_fn: NavigateFn = hooks.use_memo(lambda: _make_navigate(navsvc), [navsvc])
     navsvc.navigate = navigate_fn
 
-    # Use the CURRENT path from the service
+    # Snapshot the location ONCE per render; everything below (route
+    # selection, params, query, fragment) derives from this snapshot.
     current_path_only = navsvc.current
+    location = hooks.use_memo(
+        lambda: parse_location(current_path_only), [current_path_only]
+    )
 
-    current_path_for_match = current_path_only.split("?")[0]
+    current_path_for_match = location["path"]
 
     selected_child = None
     for ch in children:
@@ -196,7 +190,14 @@ def Router(*, initial=None, children):
         RouteContext(
             value=current_path_only,
             children=[
-                RoutesCatalogContext(value=routes_catalog, children=selected_children)
+                LocationContext(
+                    value=location,
+                    children=[
+                        RoutesCatalogContext(
+                            value=routes_catalog, children=selected_children
+                        )
+                    ],
+                )
             ],
         )
     ]
