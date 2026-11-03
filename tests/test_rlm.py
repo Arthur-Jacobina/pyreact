@@ -150,10 +150,16 @@ def test_use_rlm_superseded_call_is_cancelled_in_the_worker():
 
     asyncio.run(main())
     assert results == [("len=5", None)]
-    errors = [e.payload["error"] for e in events if e.kind == "llm.error"]
-    assert errors == ["cancelled"]
+    # Unified Call path: a superseded call publishes llm.cancel (like every
+    # other architecture) and its worker thread stops at the next checkpoint.
+    assert [e for e in events if e.kind == "llm.error"] == []
+    cancels = [e for e in events if e.kind == "llm.cancel"]
+    assert len(cancels) == 1
     ends = [e for e in events if e.kind == "llm.end"]
     assert len(ends) == 1
+    assert cancels[0].payload["call_id"] != ends[0].payload["call_id"]
+    old = FakeInterpreter.instances[-2]
+    assert old.shut and old.executed < 4  # stopped before SUBMIT
 
 
 def test_use_rlm_missing_sandbox_surfaces_clear_error(monkeypatch):

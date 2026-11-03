@@ -37,7 +37,7 @@ from pyreact.core.runtime import schedule_rerender, spawn
 from pyreact.tools import Tool, resolve_tools, use_tools
 
 from . import telemetry as tm
-from .dspy_integration import DSPyEnv, _mk_module_key, use_dspy_env
+from .dspy_integration import DSPyEnv
 
 __all__ = [
     "Call",
@@ -48,6 +48,7 @@ __all__ = [
     "use_call",
     "use_stream",
     "use_agent",
+    "use_agent_call",
     "to_dspy_tool",
     "invoke_module",
 ]
@@ -62,10 +63,27 @@ def _sig_key(signature) -> str:
     return signature if isinstance(signature, str) else signature.__name__
 
 
+def _stable(value: Any) -> Any:
+    """Hashable, render-stable fingerprint of an arch kwarg (memo deps)."""
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, Tool):
+        return ("tool", value.name, id(value.fn))
+    if isinstance(value, (list, tuple)):
+        return tuple(_stable(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _stable(v)) for k, v in value.items()))
+    if callable(value) and getattr(value, "__qualname__", None):
+        # inline lambdas are rebuilt every render: key on *what* they are
+        return ("fn", getattr(value, "__module__", None), value.__qualname__)
+    return ("obj", type(value).__name__, id(value))
+
+
 def use_module(
     signature_or_module,
-    module_cls=dspy.Predict,
+    module_cls=None,
     *,
+    arch: Any = None,
     name: Optional[str] = None,
     deps: Optional[list] = None,
     compile_with_optimizer: bool = False,
@@ -75,38 +93,98 @@ def use_module(
     """Memoized DSPy module (``useMemo`` for programs).
 
     - Passing a module instance returns it unchanged (already "memory").
-    - Otherwise builds ``module_cls(signature, **kwargs)`` once and caches it
-      in ``env.caches`` under ``(module_cls.__name__, signature, name)``, where
-      ``name`` defaults to this component's path — so each component instance
-      owns its module unless you share it explicitly by ``name``.
-    - If ``env.compiled`` holds a compiled program for that key (optimizer,
-      GEPA, ...) it is returned instead, transparently.
+    - ``arch=`` picks *how* it thinks -- ``"predict"`` (default), ``"cot"``,
+      ``"react"``, ``"rlm"``, ``"pot"``, ``"refine"``, ``"best_of_n"`` or any
+      name from :func:`integrations.architectures.register_architecture`;
+      ``**kwargs`` go to the architecture (``tools=``, ``max_iters=``,
+      ``max_iterations=``, ``sub_model=``, ``N=`` ...). Changing ``arch``
+      (e.g. from a prop) builds the other program on the next render.
+      ``tools`` may name ToolProvider tools; ``sub_model`` names a
+      ``DSPyProvider`` model (resolved to ``sub_lm``).
+    - Legacy: ``use_module(sig, dspy.ChainOfThought)`` (a module class).
+    - Built once and cached in ``env.caches`` under ``(cache_key, signature,
+      scope)`` -- e.g. ``("ChainOfThought", "q -> a", "App/QA#qa")`` --
+      where scope is ``name`` or this component's path, so each component
+      instance owns its module unless you share it explicitly by ``name``.
+    - If ``env.compiled`` holds a compiled/optimized program for that key
+      (optimizer, GEPA, ``OptimizationResult.hot_swap``) it is returned
+      instead, transparently.
     - ``deps``: rebuild when changed (e.g. new demos / instructions).
     """
     if isinstance(signature_or_module, dspy.Module):
         return signature_or_module
 
-    env = use_dspy_env()
+    from . import architectures as A
+
+    # Works without a DSPyProvider too (lm=... on the call): modules then live
+    # in a component-local store. Both hooks always run (stable hook order).
+    provided = hooks.use_context(_dspy_ctx())
+    local_env = hooks.use_memo(DSPyEnv, [])
+    env = provided if provided is not None else local_env
     ctx = _context_stack.get()
+    registry = use_tools()
+
+    if arch is None and module_cls is None:
+        arch = "predict"
+    legacy = arch is None
+    if legacy:
+        factory, prefix, arch_name = module_cls, module_cls.__name__, None
+        a = A._arch_for_class(module_cls)
+        arch_name = a.name if a is not None else module_cls.__name__
+    elif isinstance(arch, str):
+        a = A.get_architecture(arch)
+        factory, prefix, arch_name = a.factory, a.cache_key, a.name
+    elif isinstance(arch, type):
+        a = A._arch_for_class(arch)
+        factory, prefix = arch, arch.__name__
+        arch_name = a.name if a is not None else arch.__name__
+    elif callable(arch):
+        factory = arch
+        prefix = arch_name = getattr(arch, "__name__", "custom")
+    else:
+        raise TypeError(f"arch must be a name, a dspy.Module class or a factory, got {arch!r}")
+
+    build_kw = dict(kwargs)
+    if not legacy:
+        if "tools" in build_kw:
+            build_kw["tools"] = resolve_tools(build_kw["tools"], registry)
+        sub_model = build_kw.pop("sub_model", None)
+        if sub_model is not None:
+            if sub_model not in env.models:
+                raise KeyError(
+                    f"sub_model {sub_model!r} not in DSPyProvider models ({sorted(env.models)})"
+                )
+            build_kw["sub_lm"] = env.models[sub_model]
+
     if _key is None:
         scope = name if name is not None else tm.component_path(ctx)
-        key = _mk_module_key(module_cls, signature_or_module, scope)
-        if kwargs:
+        key = (prefix, _sig_key(signature_or_module), scope)
+        if legacy and kwargs:
             key = key + (repr(sorted(kwargs.items())),)
     else:
         key = _key
     deps_key = tuple(deps) if deps is not None else None
+    kw_sig = None if legacy else _stable(build_kw)
 
     def _factory():
         cached = env.caches.get(key)
-        if cached is not None and deps is None:
+        if (cached is not None and deps is None
+                and (legacy or getattr(cached, "_pyreact_kw_sig", kw_sig) == kw_sig)):
             return cached
-        mod = module_cls(signature_or_module, **kwargs)
-        mod._pyreact_name = name or f"{module_cls.__name__}({_sig_key(signature_or_module)})"
+        mod = factory(signature_or_module, **build_kw)
+        label = getattr(factory, "__name__", None) if legacy else arch_name
+        try:
+            mod._pyreact_name = name or f"{label}({_sig_key(signature_or_module)})"
+            mod._pyreact_key = key
+            mod._pyreact_arch = arch_name
+            mod._pyreact_signature = signature_or_module
+            mod._pyreact_kw_sig = kw_sig
+        except Exception:
+            pass
         env.caches[key] = mod
         return mod
 
-    mod = hooks.use_memo(_factory, deps=[key, deps_key, id(env.caches)])
+    mod = hooks.use_memo(_factory, deps=[key, deps_key, id(env.caches), kw_sig])
 
     if compile_with_optimizer and env.optimizer is not None:
         _use_compile(env, key, mod, ctx)
@@ -151,6 +229,28 @@ def use_predict(signature, *, name: Optional[str] = None, **kwargs):
 
 def use_chain_of_thought(signature, *, name: Optional[str] = None, **kwargs):
     return use_module(signature, dspy.ChainOfThought, name=name, **kwargs)
+
+
+def use_agent_call(
+    signature,
+    *,
+    arch: Any = "predict",
+    model: Optional[str] = None,
+    lm: Optional[Any] = None,
+    policy: str = "replace",
+    name: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    deps: Optional[list] = None,
+    **arch_kwargs,
+) -> "Call":
+    """One-liner: ``use_call(use_module(signature, arch=arch, **arch_kwargs))``.
+
+    Same :class:`Call` shape for every architecture (``run``/``submit``/
+    ``cancel``, ``result``/``ver``/``loading``/``error``/``usage``), same
+    ``llm.*`` events, same cancellation -- switch ``arch`` like a prop.
+    """
+    mod = use_module(signature, arch=arch, name=name, deps=deps, **arch_kwargs)
+    return use_call(mod, model=model, lm=lm, policy=policy, name=name, turn_id=turn_id)
 
 
 # ---------------------------------------------------------------------------
@@ -226,24 +326,44 @@ async def invoke_module(
     turn_id: Optional[str] = None,
     stream_fields: Optional[Sequence[str]] = None,
     on_chunk: Optional[Callable[[str, str, bool], None]] = None,
+    call_id: Optional[str] = None,
+    debug: Optional[bool] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Run one module call with per-call settings and publish llm.* events.
 
-    Returns ``(result, usage)``. Usable outside components too (scripts,
+    Returns ``(result, usage)`` (``usage["call_id"]`` identifies the call for
+    ``explain`` / feedback). Usable outside components too (scripts,
     evaluation). On failure the exception gets a ``usage`` attribute.
+
+    Architectures with a custom runner (e.g. ``rlm``: worker thread +
+    cooperative cancellation) are awaited through it; everything else via
+    ``acall``. The LM history of the call (prompts + completions) is kept in
+    a small in-memory buffer for :func:`integrations.learn.explain`; with
+    ``debug=True`` (or ``telemetry.set_debug(True)``) it is also attached to
+    ``llm.end`` as ``lm_calls``.
     """
+    from .architectures import arch_of, runner_of
+
     if lm is None and getattr(dspy.settings, "lm", None) is None:
         raise RuntimeError(
             "No language model configured: mount DSPyProvider(lm=... or models={'default': ...}) "
             "or pass lm=... to the hook."
         )
     label = _module_label(module, name)
-    call_id = tm.new_call_id()
+    call_id = call_id or tm.new_call_id()
     if turn_id is None:
         turn_id = tm.current_turn_id()
     model = tm.model_name(lm if lm is not None else dspy.settings.lm)
+    mkey = getattr(module, "_pyreact_key", None)
+    arch = arch_of(module)
     base = {"call_id": call_id, "module": label, "component": component, "model": model}
+    if mkey is not None:
+        from .feedback import key_str
+
+        base["module_key"] = key_str(mkey)
     pub = functools.partial(tm.publish, turn_id=turn_id, source=component)
+    runner = runner_of(module)
+    debug = tm.DEBUG if debug is None else debug
 
     recorder = tm.UsageRecorder()
     overrides: Dict[str, Any] = {
@@ -263,22 +383,46 @@ async def invoke_module(
     def _status(message):
         pub("llm.status", {"call_id": call_id, "module": label, "message": message})
 
-    pub("llm.start", {**base, "inputs": tm.brief(inputs), "stream": bool(stream_fields)})
+    def _record(result=None, error=None, latency=None):
+        lm_calls = tm.lm_calls_of(recorder.history)
+        tm.record_call({
+            "call_id": call_id, "module": label, "module_key": base.get("module_key"),
+            "arch": arch, "component": component, "turn_id": turn_id, "model": model,
+            "inputs": tm.brief(inputs, 4000), "outputs": tm.outputs_of(result),
+            "error": error, "latency": latency, "lm_calls": lm_calls, "ts": time.time(),
+        })
+        return lm_calls
+
+    pub("llm.start", {**base, "arch": arch, "inputs": tm.brief(inputs),
+                      "input_chars": _input_chars(inputs), "stream": bool(stream_fields)})
     token = tm.enter_scope(tm.CallScope(call_id, label, component, turn_id))
     t0 = time.perf_counter()
+    extra: Dict[str, Any] = {}
     try:
         with dspy.context(**overrides):
-            if stream_fields:
+            if runner is not None:
+                result, extra = await runner(
+                    module, inputs, call_id=call_id,
+                    publish=lambda kind, payload: pub(kind, {"module": label, **payload}),
+                )
+                extra = dict(extra or {})
+            elif stream_fields:
                 result = await _stream_call(module, inputs, stream_fields, _chunk, _status)
             else:
                 result = await _plain_call(module, inputs)
     except asyncio.CancelledError:
+        _record(error="cancelled", latency=time.perf_counter() - t0)
         pub("llm.cancel", {**base, "latency": time.perf_counter() - t0})
         raise
     except Exception as exc:
         usage = recorder.summary()
-        pub("llm.error", {**base, "latency": time.perf_counter() - t0, "usage": usage,
-                          "cost": usage["cost"], "error": repr(exc)})
+        usage["call_id"] = call_id
+        lm_calls = _record(error=repr(exc), latency=time.perf_counter() - t0)
+        payload = {**base, "latency": time.perf_counter() - t0, "usage": usage,
+                   "cost": usage["cost"], "error": repr(exc)}
+        if debug:
+            payload["lm_calls"] = lm_calls
+        pub("llm.error", payload)
         try:
             exc.usage = usage
         except Exception:
@@ -288,9 +432,18 @@ async def invoke_module(
         tm.exit_scope(token)
     usage = recorder.summary()
     usage["latency"] = time.perf_counter() - t0
-    pub("llm.end", {**base, "latency": usage["latency"], "usage": usage,
-                    "cost": usage["cost"], "outputs": tm.outputs_of(result)})
+    usage["call_id"] = call_id
+    lm_calls = _record(result=result, latency=usage["latency"])
+    payload = {**base, **extra, "latency": usage["latency"], "usage": usage,
+               "cost": usage["cost"], "outputs": tm.outputs_of(result)}
+    if debug:
+        payload["lm_calls"] = lm_calls
+    pub("llm.end", payload)
     return result, usage
+
+
+def _input_chars(inputs: dict) -> int:
+    return sum(len(v) if isinstance(v, str) else len(str(v)) for v in inputs.values())
 
 
 @dataclass(frozen=True)
@@ -314,6 +467,11 @@ class Call:
 
     def __iter__(self):  # legacy tuple-unpacking: run, (result, ver), loading, error
         return iter((self.run, (self.result, self.ver), self.loading, self.error))
+
+    @property
+    def call_id(self) -> Optional[str]:
+        """Id of the last settled call (for ``explain`` / ``send_feedback``)."""
+        return (self.usage or {}).get("call_id")
 
 
 @dataclass(frozen=True)
@@ -386,6 +544,7 @@ def _use_call_machine(
         "component": tm.component_path(ctx),
         "stream_fields": stream_fields,
         "throttle": throttle,
+        "debug": (env.settings.get("debug") if env is not None else None) or None,
     }
 
     def _mount():
@@ -406,7 +565,7 @@ def _use_call_machine(
             return False
         return ref["cfg"]["policy"] == "parallel" or ref["latest"] is task
 
-    async def _do(inputs: dict, cfg: dict, turn: Optional[str]):
+    async def _do(inputs: dict, cfg: dict, turn: Optional[str], call_id: Optional[str] = None):
         me = asyncio.current_task()
         loop = asyncio.get_running_loop()
         partial: Dict[str, str] = {}
@@ -440,6 +599,7 @@ def _use_call_machine(
                     name=cfg["name"], component=cfg["component"], turn_id=turn,
                     stream_fields=cfg["stream_fields"],
                     on_chunk=_on_chunk if cfg["stream_fields"] else None,
+                    call_id=call_id, debug=cfg["debug"],
                 )
             except Exception as exc:
                 result, usage, err = None, getattr(exc, "usage", None), exc
@@ -463,6 +623,7 @@ def _use_call_machine(
                   "partial": dict(partial)})
 
     def _submit(**inputs) -> Optional[asyncio.Task]:
+        call_id = inputs.pop("_call_id", None)  # internal: caller-chosen id
         cfg = ref["cfg"]
         pol = cfg["policy"]
         inflight = [t for t in ref["tasks"] if not t.done()]
@@ -475,7 +636,8 @@ def _use_call_machine(
         turn = cfg["turn_id"] if cfg["turn_id"] is not None else tm.current_turn_id()
         dispatch({"type": "start"})
         task = spawn(
-            _do(inputs, cfg, turn), owner=ctx, turn=turn, name=f"dspy_call:{tm.component_path(ctx)}"
+            _do(inputs, cfg, turn, call_id), owner=ctx, turn=turn,
+            name=f"dspy_call:{tm.component_path(ctx)}"
         )
         ref["latest"] = task
         ref["tasks"].add(task)

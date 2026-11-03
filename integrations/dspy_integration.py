@@ -50,6 +50,8 @@ class DSPyEnv:
         return dspy.context(**overrides) if overrides else nullcontext()
 
 
+ENVS_SERVICE = "dspy_envs"  # session service: {provider path: DSPyEnv}
+
 # Create DSPy context - will be automatically managed by create_context
 DSPyContext = create_context(default=None, name="DSPy")
 
@@ -118,6 +120,16 @@ def DSPyProvider(
             id(adapter),
         ],
     )
+    # Make the env discoverable from outside the tree (dev tools, hot swap by
+    # key): ``session.services["dspy_envs"][provider_path] = env``.
+    try:
+        from pyreact.core.core import _context_stack
+
+        from .telemetry import component_path
+
+        hooks.get_service(ENVS_SERVICE, dict)[component_path(_context_stack.get())] = env
+    except Exception:
+        pass
     return [DSPyContext(value=env, children=children or [])]
 
 
