@@ -18,6 +18,20 @@ class _HookProxy:
 hooks = _HookProxy()
 
 
+def use_path() -> str:
+    """The calling component's stable path (``HookContext.path``, e.g.
+    ``App/Chat[chat]``; providers add no segment). Same as ``hooks.path``.
+
+    Call it during render (or in an effect / cleanup, which also run "as" the
+    component) and keep the string: closures and tasks that run later can use
+    it without reaching into the render stack.
+    """
+    comp = _context_stack.get()
+    if comp is None:
+        raise RuntimeError("use_path() can only be used during render or effect.")
+    return comp.path
+
+
 class VNode:
     def __init__(self, component_fn, props=None, key=None):
         self.component_fn = component_fn

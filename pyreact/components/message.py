@@ -6,8 +6,7 @@ import json
 import time
 from typing import Literal, Optional
 
-import pyreact.core.core as _core
-from pyreact.core.core import component, hooks
+from pyreact.core.core import component, hooks, use_path
 from pyreact.core.events import EventBus
 from pyreact.core.message_buffer import MessageBuffer
 
@@ -67,11 +66,11 @@ def Message(
 
     ``legacy`` overrides the global legacy-bridge flag.
     """
-    from pyreact.observability._base import component_path, current_turn_id
+    from pyreact.observability._base import current_turn_id
 
     bus = hooks.get_service("event_bus", EventBus)
     console = hooks.get_service("console_buffer", MessageBuffer)
-    ctx = _core._context_stack.get()
+    source = use_path()
     if trigger == "mount":
         deps = []
     elif trigger == "turn":
@@ -90,7 +89,7 @@ def Message(
             "message",
             payload,
             turn_id=current_turn_id(),
-            source=component_path(ctx),
+            source=source,
         )
         if _legacy_bridge if legacy is None else legacy:
             console.append(legacy_line(payload))

@@ -4,7 +4,7 @@ from .provider import create_context
 from .runtime import schedule_rerender, run_renders
 from .core import VNode
 from .message_buffer import MessageBuffer
-from .core import component, hooks
+from .core import component, hooks, use_path
 from .events import Event, EventBus
 from .turns import Turn, TurnManager, use_turn
 from .turn_hooks import use_on_turn
@@ -22,6 +22,7 @@ __all__ = [
     "MessageBuffer",
     "component",
     "hooks",
+    "use_path",
     "Event",
     "EventBus",
     "Turn",
