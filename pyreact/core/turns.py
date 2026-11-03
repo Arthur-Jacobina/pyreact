@@ -42,7 +42,7 @@ import itertools
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Deque, Dict, List, Literal, Optional, Protocol
 
 from . import runtime
@@ -325,6 +325,36 @@ class TurnManager:
         self._results.pop(turn.id, None)
         self.enqueue(turn)
         return turn
+
+    # ------------------------------------------------------------------
+    # dehydrate / hydrate (snapshot["turns"])
+    # ------------------------------------------------------------------
+    def dehydrate(self, *, carry: Any = ()) -> Dict[str, Any]:
+        """The turns part of a snapshot: ``{"next_index", "policy", "carry"}``.
+
+        ``carry`` (turns a suspend cut short, e.g. the interrupted active one)
+        come first, then the queued turns that never started; each is the
+        Turn's fields (no ``resumed``). Must run on the render loop."""
+        seen, out = set(), []
+        for t in [*carry, *self._queue]:
+            if t.id not in seen:
+                seen.add(t.id)
+                out.append({k: v for k, v in asdict(t).items() if k != "resumed"})
+        return {"next_index": self.next_index(), "policy": self.policy, "carry": out}
+
+    def hydrate(self, state: Optional[Dict[str, Any]]) -> List[Turn]:
+        """Restore numbering from a snapshot's ``turns`` and return its carried
+        turns as ``resumed`` turns (same ids), to :meth:`enqueue` once the
+        tree is mounted."""
+        state = state or {}
+        self.advance_to(int(state.get("next_index") or 1))
+        turns = []
+        for t in state.get("carry") or []:
+            turn = Turn(**{k: v for k, v in t.items() if k in Turn.__dataclass_fields__})
+            turn = replace(turn, resumed=True, ts=time.time())
+            self.advance_to(turn.index + 1)
+            turns.append(turn)
+        return turns
 
     def interrupt(self) -> None:
         """Ask the active turn to give way: its interruptible tasks (those
