@@ -288,10 +288,6 @@ sandboxes reached their final state (the dehydrate awaits the closes).
 `use_sandbox` in the calling component (slice `"sandbox"` / `"sandbox:<key>"`).
 Under a hidden `Activity` sandboxes keep running.
 
-`SandboxParticipant` is deprecated (a `DeprecationWarning`); it still works
-with the legacy `session.suspend()` / `app.resume(id)` (`mode=` overrides the
-suspend policy, the fragment lists the sandboxes as before).
-
 ## Integrations
 
 **RLM in Docker** — `SandboxInterpreter(sandbox_or_handle)` implements dspy's

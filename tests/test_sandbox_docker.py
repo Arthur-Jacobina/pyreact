@@ -303,37 +303,3 @@ def test_root_hydrate_with_a_lost_snapshot_boots_fresh(docker, tmp_path):
             r.unmount()
             wait_closed(60)
 
-
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-def test_deprecated_participant_suspend_resume_still_works(docker, tmp_path):
-    from pyreact.boot import AppRunner, DirectoryManifestStore
-    from pyreact_sandbox.react import wait_closed
-
-    def make():
-        return AppRunner(_shell_app(docker, "destroy"), default_session=False,
-                         participants=[lambda s: ps.SandboxParticipant(s, mode="snapshot")],
-                         manifest_store=DirectoryManifestStore(tmp_path / "m"))
-
-    app = make()
-    try:
-        s = app.open_session("dk")
-        s.invoke("sh -c 'echo persisted > /tmp/state.txt'", wait=True, timeout=120)
-        m = s.suspend()
-        [rec] = m["participants"]["sandbox"]["sandboxes"]
-        assert rec["snapshot"]["id"].startswith("pyreact-sandbox:")
-    finally:
-        app.shutdown()
-        wait_closed(60)
-
-    app = make()
-    try:
-        texts = []
-        app.on_session(open=lambda sess: sess.event_bus.subscribe(
-            lambda ev: texts.append(ev.payload["text"]), ["message"]))
-        r = app.resume("dk")
-        r.invoke("cat /tmp/state.txt", wait=True, timeout=120)
-        assert texts == ["persisted"] and r.degraded == []
-        app.close_session("dk")
-    finally:
-        app.shutdown()
-        wait_closed(60)
