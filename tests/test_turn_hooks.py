@@ -79,3 +79,31 @@ def test_message_trigger_turn_publishes_once_per_turn(run_app):
         ("got hi", ids[0]), ("got hi", ids[1]), ("got yo", ids[2])]
     # the default (trigger="change") dedupes equal text across turns
     assert [m[0] for m in msgs if m[0].startswith("seen")] == ["seen hi", "seen yo"]
+
+
+def test_since_mount_skips_the_turn_that_mounted_the_component(run_app):
+    seen = {"default": [], "since": [], "handled": []}
+
+    @component
+    def Panel():
+        seen["default"].append(getattr(use_turn(), "text", None))
+        seen["since"].append(getattr(use_turn(since_mount=True), "text", None))
+        use_on_turn(lambda t: seen["handled"].append(t.text), since_mount=True)
+        return []
+
+    @component
+    def App():
+        turn = use_turn()
+        # "open" mounts the panel; it stays mounted afterwards
+        opened, set_opened = hooks.use_state(False)
+        hooks.use_effect(lambda: turn and turn.text == "open" and set_opened(True),
+                         [turn and turn.id])
+        return [Panel(key="panel")] if opened else []
+
+    app = run_app(App)
+    app.invoke("open", wait=True, timeout=5)
+    assert seen["default"][-1] == "open"   # default: gets the in-flight turn
+    assert set(seen["since"]) == {None}    # since_mount: nothing yet
+    assert seen["handled"] == []
+    app.invoke("next", wait=True, timeout=5)
+    assert seen["since"][-1] == "next" and seen["handled"] == ["next"]

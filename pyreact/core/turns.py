@@ -427,11 +427,21 @@ def get_turn_manager() -> TurnManager:
     return hooks.get_service("turns", TurnManager)
 
 
-def use_turn(policy: Optional[TurnPolicy] = None) -> Optional[Turn]:
+def use_turn(
+    policy: Optional[TurnPolicy] = None, *, since_mount: bool = False
+) -> Optional[Turn]:
     """Latest Turn of this app/session; rerenders on every new turn.
 
     ``policy`` (``"queue"``/``"interrupt"``) overrides the app's turn policy
     for tasks spawned by this component and its descendants.
+
+    ``since_mount``: by default a newly mounted component immediately gets
+    the session's latest turn -- usually the one *in flight* that caused it to
+    mount (what a child mounted to answer this input wants). With
+    ``since_mount=True`` it returns ``None`` until a turn starts after the
+    component mounted, so a conditionally mounted component (a page shown by
+    a navigation, a panel opened by a command) does not handle the input that
+    mounted it again.
     """
     from .core import _context_stack, hooks
 
@@ -443,12 +453,15 @@ def use_turn(policy: Optional[TurnPolicy] = None) -> Optional[Turn]:
             ctx._turn_policy = policy
 
     tm = get_turn_manager()
-    turn, set_turn = hooks.use_state(tm.latest)
+    at_mount = hooks.use_ref(tm.latest)  # latest turn when we mounted
+    turn, set_turn = hooks.use_state(None if since_mount else tm.latest)
 
     def _subscribe():
         un = tm.subscribe(set_turn)
-        if tm.latest is not None:
-            set_turn(tm.latest)  # catch a turn that started before we subscribed
+        latest = tm.latest
+        # catch a turn that started before we subscribed
+        if latest is not None and not (since_mount and latest is at_mount.current):
+            set_turn(latest)
         return un
 
     hooks.use_effect(_subscribe, [id(tm)])
