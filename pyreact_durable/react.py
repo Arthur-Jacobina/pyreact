@@ -32,6 +32,7 @@ from pyreact.core import (
     component,
     create_context,
     hooks,
+    is_updater,
     use_cleanup_reason,
     use_dehydrate,
     use_event,
@@ -490,12 +491,13 @@ def use_persistent_state(initial: Any, *, key: str):
     ``use_state`` (and warns once).
 
     Returns ``(value, set_value)``; ``set_value`` accepts a value or a
-    function of the previous value.
+    function of the previous value (an updater: see
+    :func:`pyreact.core.is_updater`).
     """
     box, commit = _use_box("use_persistent_state", key, lambda: initial)
 
-    def set_value(val):
-        commit(lambda cur: val(cur) if callable(val) else val)
+    def set_value(val):  # functions are updaters; callable objects are values
+        commit(lambda cur: val(cur) if is_updater(val) else val)
 
     setter = hooks.use_callback(set_value, [])
     return box["value"], setter

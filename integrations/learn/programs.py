@@ -396,7 +396,7 @@ def _use_learned_provider(declared: Mapping[str, Any], *, watch: bool, interval:
     if sig != st["declared"]:  # the prop changed: it wins (a re-render = the swap)
         st["declared"] = sig
         programs = dict(declared)
-        set_programs(lambda _old: programs)
+        set_programs(programs)
     outer = hooks.use_context(LearnedContext)
 
     # the handle outside code (hot_swap, :optimize) and use_learned_registry use

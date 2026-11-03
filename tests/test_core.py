@@ -303,3 +303,47 @@ def test_message_source_is_the_component_path(tmp_path):
     finally:
         app.shutdown()
     assert ev.source == "App/Message[hello]"
+
+
+def test_set_state_calls_functions_but_stores_callable_objects():
+    import functools
+
+    from pyreact.core import is_updater
+
+    class Program:  # like a dspy.Module: callable, but a value
+        def __call__(self, *a, **kw):
+            raise AssertionError("set_state must not call a callable object")
+
+    calls = []
+
+    def lazy():
+        calls.append("init")
+        return 1
+
+    seen, setters = [], {}
+
+    @component
+    def App():
+        n, set_n = hooks.use_state(lazy)  # a function: lazy initializer
+        prog, set_prog = hooks.use_state(Program)  # a class: stored, not instantiated
+        setters.update(n=set_n, prog=set_prog)
+        seen.append((n, prog))
+        return []
+
+    p = Program()
+
+    async def main():
+        await _mount(App)
+        setters["n"](lambda v: v + 1)  # lambda: updater
+        await _flush()
+        setters["n"](functools.partial(lambda k, v: v * k, 10))  # partial: updater
+        await _flush()
+        setters["prog"](p)  # a callable object: the new value
+        await _flush()
+
+    asyncio.run(main())
+    assert calls == ["init"]  # once, on mount
+    assert seen[0] == (1, Program)
+    assert seen[-1] == (20, p)
+    assert is_updater(lambda: 0) and is_updater(len) and is_updater(p.__call__)
+    assert not is_updater(p) and not is_updater(Program) and not is_updater(3)
