@@ -3,8 +3,9 @@
 Everything here is built on pyreact's *public* surface only:
 ``hooks.use_state / use_ref / use_memo / use_effect / use_callback /
 use_context``,
-``hooks.provide``, ``hooks.path`` / ``hooks.full_path``, ``hooks.get_service`` and the session's
-``EventBus``. Nothing in ``pyreact`` knows this module exists.
+``hooks.provide``, ``hooks.path`` / ``hooks.full_path``, ``hooks.get_service``,
+``use_dehydrate`` / ``use_cleanup_reason`` and the session's ``EventBus``.
+Nothing in ``pyreact`` knows this module exists.
 
     @component
     def App():
@@ -26,7 +27,15 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from pyreact.core import TurnManager, component, create_context, hooks, use_event
+from pyreact.core import (
+    TurnManager,
+    component,
+    create_context,
+    hooks,
+    use_cleanup_reason,
+    use_dehydrate,
+    use_event,
+)
 
 from .log import SessionLog, archive_log, delete_log, kind_matches, safe_session_id
 
@@ -99,22 +108,73 @@ def _open(log: Any, log_factory: Optional[Callable[[str], Any]], session_id: str
     raise TypeError(f"Durable: unsupported log {src!r}")
 
 
-# Session services shared with pyreact_durable.stateful.DurableParticipant.
-LOGS_SERVICE = "pyreact_durable.logs"        # {resolved path: SessionLog} of mounted providers
-RESTORE_SERVICE = "pyreact_durable.restore"  # {resolved path: {"leaf": id}} from a manifest
+# Deprecated: {resolved path: {"leaf": id}} filled by DurableParticipant from a
+# manifest written before Durable dehydrated itself (read for one release).
+RESTORE_SERVICE = "pyreact_durable.restore"
 
 
 def _log_key(slog: SessionLog) -> str:
     return str(Path(slog.path).resolve())
 
 
-def _apply_restore(slog: SessionLog, restore: Dict[str, Any]) -> None:
-    """Put the log back at the leaf a manifest recorded (resume): the state
-    the children restore on their first render is the suspended one."""
-    rec = restore.pop(_log_key(slog), None) if restore else None
-    leaf = (rec or {}).get("leaf")
+def _checkout(slog: SessionLog, leaf: Optional[str]) -> None:
     if leaf and leaf != slog.leaf and leaf in slog.by_id and not slog.readonly:
         slog.checkout(leaf)
+
+
+def _log_record(slog: SessionLog, turns: Any) -> Dict[str, Any]:
+    """The provider's slice: where its log is and where its leaf was."""
+    store = getattr(turns, "store", None)
+    pending: List[str] = []
+    if getattr(store, "log", None) is slog and not slog.closed:
+        pending = [t.id for t in store.pending()]
+    return {"path": _log_key(slog), "log_id": slog.id, "leaf": slog.leaf,
+            "entries": len(slog.entries), "version": slog.version,
+            "pending_turns": pending}
+
+
+class LogHydrationError(RuntimeError):
+    """The log a snapshot points at cannot be reopened as it was."""
+
+
+def _degrade(session: Any, reason: str, **info: Any) -> None:
+    fn = getattr(session, "degrade", None)
+    if callable(fn):
+        try:
+            fn("durable", reason, **info)
+        except Exception:
+            pass
+
+
+def _check_record(rec: Any, session: Any) -> Optional[Dict[str, Any]]:
+    """``hydrate`` of the provider's slice: the log must still be there and
+    be the same log (header id). A leaf no longer in it is dropped (the log
+    opens at its current leaf). Raising makes it a ``hydration.mismatch``
+    (the provider then opens its log as usual, a fresh one if it is gone)."""
+    if not isinstance(rec, dict) or not rec.get("path"):
+        return None
+    path = Path(rec["path"])
+    if not path.exists():
+        _degrade(session, "log missing", path=str(path))
+        raise LogHydrationError(f"log missing: {path}")
+    try:
+        log = SessionLog.open(path, readonly=True)
+    except Exception as exc:
+        _degrade(session, "log unreadable", path=str(path), error=f"{type(exc).__name__}: {exc}")
+        raise LogHydrationError(f"log unreadable: {path} ({exc})") from exc
+    try:
+        if rec.get("log_id") and log.id != rec["log_id"]:
+            _degrade(session, "log replaced", path=str(path), expected=rec["log_id"],
+                     found=log.id)
+            raise LogHydrationError(f"log replaced: {path} (header {log.id}, "
+                                    f"expected {rec['log_id']})")
+        leaf = rec.get("leaf")
+        if leaf and leaf not in log.by_id:
+            _degrade(session, "leaf missing", path=str(path), leaf=leaf)
+            rec = {**rec, "leaf": None}
+    finally:
+        log.close()
+    return dict(rec)
 
 
 def _jsonable(obj: Any) -> Any:
@@ -197,6 +257,14 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
     highest turn index journaled in the log (``TurnManager.advance_to``), so
     turn ids (``t1``, ``t2``, ...) are not reused across restarts.
 
+    Suspend / hydrate (ADR 0001): the provider dehydrates a reference to its
+    log (``use_dehydrate("log")``: ``{path, log_id, leaf, entries, version,
+    pending_turns}``), so ``root.suspend()`` carries it and ``hydrate_root``
+    reopens the log at that leaf before the children's first render. A log
+    that is gone or was replaced is a ``hydration.mismatch`` (and
+    ``session.resume.degraded``): the provider opens its log as usual. Under
+    a hidden ``Activity`` the log stays open.
+
     - ``resume_turns`` (default ``True``, needs ``turn.*`` in ``journal``):
       attach a :class:`~pyreact_durable.turns.DurableTurnStore` to the
       session's ``TurnManager`` (unless it has a store already), so turns
@@ -211,16 +279,33 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
     # Keyed on the log identity / path and the session, not on the factory's
     # identity (an inline lambda is a new object every render).
     log_src = log if isinstance(log, SessionLog) else (str(log) if log is not None else None)
-    restore = hooks.get_service(RESTORE_SERVICE, dict)
-    registry = hooks.get_service(LOGS_SERVICE, dict)
+    turns = hooks.get_service("turns", TurnManager)
+    # The provider's own state: a reference to its log (ADR 0001). A suspend
+    # dehydrates it ({path, log_id, leaf, entries, version, pending_turns});
+    # hydrate_root reopens the log at that leaf before the children render.
+    live = hooks.use_ref(None)  # {"log": SessionLog, "record": captured at suspend}
+    hydrated = use_dehydrate(
+        "log",
+        dehydrate=lambda: (live.current or {}).get("record") or _log_record(
+            live.current["log"], turns),
+        hydrate=lambda rec: _check_record(rec, session),
+    )
 
     def _open_and_restore():
         slog, owned = _open(log, log_factory, sid)
-        _apply_restore(slog, restore)
+        legacy = hooks.get_service(RESTORE_SERVICE, dict).pop(_log_key(slog), None)
+        rec = hydrated if live.current is None else None  # first open only
+        if rec and rec.get("path") != _log_key(slog):
+            _degrade(session, "log moved", path=_log_key(slog), expected=rec.get("path"))
+        elif rec:
+            _checkout(slog, rec.get("leaf"))
+        elif legacy:
+            _checkout(slog, legacy.get("leaf"))
         return slog, owned
 
     opened = hooks.use_memo(_open_and_restore, [log_src, log_factory is None, sid])
     slog, owned = opened
+    live.current = {"log": slog, "record": None}
 
     gen, set_gen = hooks.use_state(0)
     retention = hooks.use_ref(None)
@@ -228,6 +313,11 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
 
     def _own():
         def _close():
+            reason = use_cleanup_reason()
+            if reason == "hidden":  # Activity: keep the log open, state is kept
+                return
+            if reason == "suspend":  # the tree is about to be dehydrated
+                live.current = {"log": slog, "record": _log_record(slog, turns)}
             if not owned:
                 return
             slog.close()
@@ -239,13 +329,6 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
         return _close
 
     hooks.use_effect(_own, [slog])
-
-    def _register():  # so a DurableParticipant can checkpoint this log
-        key = _log_key(slog)
-        registry[key] = slog
-        return lambda: registry.get(key) is slog and registry.pop(key, None)
-
-    hooks.use_effect(_register, [slog])
 
     def _watch():
         return slog.subscribe(lambda _entry, moved: moved and set_gen(lambda g: g + 1))
@@ -263,8 +346,6 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
         )
 
     use_event(kinds, _journal)
-
-    turns = hooks.get_service("turns", TurnManager)
 
     def _continue_turn_ids():
         last = _last_turn_index(slog)

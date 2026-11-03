@@ -4,8 +4,8 @@
 - :mod:`pyreact_durable.react` ``Durable`` provider + persistent hooks
 - :mod:`pyreact_durable.lm`    ``durable_lm`` record/replay at the LM boundary
 - :mod:`pyreact_durable.turns` ``DurableTurnStore``: resume turns cut short by a crash
-- :mod:`pyreact_durable.stateful` ``DurableParticipant``: the logs in a session's
-  suspend manifest (``Session.suspend`` / ``AppRunner.resume``)
+- :mod:`pyreact_durable.stateful` ``DurableParticipant``: deprecated (``Durable``
+  dehydrates its log reference itself, so ``root.suspend()`` carries it)
 
 ``render_tree(log)`` / ``log.render()`` draw the entry tree as text. Only the
 storage layer (and its text rendering) is imported eagerly, so ``from pyreact_durable import
