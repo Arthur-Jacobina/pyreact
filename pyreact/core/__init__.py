@@ -8,6 +8,7 @@ from .core import component, hooks, use_path
 from .events import Event, EventBus
 from .turns import Turn, TurnManager, TurnStore, use_turn
 from .turn_hooks import use_on_turn
+from .io_hooks import use_input
 from . import runtime
 from . import harness
 from . import recovery
@@ -32,6 +33,7 @@ __all__ = [
     "TurnStore",
     "use_turn",
     "use_on_turn",
+    "use_input",
     "runtime",
     "harness",
     "recovery",
