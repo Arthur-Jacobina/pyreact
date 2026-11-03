@@ -12,7 +12,7 @@ OpenTelemetry packages. It plugs in at two points:
 - **Harness middleware** (`pyreact.core.harness.install`): one span per
   boundary call (`turn`, `llm`, `tool`, `sandbox.exec`, ...), plus metrics.
 - **EventBus bridge**: events that are not boundaries (`message`, `error`,
-  `feedback`, `optimize.*`) are attached to the trace they belong to.
+  `feedback`, `optimize.*`, `session.*`) are attached to the trace they belong to.
 
 ```bash
 pip install 'pyreact[otel]'      # or: uv sync --extra otel
@@ -26,7 +26,7 @@ import pyreact_otel
 otel = pyreact_otel.setup(exporter="langfuse", service_name="store")
 # LANGFUSE_HOST (default https://cloud.langfuse.com), LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY
 app = bootstrap(Root)
-otel.attach_app(app)              # bridge message/error/feedback events of its sessions
+otel.attach_app(app)              # bridge events of its sessions, incl. ones opened later
 ...
 otel.shutdown()                   # flush, uninstall
 ```
@@ -72,13 +72,14 @@ handle = pyreact_otel.setup(
     service_name="pyreact-app",
     capture_content=None,         # default: $PYREACT_OTEL_CAPTURE_CONTENT / $OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT
     metrics=True,                 # when the exporter takes metrics (Langfuse doesn't)
-    events=("message", "error", "feedback", "optimize.*"),   # None = all, () = none
+    events=("message", "error", "feedback", "optimize.*", "session.*"),   # None = all, () = none
     event_buses=(),               # extra EventBus objects to bridge
     set_global=False,             # also make the providers OTel-global
     span_processors=(), metric_readers=(), sampler=None, resource_attributes=None,
     **exporter_options,
 )
-handle.attach_bus(bus); handle.attach_app(app)
+handle.attach_bus(bus)
+handle.attach_app(app)    # open sessions now + those opened/resumed later (app.on_session)
 handle.force_flush(); handle.shutdown()      # also a context manager
 ```
 
@@ -186,6 +187,5 @@ pyreact_otel.setup(exporter="phoenix", project="store")
 
 ## Known gaps
 
-- `attach_app` bridges the sessions open at the time of the call. pyreact has no session-opened hook yet, so call `attach_bus(session.event_bus)` for sessions opened later.
 - Events are not exported as OTel log records; the Python logs API is still experimental.
 - Only HTTP/protobuf OTLP is bundled. For gRPC, add `opentelemetry-exporter-otlp-proto-grpc` and register it. Langfuse accepts HTTP only.

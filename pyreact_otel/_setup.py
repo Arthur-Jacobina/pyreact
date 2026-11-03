@@ -2,7 +2,7 @@
 
     import pyreact_otel
     otel = pyreact_otel.setup(exporter="langfuse", service_name="store")
-    otel.attach_app(app)          # bridge message/error/feedback events of its sessions
+    otel.attach_app(app)          # bridge events of its sessions, now and opened later
     ...
     otel.shutdown()               # flush + uninstall
 
@@ -60,6 +60,9 @@ class OtelHandle:
         self.config = config
         self._uninstall = uninstall
         self._closed = False
+        self._app_unhooks: List[Callable[[], None]] = []
+        self._session_unsubs: Dict[int, Callable[[], None]] = {}
+        self._session_lock = threading.Lock()
         for k, v in config.extras.items():  # e.g. memory: span_exporter / metric_reader
             setattr(self, k, v)
 
@@ -69,15 +72,40 @@ class OtelHandle:
             return lambda: None
         return self.bridge.attach(bus)
 
-    def attach_app(self, app: Any) -> None:
-        """Bridge the event buses of every currently open session of ``app``
-        (an ``AppRunner`` from ``pyreact.boot.bootstrap``)."""
-        sessions = getattr(app, "sessions", None)
-        buses = [s.event_bus for s in (sessions() if callable(sessions) else [])]
-        if not buses and getattr(app, "event_bus", None) is not None:
-            buses = [app.event_bus]
-        for bus in buses:
-            self.attach_bus(bus)
+    def attach_app(self, app: Any) -> Callable[[], None]:
+        """Bridge the event buses of ``app``'s sessions (an ``AppRunner`` from
+        ``pyreact.boot.bootstrap``): those open now *and* those opened or
+        resumed later (through ``app.on_session``; each session's bridge is
+        detached when it closes). Returns a function that stops following
+        the app (also done by :meth:`shutdown`)."""
+        on_session = getattr(app, "on_session", None)
+        if not callable(on_session):  # an object without lifecycle hooks
+            sessions = getattr(app, "sessions", None)
+            buses = [s.event_bus for s in (sessions() if callable(sessions) else [])]
+            if not buses and getattr(app, "event_bus", None) is not None:
+                buses = [app.event_bus]
+            for bus in buses:
+                self.attach_bus(bus)
+            return lambda: None
+
+        def _open(session: Any) -> None:
+            if self._closed:
+                return
+            key = id(session)
+            with self._session_lock:
+                if key in self._session_unsubs:
+                    return
+                self._session_unsubs[key] = self.attach_bus(session.event_bus)
+
+        def _close(session: Any) -> None:
+            with self._session_lock:
+                unsub = self._session_unsubs.pop(id(session), None)
+            if unsub is not None:
+                unsub()
+
+        unhook = on_session(open=_open, close=_close, replay=True)
+        self._app_unhooks.append(unhook)
+        return unhook
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         ok = self.tracer_provider.force_flush(timeout_millis)
@@ -91,6 +119,11 @@ class OtelHandle:
         if self._closed:
             return
         self._closed = True
+        for unhook in self._app_unhooks:
+            unhook()
+        self._app_unhooks.clear()
+        with self._session_lock:
+            self._session_unsubs.clear()
         if self._uninstall is not None:
             self._uninstall()
         if self.bridge is not None:
