@@ -228,3 +228,59 @@ def test_rlm_run_is_an_llm_boundary():
 
     asyncio.run(main())
     assert seen == [("llm", "rlm", hs["cid"], "len=3")]
+
+
+class ToolInterpreter(FakeInterpreter):
+    """Calls the ``shout`` tool from the REPL (worker thread), then SUBMITs."""
+
+    def execute(self, code, variables=None):
+        self.executed += 1
+        if self.executed == 1:
+            return self.tools["shout"](text="hi")
+        return FinalOutput({"answer": "done"})
+
+
+def test_rlm_tools_run_as_tool_boundaries_from_the_worker_thread():
+    import threading
+
+    seen, threads = [], []
+
+    def shout(text: str) -> str:
+        """Shout the text.
+        text: what to shout
+        """
+        threads.append(threading.current_thread().name)
+        return text.upper()
+
+    async def spy(b, call_next):
+        out = await call_next(b)
+        seen.append((b.kind, b.name, dict(b.inputs), b.attrs.get("result"),
+                     b.attrs.get("call_id")))
+        return out
+
+    hs = {}
+
+    @component
+    def Agent():
+        run, (result, ver), _l, error = use_rlm(
+            "context, question -> answer", lm=FakeLM(), tools=[shout], max_iterations=5,
+            interpreter=lambda: ToolInterpreter(),
+        )
+        hs["run"] = run
+        return []
+
+    @component
+    def Root():
+        return [HarnessProvider(key="h", middleware=[spy], children=[Agent(key="a")])]
+
+    async def main():
+        schedule_rerender(HookContext("Root", Root))
+        await _settle()
+        hs["cid"] = hs["run"](context="abc", question="q")
+        await _settle()
+
+    asyncio.run(main())
+    tool = [s for s in seen if s[0] == "tool"]
+    assert tool == [("tool", "shout", {"text": "hi"}, "HI", hs["cid"])]
+    assert threads and threads[0] != "MainThread"  # sync tool still off the loop
+    assert [s[0] for s in seen] == ["tool", "llm"]

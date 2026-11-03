@@ -12,6 +12,7 @@ Every LM/module call and tool call is published on the app's
     llm.blocked {call_id, module, component, model, reason, by, message}  (then llm.error)
     tool.start  {call_id, tool, args}
     tool.end    {call_id, tool, args, duration, error, result}
+    tool.blocked {call_id, tool, args, reason, by, message}  (before tool.end)
 
 Token usage / cost come from the LM history entries recorded *for that call
 only* (a per-call recorder is injected into ``dspy.settings.caller_modules``,
@@ -108,6 +109,7 @@ class CallScope:
     module: str
     component: Optional[str]
     turn_id: Optional[str]
+    loop: Any = None  # event loop of the call (worker threads route tools back to it)
 
 
 _scope: ContextVar[Optional[CallScope]] = ContextVar("pyreact_dspy_call", default=None)

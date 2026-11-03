@@ -52,6 +52,8 @@ __all__ = [
     "use_agent_call",
     "to_dspy_tool",
     "invoke_module",
+    "call_tool",
+    "call_tool_sync",
 ]
 
 POLICIES = ("replace", "parallel", "ignore")
@@ -433,7 +435,8 @@ async def invoke_module(
 
     pub("llm.start", {**base, "arch": arch, "inputs": tm.brief(inputs),
                       "input_chars": _input_chars(inputs), "stream": bool(stream_fields)})
-    token = tm.enter_scope(tm.CallScope(call_id, label, component, turn_id))
+    token = tm.enter_scope(tm.CallScope(call_id, label, component, turn_id,
+                                        loop=asyncio.get_running_loop()))
     t0 = time.perf_counter()
     try:
         result = await through(
@@ -768,44 +771,117 @@ def use_stream(
 # ---------------------------------------------------------------------------
 # Tools = capabilities
 # ---------------------------------------------------------------------------
-def _instrumented(tool: Tool) -> Callable:
+def _bind(fn: Callable, args: tuple, kwargs: dict) -> Tuple[Dict[str, Any], bool]:
+    """Tool call args -> (named inputs, by_name). Positional args are bound to
+    parameter names when possible so middleware sees one ``{name: value}``
+    dict; otherwise they stay under ``"args"``."""
+    if not args:
+        return dict(kwargs), True
+    try:
+        sig = inspect.signature(fn)
+        if not any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD, p.POSITIONAL_ONLY)
+                   for p in sig.parameters.values()):
+            return dict(sig.bind(*args, **kwargs).arguments), True
+    except (TypeError, ValueError):
+        pass
+    return {"args": list(args), **kwargs}, False
+
+
+async def call_tool(tool: Tool, args: tuple = (), kwargs: Optional[dict] = None, *,
+                    harness: Optional[Harness] = None) -> Any:
+    """Run one tool call as a ``"tool"`` boundary and publish ``tool.*`` events.
+
+    Sync tools run in a worker thread (never blocking the render loop).
+    ``b.inputs`` holds the named arguments (a middleware may rewrite them);
+    attrs: ``call_id`` (the LLM call that asked for the tool), after the call
+    ``result`` (preview) and ``latency``. A :class:`Blocked` tool call
+    returns an ``"Error: ..."`` string to the agent (so it can adapt) and
+    publishes ``tool.blocked``.
+    """
     fn = tool.fn
+    kwargs = kwargs or {}
     is_async = inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(
         getattr(fn, "__call__", None)
     )
+    scope = tm.current_scope()
+    call_id = scope.call_id if scope else None
+    turn_id = scope.turn_id if scope else tm.current_turn_id()
+    source = scope.component if scope else None
+    args_preview = tm.brief(kwargs if not args else {"args": args, **kwargs})
+    inputs, by_name = _bind(fn, args, kwargs)
 
-    @functools.wraps(fn)
-    async def _tool(*args, **kwargs):
-        scope = tm.current_scope()
-        call_id = scope.call_id if scope else None
-        turn_id = scope.turn_id if scope else tm.current_turn_id()
-        source = scope.component if scope else None
-        args_preview = tm.brief(kwargs if not args else {"args": args, **kwargs})
-        tm.publish("tool.start", {"call_id": call_id, "tool": tool.name, "args": args_preview},
-                   turn_id=turn_id, source=source)
-        t0 = time.perf_counter()
-        error = None
-        result = None
+    async def _run(b: Boundary):
+        if by_name:
+            a, kw = (), b.inputs
+        else:
+            kw = dict(b.inputs)
+            a = tuple(kw.pop("args", ()))
+        t_run = time.perf_counter()
         try:
             if is_async:
-                result = await fn(*args, **kwargs)
+                out = await fn(*a, **kw)
             else:
-                # Sync tools run in a worker thread: never block the render loop.
-                result = await asyncio.to_thread(fn, *args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = await result
-            return result
-        except asyncio.CancelledError:
-            error = "cancelled"
-            raise
-        except Exception as exc:
-            error = repr(exc)
-            raise
+                out = await asyncio.to_thread(fn, *a, **kw)
+                if inspect.isawaitable(out):
+                    out = await out
         finally:
-            tm.publish("tool.end", {"call_id": call_id, "tool": tool.name, "args": args_preview,
-                                    "duration": time.perf_counter() - t0, "error": error,
-                                    "result": tm.brief(result) if error is None else None},
-                       turn_id=turn_id, source=source)
+            b.attrs["latency"] = time.perf_counter() - t_run
+        b.attrs["result"] = tm.brief(out)
+        return out
+
+    tm.publish("tool.start", {"call_id": call_id, "tool": tool.name, "args": args_preview},
+               turn_id=turn_id, source=source)
+    t0 = time.perf_counter()
+    error = None
+    result = None
+    try:
+        result = await through("tool", tool.name, inputs, _run, harness=harness,
+                               call_id=call_id)
+        return result
+    except Blocked as exc:
+        error = f"blocked: {exc}"
+        tm.publish("tool.blocked", {"call_id": call_id, "tool": tool.name, "args": args_preview,
+                                    "reason": exc.reason, "by": exc.by, "message": str(exc)},
+                   turn_id=turn_id, source=source)
+        return f"Error: {exc}"
+    except asyncio.CancelledError:
+        error = "cancelled"
+        raise
+    except Exception as exc:
+        error = repr(exc)
+        raise
+    finally:
+        tm.publish("tool.end", {"call_id": call_id, "tool": tool.name, "args": args_preview,
+                                "duration": time.perf_counter() - t0, "error": error,
+                                "result": tm.brief(result) if error is None else None},
+                   turn_id=turn_id, source=source)
+
+
+def call_tool_sync(tool: Tool, args: tuple = (), kwargs: Optional[dict] = None) -> Any:
+    """:func:`call_tool` from synchronous code running in a worker thread of
+    an LLM call (e.g. tools called from the RLM REPL): the boundary runs on
+    the call's event loop while this thread waits for the result."""
+    scope = tm.current_scope()
+    loop = getattr(scope, "loop", None)
+    try:
+        asyncio.get_running_loop()
+        on_loop_thread = True
+    except RuntimeError:
+        on_loop_thread = False
+    if on_loop_thread:
+        # Can't block a running loop waiting on itself: plain call.
+        return tool.fn(*args, **(kwargs or {}))
+    if loop is not None and loop.is_running():
+        # The context (call scope, owner, turn, current boundary) travels
+        # with the coroutine: run_coroutine_threadsafe copies this thread's.
+        return asyncio.run_coroutine_threadsafe(call_tool(tool, args, kwargs), loop).result()
+    return asyncio.run(call_tool(tool, args, kwargs))
+
+
+def _instrumented(tool: Tool) -> Callable:
+    @functools.wraps(tool.fn)
+    async def _tool(*args, **kwargs):
+        return await call_tool(tool, args, kwargs)
 
     return _tool
 
