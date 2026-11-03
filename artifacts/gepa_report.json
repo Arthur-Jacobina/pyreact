@@ -1,0 +1,147 @@
+{
+  "budget": 50,
+  "model": "haiku",
+  "baseline_val_acc": 0.625,
+  "baseline_val": [
+    {
+      "message": "comprar e saber o frete",
+      "gold": "shipping",
+      "pred": "order",
+      "ok": false,
+      "error": null
+    },
+    {
+      "message": "quanto sai a entrega do chapéu?",
+      "gold": "shipping",
+      "pred": "shipping",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "pedir duas camisas e calcular o frete",
+      "gold": "shipping",
+      "pred": "order",
+      "ok": false,
+      "error": null
+    },
+    {
+      "message": "finalizar a compra do tênis e ver o prazo de entrega",
+      "gold": "shipping",
+      "pred": "order",
+      "ok": false,
+      "error": null
+    },
+    {
+      "message": "qual o valor do tênis?",
+      "gold": "catalog",
+      "pred": "catalog",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "vocês têm camisa?",
+      "gold": "catalog",
+      "pred": "catalog",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "tem chapéu de lã pra pronta entrega?",
+      "gold": "order",
+      "pred": "order",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "quero fazer um pedido de 3 camisas vermelhas",
+      "gold": "order",
+      "pred": "order",
+      "ok": true,
+      "error": null
+    }
+  ],
+  "baseline_train_acc": 0.75,
+  "gepa_llm_calls": 53,
+  "instructions_before": {
+    "predict": "Choose the best specialist for the message.\n\nInstructions:\n- Return ONLY the exact name of one of the provided specialists.\n- Consider each specialist's description and example utterances.\n- \"quais produtos / listar / catálogo / preço\" -> catalog.\n- \"estoque de um item / comprar / pedido\" -> order.\n- \"frete / entrega / frete grátis\" -> shipping."
+  },
+  "instructions_after": {
+    "predict": "You are a routing classifier for a Brazilian Portuguese e-commerce assistant. Given a customer message and a list of specialists, choose the single specialist that should handle the message.\n\nInput format:\n- `message`: a customer message, usually in informal Brazilian Portuguese (e.g., \"vocês\", \"tem\", \"pra\", \"boné\"). Interpret it in Portuguese.\n- `specialists`: a list of objects, each with `name`, `description`, and `utterances` (example phrases). Use only the names in this list.\n\nSpecialists:\n- `catalog`: what products exist, listing the catalog, searching products, and product prices.\n- `order`: checking stock for a specific product, buying, placing orders, and finalizing purchases.\n- `shipping`: shipping cost, delivery, and free-shipping eligibility.\n\nRouting rules, in priority order:\n1. **Shipping first.** Any question about frete or entrega (cost, delivery time/prazo, free shipping, delivery value for a location) goes to `shipping`, even when the message also expresses purchase intent. Example: \"quero comprar a camisa azul e ver quanto fica o frete\" -> `shipping`. The customer needs the delivery answer before ordering. Phrasings like \"quanto custa/sai\" count as shipping when they refer to frete or entrega.\n2. **Order second.** Purchase or ordering intent goes to `order`, including \"quero comprar 2 chapéus\", \"fazer um pedido\", and \"quero 2 unidades\". Availability of a specific item goes to `order`: \"tem em estoque\", \"ainda tem\", \"pronta entrega\" (in stock now). \"Pronta entrega\" is stock, not shipping.\n3. **Catalog third.** Questions about what the store sells, listing products, and product prices go to `catalog`. \"Vocês vendem boné?\" is a product-offering question, so it goes to `catalog`, not `order`. \"Qual o preço da camisa?\" (with no frete question) goes to `catalog`.\n\nKey distinctions:\n- \"vocês vendem/têm <tipo de produto>?\" asks about the catalog, not stock.\n- A price question without frete or entrega goes to `catalog`. A price or cost question about frete or entrega goes to `shipping`.\n- \"Tem\" alone is ambiguous. Decide by the object: a specific item in stock goes to `order`, and a product category goes to `catalog`.\n\nApproach:\n1. Identify every intent in the message: product discovery, stock/purchase, or shipping.\n2. If a shipping intent is present, choose `shipping`.\n3. Otherwise, if a stock or purchase intent is present, choose `order`.\n4. Otherwise, choose `catalog`.\n5. Use each specialist's `description` and `utterances` as the final check. Do not invent specialist names. If no specialist fits exactly, choose the closest one.\n\nOutput format:\n- If the output schema has a separate `reasoning` field, write one or two sentences that name the intent(s) found and the rule that applied.\n- The `name` field must contain only the exact specialist name from the list (`catalog`, `order`, or `shipping`), with no punctuation, quotes, or extra text."
+  },
+  "gepa_val_scores": [
+    0.625,
+    1.0
+  ],
+  "gepa_best_idx": 1,
+  "optimized_val_acc": 1.0,
+  "optimized_val": [
+    {
+      "message": "comprar e saber o frete",
+      "gold": "shipping",
+      "pred": "shipping",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "quanto sai a entrega do chapéu?",
+      "gold": "shipping",
+      "pred": "shipping",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "pedir duas camisas e calcular o frete",
+      "gold": "shipping",
+      "pred": "shipping",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "finalizar a compra do tênis e ver o prazo de entrega",
+      "gold": "shipping",
+      "pred": "shipping",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "qual o valor do tênis?",
+      "gold": "catalog",
+      "pred": "catalog",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "vocês têm camisa?",
+      "gold": "catalog",
+      "pred": "catalog",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "tem chapéu de lã pra pronta entrega?",
+      "gold": "order",
+      "pred": "order",
+      "ok": true,
+      "error": null
+    },
+    {
+      "message": "quero fazer um pedido de 3 camisas vermelhas",
+      "gold": "order",
+      "pred": "order",
+      "ok": true,
+      "error": null
+    }
+  ],
+  "hot_swap": {
+    "message": "comprar e saber o frete",
+    "before": "order",
+    "after": "shipping",
+    "rerendered": [
+      "SupervisorAgent"
+    ],
+    "env_has_compiled": true,
+    "prompt_has_new_instructions": true
+  },
+  "total_llm_calls": 83,
+  "seconds": 130.9
+}
