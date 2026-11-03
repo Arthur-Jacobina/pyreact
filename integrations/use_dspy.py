@@ -3,8 +3,8 @@ from collections.abc import Callable
 from typing import Optional, Any
 import inspect
 import dspy
-from pyreact.core.core import hooks
-from pyreact.core.runtime import spawn
+from pyreact.core.core import hooks, _context_stack
+from pyreact.core.runtime import spawn, current_turn_id
 from integrations.dspy_integration import use_dspy_env
 
 
@@ -62,6 +62,7 @@ def use_dspy_call(
 
     # Get environment during render (not in async function)
     env = use_dspy_env()
+    owner = _context_stack.get()  # component calling the hook (turn policy, errors)
 
     async def _do_call(inputs: dict):
         current_task = asyncio.current_task()
@@ -127,7 +128,9 @@ def use_dspy_call(
         if prev is not None and not prev.done():
             prev.cancel()  # superseded: don't keep paying for a stale LLM call
         dispatch({"type": "start"})
-        t = spawn(_do_call(inputs), name="dspy_call")
+        # Attributed to the turn that started the call, so turn.end waits for
+        # it (and an interrupt cancels it).
+        t = spawn(_do_call(inputs), owner=owner, name="dspy_call", turn=current_turn_id())
         task_ref["task"] = t
 
     run = hooks.use_callback(_run, deps=[id(module)])

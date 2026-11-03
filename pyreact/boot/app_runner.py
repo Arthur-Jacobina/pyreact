@@ -2,21 +2,16 @@ import asyncio
 import concurrent.futures
 import inspect
 import threading
-import time
 from typing import Optional, Callable
 
 from pyreact.core.hook import HookContext
 from pyreact.core import runtime
 from pyreact.core.runtime import run_renders, schedule_rerender
+from pyreact.core.events import EventBus
+from pyreact.core.turns import TurnManager
 from pyreact.input.bus import InputBus
 from pyreact.router.nav_service import NavService
 from pyreact.web.console import MessageBuffer
-
-
-def _emit_text_and_submit(bus: InputBus, text: str) -> None:
-    now = time.time()
-    bus.emit({"type": "text", "value": text, "source": "term", "ts": now})
-    bus.emit({"type": "submit", "value": text, "source": "term", "ts": now})
 
 
 class AppRunner:
@@ -29,7 +24,11 @@ class AppRunner:
         app.shutdown()
     """
 
-    def __init__(self, app_component_fn, *, fps: int = 20):
+    def __init__(self, app_component_fn, *, fps: int = 20, turn_policy: str = "queue"):
+        if turn_policy not in ("queue", "interrupt"):
+            raise ValueError(f"turn_policy must be 'queue' or 'interrupt', got {turn_policy!r}")
+        self._turn_policy = turn_policy
+        self._turns: Optional[TurnManager] = None
         self._app_component_fn = app_component_fn
         self._fps: int = max(1, int(fps))
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -65,35 +64,62 @@ class AppRunner:
             raise RuntimeError("AppRunner is not running")
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
-    async def _emit_and_maybe_wait(self, txt: str, should_wait: bool):
-        _emit_text_and_submit(self._bus, txt)
+    @property
+    def turns(self) -> TurnManager:
+        """The app's :class:`~pyreact.core.turns.TurnManager`."""
+        return self._turns
+
+    async def _submit_turn(self, turn, should_wait: bool):
+        self._turns.enqueue(turn)
         if should_wait:
-            await runtime.wait_idle()
+            await self._turns.wait(turn.id)
 
     def invoke(
-        self, text: str, *, wait: bool = False, timeout: Optional[float] = None
-    ) -> None:
-        """Send a line of input to the app via the InputBus.
+        self,
+        text: str,
+        *,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+        source: str = "term",
+    ) -> str:
+        """Submit a line of input as a new turn; returns the turn id.
 
-        If wait=True, blocks until the app is idle: no queued renders and no
-        pending background tasks spawned by components (e.g. LLM calls).
-        Raises TimeoutError if that takes longer than ``timeout`` seconds.
-        Do not call with wait=True from inside a running event loop; use
-        :meth:`ainvoke` there.
+        The turn is processed according to the app's turn policy (queued
+        behind the current turn by default). If wait=True, blocks until the
+        turn has ended: no queued renders and no pending background tasks
+        spawned during the turn (e.g. LLM calls). Raises TimeoutError if that
+        takes longer than ``timeout`` seconds. Do not call with wait=True
+        from inside a running event loop; use :meth:`ainvoke` there.
         """
-        fut = self._submit(self._emit_and_maybe_wait(text, wait))
+        turn = self._turns.new_turn(text, source=source)
+        fut = self._submit(self._submit_turn(turn, wait))
         if wait:
             try:
                 fut.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                raise TimeoutError(f"app not idle after {timeout}s") from None
+                raise TimeoutError(f"turn {turn.id} not done after {timeout}s") from None
+        return turn.id
 
     async def ainvoke(
-        self, text: str, *, wait: bool = False, timeout: Optional[float] = None
-    ) -> None:
+        self,
+        text: str,
+        *,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+        source: str = "term",
+    ) -> str:
         """Async version of :meth:`invoke` for callers on another event loop."""
-        fut = self._submit(self._emit_and_maybe_wait(text, wait))
+        turn = self._turns.new_turn(text, source=source)
+        fut = self._submit(self._submit_turn(turn, wait))
         await asyncio.wait_for(asyncio.wrap_future(fut), timeout)
+        return turn.id
+
+    def wait_turn(self, turn_id: str, timeout: Optional[float] = None) -> dict:
+        """Block until ``turn_id`` ends; returns ``{"status", "duration"}``."""
+        try:
+            return self._submit(self._turns.wait(turn_id)).result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"turn {turn_id} not done after {timeout}s") from None
 
     def wait_idle(self, timeout: Optional[float] = None) -> None:
         """Block until no renders or component tasks are pending."""
@@ -302,6 +328,12 @@ class AppRunner:
         )
         schedule_rerender(self._root_ctx, reason="app startup")
         self._bus = self._root_ctx.get_service("input_bus", InputBus)
+        self._turns = self._root_ctx.get_service("turns", TurnManager).configure(
+            policy=self._turn_policy,
+            input_bus=self._bus,
+            event_bus=self._root_ctx.get_service("event_bus", EventBus),
+            loop=asyncio.get_running_loop(),
+        )
 
         # Bridge navigation events to server publisher
         try:
@@ -374,6 +406,9 @@ class AppRunner:
                     self._root_ctx.unmount()
             except Exception:
                 pass
+            pump = getattr(self._turns, "_pump", None)
+            if pump is not None and not pump.done():
+                pump.cancel()
             for t in runtime.pending_tasks():
                 t.cancel()
             runtime.bind_loop(None)

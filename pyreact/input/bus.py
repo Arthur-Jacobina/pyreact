@@ -6,13 +6,19 @@ class Event(TypedDict, total=False):
     value: str
     source: Literal["web", "term"]
     ts: float
+    turn_id: str  # id of the Turn this input started (see pyreact.core.turns)
 
 
 Subscriber = Callable[[Event], None]
 
 
 class InputBus:
-    """Input bus (thread-safe enough for use with ``asyncio``)."""
+    """Input bus (thread-safe enough for use with ``asyncio``).
+
+    Inputs are normally emitted by the ``TurnManager`` when a turn starts
+    (``AppRunner.invoke`` → turn → ``text`` + ``submit`` events carrying
+    ``turn_id``). Emitting directly bypasses turn tracking.
+    """
 
     def __init__(self):
         self._subs: list[Subscriber] = []
