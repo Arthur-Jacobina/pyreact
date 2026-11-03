@@ -52,6 +52,14 @@ See [Error recovery](../README.md#error-recovery) in the main README.
 |---|---|---|
 | `sandbox.01_coding_agent` | A ReAct agent writes and runs code in a Docker sandbox (`sandbox_tools`); `--resume` restores the sandbox after a restart (`--driver local` = no Docker, not isolated) | yes |
 
+## Stateful agents (`examples/stateful/`)
+
+| Example | Idea | LLM |
+|---|---|---|
+| `stateful.01_suspend_resume` | A coding agent (sandbox tools, durable conversation, a learned prompt) is **suspended mid-turn** into one manifest; a **new process** resumes it: the conversation, the sandbox files, the learned prompt and the cut turn come back, and the turn's answered LLM calls are replayed from the log (`--demo` runs both processes; `--driver local` = no Docker) | yes (≤ 15 calls) |
+
+See [Stateful agents](../README.md#stateful-agents-suspend--resume) in the main README.
+
 ## Learning: architectures & optimizers (`examples/learn/`)
 
 | Example | Idea |
@@ -73,6 +81,6 @@ See [Error recovery](../README.md#error-recovery) in the main README.
 
 - **New to pyreact:** `message` → `qa_guardrail` → `tools` → `main_web --app tools`.
 - **Need memory:** `durable.01_counter` → `durable.02_branches_sqlite` → `durable.04_llm_chat`.
-- **Going to production:** `harness.02_resilient_agent` (recovery), then `durable.04_llm_chat`.
+- **Going to production:** `harness.02_resilient_agent` (recovery), then `durable.04_llm_chat`, then `stateful.01_suspend_resume`.
 - **Want better prompts:** `learn.01` → `learn.02` → `learn.03` → `learn.05`.
 - **Need guardrails:** `qa_guardrail` (a guard as a component) → `harness.01_guarded_agent` (guards and verifiers as middleware).
