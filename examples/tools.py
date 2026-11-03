@@ -1,20 +1,47 @@
-from typing import Callable, List
-from integrations.dspy_integration import DSPyProvider
-from integrations.dspy_agent import use_dspy_agent
-from integrations.use_dspy import use_dspy_call
-from integrations.dspy_integration import use_dspy_module
-from .message import Message
-from pyreact.core import EventBus, runtime, use_turn
-from pyreact.core.core import component, hooks
-from pyreact.tools import ToolProvider, use_tool
+"""Multi-agent store: a supervisor routes each message to a tool-using specialist.
+
+What it teaches:
+
+- tools are plain functions (type hints + docstring -> JSON Schema), shared
+  once through ``ToolProvider`` and picked *by name* by each agent;
+  ``use_tool`` adds a component-local tool (like ``use_callback``)
+- a classifier agent (``use_module(..., arch="cot")`` + ``use_call``) and
+  ReAct specialists (``use_agent``) are just components; "dispatch" is
+  conditional rendering
+- every input is a turn (``use_turn``); the app publishes its own events
+  (``agent.route``, ``agent.answer``) next to the built-in ``llm.*`` /
+  ``tool.*`` ones -- ``scripts/e2e_turns.py`` and the learning examples read them
+
+Run from the repo root::
+
+    uv run python -m examples.tools                 # terminal
+    uv run python -m examples.main_web --app tools  # browser, http://127.0.0.1:8000
+
+    > quais produtos vocês vendem?
+    > quanto custa o frete do SHOE-RUN-42 para o BR?
+    > :events agent  :usage  :turns  :q
+
+LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
+~3-5 LM calls per question. The store speaks Portuguese: its routing data
+(``SPECIALISTS``) is the dataset the learning examples optimize.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Callable, List, Optional
+
 import dspy
-import os
-import dotenv
 
+from examples._lm import example_models
+from integrations import DSPyProvider, use_agent, use_call, use_module
+from pyreact.boot import bootstrap, read_terminal_and_invoke
+from pyreact.components.message import Message
+from pyreact.core import EventBus, component, hooks, runtime, use_turn
+from pyreact.tools import ToolProvider, use_tool
 
-dotenv.load_dotenv()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
+SMOKE = {"stdin": "quais produtos vocês vendem?\nquanto custa o frete do HAT-WOOL?\n:q\n"}
 
 
 # --- Tools: plain functions; type hints + docstrings drive the JSON Schema. ---
@@ -75,6 +102,7 @@ def place_order(sku: str, quantity: int) -> str:
 
 
 # --- Specialists: each is a tool-using agent over its own toolset. ---
+# (Also the routing dataset of examples/optimize_router.py and examples/learn/.)
 SPECIALISTS = [
     {
         "name": "catalog",
@@ -146,58 +174,52 @@ class RouteSpecialistSig(dspy.Signature):
     name: str = dspy.OutputField()
 
 
-def _use_publish(kind: str, payload_fn, deps):
-    """Publish an app event (attributed to the current turn) when deps change."""
+def use_publish(kind: str, payload: Optional[dict], deps: list) -> None:
+    """Custom hook: publish an app event when ``deps`` change (``None`` payload
+    = nothing to say). The event is attributed to the current turn."""
     bus = hooks.get_service("event_bus", EventBus)
 
     def _pub():
-        payload = payload_fn()
         if payload is not None:
             bus.publish(kind, payload, turn_id=runtime.current_turn_id(), source="store")
 
     hooks.use_effect(_pub, deps)
 
 
-def _use_publish_answer(specialist: str, question: str, result, error):
-    # Fires once per settled call (result carries a version that bumps on settle).
-    def _payload():
-        if result[0] is None and error is None:
-            return None
-        answer = getattr(result[0], "answer", None) if result[0] is not None else None
-        return {"specialist": specialist, "question": question, "answer": answer,
-                "error": str(error) if error else None}
+def use_specialist(name: str, signature, tools: list, question: str, turn: int) -> list:
+    """Custom hook shared by the specialists: a ReAct agent over ``tools`` that
+    answers ``question`` once per ``turn``, publishes ``agent.answer`` once per
+    settled call and returns what to render."""
+    agent = use_agent(signature, tools=tools, model="reasoning")
 
-    _use_publish("agent.answer", _payload, [result, error])
+    def ask():
+        if question.strip():
+            agent.run(question=question)
 
+    hooks.use_effect(ask, [question, turn])
 
-def _render_result(result, loading, error):
-    # Shared loading/error/result rendering for the specialist agents.
-    if loading:
+    settled = agent.ver > 0 and not agent.loading
+    use_publish("agent.answer", {
+        "specialist": name,
+        "question": question,
+        "answer": getattr(agent.result, "answer", None),
+        "error": str(agent.error) if agent.error else None,
+    } if settled else None, [agent.ver])
+
+    if agent.loading:
         return [Message(key="loading", text="Pensando...", sender="system", message_type="info")]
-    if error:
-        return [Message(key="error", text=f"Erro: {error}", sender="system", message_type="error")]
-    if result[0] is None:
+    if agent.error is not None:
+        return [Message(key=f"error-{agent.ver}", text=f"Erro: {agent.error}", sender="system",
+                        message_type="error")]
+    if agent.result is None:
         return []
-    return [
-        Message(
-            key="answer",
-            text=f"{getattr(result[0], 'answer', None)}",
-            sender="assistant",
-            message_type="chat",
-        )
-    ]
+    return [Message(key=f"answer-{agent.ver}", text=str(agent.result.answer), sender="assistant")]
 
 
 @component
 def CatalogAgent(question: str, turn: int = 0):
-    call, result, loading, error = use_dspy_agent(
-        CatalogSig,
-        tools=["list_products", "search_products", "lookup_price"],
-        model="reasoning",
-    )
-    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
-    _use_publish_answer("catalog", question, result, error)
-    return _render_result(result, loading, error)
+    tools = ["list_products", "search_products", "lookup_price"]  # ToolProvider names
+    return use_specialist("catalog", CatalogSig, tools, question, turn)
 
 
 @component
@@ -209,22 +231,13 @@ def ShippingAgent(question: str, turn: int = 0):
         description="True if an order total qualifies for free shipping.",
         deps=[],
     )
-    call, result, loading, error = use_dspy_agent(
-        ShippingSig, tools=["estimate_shipping", free_shipping], model="reasoning"
-    )
-    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
-    _use_publish_answer("shipping", question, result, error)
-    return _render_result(result, loading, error)
+    tools = ["estimate_shipping", free_shipping]
+    return use_specialist("shipping", ShippingSig, tools, question, turn)
 
 
 @component
 def OrderAgent(question: str, turn: int = 0):
-    call, result, loading, error = use_dspy_agent(
-        OrderSig, tools=["check_stock", "place_order"], model="reasoning"
-    )
-    hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
-    _use_publish_answer("order", question, result, error)
-    return _render_result(result, loading, error)
+    return use_specialist("order", OrderSig, ["check_stock", "place_order"], question, turn)
 
 
 SPECIALIST_COMPONENTS = {
@@ -236,103 +249,97 @@ SPECIALIST_COMPONENTS = {
 
 @component
 def SupervisorAgent(*, message: str, turn: int, on_route: Callable[[str, str, int], None]):
-    # Classifier agent (no tools) that picks a specialist, like RouterAgent.
-    choose_mod = use_dspy_module(RouteSpecialistSig, dspy.ChainOfThought, name="supervisor")
-    call_llm, llm_result, llm_loading, _error = use_dspy_call(choose_mod, model="fast")
-    bus = hooks.get_service("event_bus", EventBus)
+    """Classifier agent (no tools): picks a specialist for ``message``.
 
-    def _decide():
-        if not message.strip():
-            return
-        call_llm(message=message, specialists=SPECIALISTS)
+    ``name="supervisor"`` gives the module a stable key -- the handle that
+    optimizers, ``hot_swap`` and ``:optimize supervisor`` use.
+    """
+    router = use_module(RouteSpecialistSig, arch="cot", name="supervisor")
+    call = use_call(router, model="fast")
 
-    hooks.use_effect(_decide, [message, turn])
+    def route():
+        if message.strip():
+            call.run(message=message, specialists=SPECIALISTS)
 
-    def _emit():
-        if llm_result is None or llm_result[0] is None:
-            return
-        name = getattr(llm_result[0], "name", None)
-        bus.publish("agent.route", {"specialist": name, "message": message},
-                    turn_id=runtime.current_turn_id(), source="store")
-        on_route(name, message, llm_result[1])
+    hooks.use_effect(route, [message, turn])
 
-    hooks.use_effect(_emit, [llm_result])
+    name = getattr(call.result, "name", None)
+    use_publish("agent.route", {"specialist": name, "message": message} if name else None,
+                [call.ver])
 
-    if llm_loading:
-        return [Message(key="routing", text="Encaminhando para um especialista...", sender="system")]
+    def _emit():  # call.ver bumps once per settled call
+        if name:
+            on_route(name, message, call.ver)
+
+    hooks.use_effect(_emit, [call.ver])
+
+    if call.loading:
+        return [Message(key="routing", text="Encaminhando para um especialista...",
+                        sender="system", message_type="info")]
+    if call.error is not None:
+        return [Message(key=f"route-error-{call.ver}", text=f"Erro: {call.error}",
+                        sender="system", message_type="error")]
     return []
 
 
 @component
 def StoreHome():
-    # Each user input is a Turn (id, index, text, ...). A repeated identical
-    # message is a new turn, so it re-triggers the supervisor via turn.index.
-    # Turns are queued by default: a burst of questions is answered in order.
+    # Each input is a Turn (id, index, text). A repeated identical message is a
+    # new turn, so turn.index re-triggers the supervisor. Turns queue by
+    # default: a burst of questions is answered in order.
     turn = use_turn()
-    last_message = turn.text if turn is not None else ""
-    turn_index = turn.index if turn is not None else 0
-    active, set_active = hooks.use_state(None)  # (name, question, ver)
-    handled_ver, set_handled_ver = hooks.use_state(-1)
+    active, set_active = hooks.use_state(None)  # (specialist, question, ver)
 
     def on_route(name: str, message: str, ver: int):
-        if ver == handled_ver or name not in SPECIALIST_COMPONENTS:
-            return
-        set_handled_ver(ver)
-        set_active((name, message, ver))
+        set_active((name.strip().strip("'\"").lower(), message, ver))
 
     children = [
-        Message(
-            key="welcome",
-            text="Loja: pergunte sobre produtos, preços, frete ou pedidos.",
-            sender="assistant",
-            message_type="info",
-        ),
-        SupervisorAgent(key="supervisor", message=last_message, turn=turn_index, on_route=on_route),
+        Message(key="welcome", text="Loja: pergunte sobre produtos, preços, frete ou pedidos.",
+                sender="assistant", message_type="info"),
+        SupervisorAgent(key="supervisor", message=turn.text if turn else "",
+                        turn=turn.index if turn else 0, on_route=on_route),
     ]
-
-    if active is not None:
+    if active is not None and active[0] not in SPECIALIST_COMPONENTS:
+        children.append(Message(key=f"unrouted-{active[2]}", sender="system", message_type="warning",
+                                text=f"Nenhum especialista chamado {active[0]!r}."))
+    elif active is not None:
         name, question, ver = active
-        Specialist = SPECIALIST_COMPONENTS[name]
-        children.append(
-            Message(
-                key="dispatch",
-                text=f"→ especialista: {name}",
-                sender="system",
-                message_type="info",
-            )
-        )
-        children.append(Specialist(key=f"specialist-{name}", question=question, turn=ver))
-
+        Specialist = SPECIALIST_COMPONENTS[name]  # dispatch = conditional rendering
+        children += [
+            Message(key=f"dispatch-{ver}", text=f"→ especialista: {name}", sender="system",
+                    message_type="info"),
+            Specialist(key=f"specialist-{name}", question=question, turn=ver),
+        ]
     return children
 
 
 @component
 def App():
     # Shared tools injected once; specialists pick the ones they need by name.
-    return [
-        ToolProvider(
-            key="tools",
-            tools=[
-                list_products,
-                search_products,
-                lookup_price,
-                estimate_shipping,
-                check_stock,
-                place_order,
-            ],
-            children=[StoreHome(key="store")],
-        )
-    ]
+    tools = [list_products, search_products, lookup_price, estimate_shipping,
+             check_stock, place_order]
+    return [ToolProvider(key="tools", tools=tools, children=[StoreHome(key="store")])]
 
 
 @component
 def Root(models=None):
-    if models is None:
-        lm_default = dspy.LM("openai/gpt-4o", api_key=OPENAI_API_KEY)
-        lm_fast = dspy.LM("openai/gpt-4o-mini", api_key=OPENAI_API_KEY)
-        models = {
-            "default": lm_default,
-            "fast": lm_fast,
-            "reasoning": lm_default,
-        }
-    return [DSPyProvider(key="dspy", models=models, children=[App(key="app")])]
+    # models: {"default", "fast", "reasoning"} -> DSPyProvider (context).
+    lms = hooks.use_memo(lambda: models or example_models(), [id(models)])
+    return [DSPyProvider(key="dspy", models=lms, children=[App(key="app")])]
+
+
+async def main() -> None:
+    app = bootstrap(Root)
+    try:
+        # Messages and errors are rendered from typed events (ConsoleSink);
+        # here LLM and tool activity too. :events, :usage, :turns for more.
+        await read_terminal_and_invoke(
+            app, prompt="> ",
+            console_kinds=("message", "error", "llm.end", "llm.error", "tool.*"),
+        )
+    finally:
+        app.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
