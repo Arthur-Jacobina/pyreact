@@ -31,7 +31,9 @@ def use_on_turn(fn: Callable[[Turn], Any], **use_turn_kwargs: Any) -> Optional[T
     ``fn`` always sees the latest closure (it may change every render). Like
     an effect, it may return a cleanup, or be ``async`` (run as a tracked task
     of the turn; cancelled if the component unmounts or the next turn fires
-    while it is still running). Extra keyword arguments go to :func:`use_turn`.
+    while it is still running). Extra keyword arguments go to :func:`use_turn`;
+    ``use_on_turn(fn, since_mount=True)`` skips the turn that was in flight
+    (or last ran) when the component mounted and only handles later ones.
     """
     turn = use_turn(**use_turn_kwargs)
     latest = hooks.use_ref(fn)
