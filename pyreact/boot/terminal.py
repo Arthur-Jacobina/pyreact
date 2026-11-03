@@ -1,6 +1,6 @@
 import asyncio
 import sys
-from typing import Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from pyreact.observability import ConsoleSink, format_event
 
@@ -24,6 +24,33 @@ HELP = """\
   :q | :quit | :exit   quit"""
 
 
+# Extension point: ``register_command("name", fn, "help")`` adds ``:name``;
+# ``fn(app, args_str)`` gets the AppRunner (or Session) and the raw arguments.
+CommandFn = Callable[[Any, str], Any]
+_COMMANDS: Dict[str, Tuple[CommandFn, str]] = {}
+
+
+def register_command(name: str, fn: CommandFn, help: str = "") -> None:
+    """Add (or replace) a ``:name`` terminal command. Built-ins win on clashes."""
+    if not name or any(c.isspace() for c in name):
+        raise ValueError(f"invalid command name {name!r}")
+    _COMMANDS[name] = (fn, help)
+
+
+def unregister_command(name: str) -> None:
+    _COMMANDS.pop(name, None)
+
+
+def registered_commands() -> Dict[str, str]:
+    """``{name: help}`` of commands added with :func:`register_command`."""
+    return {n: h for n, (_fn, h) in _COMMANDS.items()}
+
+
+def help_text() -> str:
+    extra = [f"  :{n:<19} {h}" for n, (_f, h) in sorted(_COMMANDS.items())]
+    return HELP + ("\n" + "\n".join(extra) if extra else "")
+
+
 def _header(title: str) -> None:
     print(f"\n{BOLD}{CYAN}=== {title} ==={RESET}")
 
@@ -32,7 +59,7 @@ def handle_command(app: AppRunner, cmd: str, args_str: str = "") -> bool:
     """Run a built-in ``:command``. Returns False for unknown commands."""
     color = sys.stdout.isatty()
     if cmd == "help":
-        print(HELP)
+        print(help_text())
         return True
     if cmd == "tree":
         app.print_vnode_tree()
@@ -103,6 +130,13 @@ def handle_command(app: AppRunner, cmd: str, args_str: str = "") -> bool:
             print(f"{GRAY}Usage:{RESET} {YELLOW}:nav /path[?query][#fragment]{RESET}")
         else:
             app.nav(dest)
+        return True
+    entry = _COMMANDS.get(cmd)
+    if entry is not None:
+        try:
+            entry[0](app, args_str)
+        except Exception as exc:  # a dev command must never kill the prompt
+            print(f"\x1b[31m[:{cmd}] {type(exc).__name__}: {exc}\x1b[0m")
         return True
     return False
 
