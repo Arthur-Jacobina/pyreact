@@ -4,11 +4,11 @@ Este projeto agora suporta dois tipos de componentes para exibição de informa�
 
 ## Componente Log
 
-O componente `Log` exibe informações como logs tradicionais, tanto no terminal quanto no browser.
+O componente `Log` publica o texto como um evento `log` (exemplo de componente de saída próprio).
 
 ### Uso:
 ```python
-from log import Log
+from examples.log import Log
 
 @component
 def MyComponent():
@@ -29,7 +29,7 @@ O componente `Message` exibe mensagens como balões de chat no browser e com for
 
 ### Uso:
 ```python
-from message import Message
+from pyreact.components.message import Message
 
 @component
 def MyComponent():
@@ -65,12 +65,15 @@ def MyComponent():
 
 ## Diferenças Visuais
 
+`Message` publica eventos `message`; `Log` (`examples/log.py`) publica eventos
+`log` -- quem exibe é o transporte.
+
 ### No Browser:
-- **Log**: Aparece na área de logs (pre com fundo escuro)
+- **Log**: não é encaminhado por padrão (adicione `"log"` a `event_kinds` de `create_fastapi_app`)
 - **Message**: Aparece como balões de chat coloridos na área de mensagens
 
 ### No Terminal:
-- **Log**: Aparece como texto normal
+- **Log**: Aparece quando `"log"` está em `console_kinds` de `read_terminal_and_invoke`
 - **Message**: Aparece com cores ANSI baseadas no sender e tipo:
   - User: Azul
   - Assistant: Verde
@@ -81,23 +84,22 @@ def MyComponent():
 
 ## Exemplo Completo
 
-Execute o arquivo `example_usage.py` para ver a diferença:
-
 ```bash
-# No terminal
-python example_usage.py
+# No terminal: Message e um evento customizado (Log), sem LM
+uv run python -m examples.message
+uv run python -m examples.log
 
 # No browser
-python main_web.py
+uv run python -m examples.main_web --app qa_guardrail
 ```
 
 ## Integração com o Sistema
 
 Os componentes foram integrados nos seguintes locais:
 
-1. **QAHome**: Mensagem de boas-vindas como Message
-2. **QAAgent**: Respostas do assistente como Message
-3. **GuardRail**: Avisos de toxicidade como Message
+1. **QAHome** (`examples/qa_guardrail.py`): Mensagem de boas-vindas como Message
+2. **QAAgent** (`examples/qa_guardrail.py`): Respostas do assistente como Message
+3. **GuardRail** (`examples/qa_guardrail.py`): Avisos de toxicidade como Message
 4. **Home**: Mensagem de boas-vindas como Message
 
 ## Configuração do Socket

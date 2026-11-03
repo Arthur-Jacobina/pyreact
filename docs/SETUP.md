@@ -43,13 +43,19 @@ python -c "import os; print('API Key configurada:', bool(os.getenv('OPENAI_API_K
 
 Após configurar a API key, execute o projeto:
 
-```bash
-# Para versão web
-python main_web.py
+A partir da raiz do repositório (os exemplos são um pacote):
 
-# Para versão terminal
-python main_terminal.py
+```bash
+# Versão terminal (cada linha é um turno; :help lista os comandos)
+uv run python -m examples.router_app      # ou: qa_guardrail, tools
+
+# Versão web (uma sessão por aba)
+uv run python -m examples.main_web --app router_app
 ```
+
+Os exemplos escolhem o LM por `PYREACT_EXAMPLE_LM` (`claude` = CLI `claude -p`,
+sem API key; `openai` = usa `OPENAI_API_KEY`; `offline` = LM falso
+determinístico). Veja `examples/_lm.py`.
 
 ## Solução de Problemas
 

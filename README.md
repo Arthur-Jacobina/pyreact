@@ -73,62 +73,47 @@ Key pieces:
 3. The loop `run_renders` renders contexts, reconciles children, then runs effects.
 4. On unmount, `HookContext.unmount()` runs effect cleanups, removes context subscriptions, and unmounts the subtree.
 
-## DSPy Provider Setup
+## Running the examples
 
-### OpenAI API Key Configuration
+### 1. Pick the LM
 
-To use this project's AI resources, you need to configure your OpenAI API key.
+Every example gets its LM from `examples/_lm.py`, switched by `PYREACT_EXAMPLE_LM`:
 
-### 1. Get an API Key
-
-1. Access [OpenAI Platform](https://platform.openai.com/)
-2. Log in or create an account
-3. Go to "API Keys" in the sidebar menu
-4. Click "Create new secret key"
-5. Copy the generated key
-
-### 2. Configure the API Key
-
-#### Option A: Environment Variable (Recommended)
+- `claude` (default without an OpenAI key): the `claude -p` CLI as a dev LM, no API key.
+- `openai` (default when `OPENAI_API_KEY` is set): `gpt-4o-mini`.
+- `offline`: a deterministic fake LM; examples run in seconds with meaningless answers
+  (what `tests/test_examples_smoke.py` uses).
 
 ```bash
-export OPENAI_API_KEY="your_api_key_here"
+export PYREACT_EXAMPLE_LM=openai OPENAI_API_KEY="your_api_key_here"   # optional
 ```
 
-#### Option B: .env File
+In your own app, pass any `dspy.LM` to `DSPyProvider(lm=...)` or
+`DSPyProvider(models={"default": ..., "fast": ..., "reasoning": ...})`.
 
-Create a `.env` file in the project root:
+### 2. Run the Project
 
-```bash
-# .env
-OPENAI_API_KEY=your_api_key_here
-```
-
-**Note:** The `.env` file is in `.gitignore` for security. Never commit your API key to the repository.
-
-### 3. Verify Configuration
-
-To check if the configuration is working:
+Run from the repository root (examples are a package). In the terminal every
+line is a turn; `:help` lists the dev commands (`:events`, `:usage`, `:turns`,
+`:route`, `:nav`, `:q`).
 
 ```bash
-python -c "import os; print('API Key configured:', bool(os.getenv('OPENAI_API_KEY')))"
-```
+# Routing: pages are routes; an LLM turns free text into a navigation
+uv run python -m examples.router_app
 
-### 4. Run the Project
+# Guardrail: a checker agent decides whether the QA agent may run
+uv run python -m examples.qa_guardrail
 
-After configuring the API key, run the project:
+# Tool-calling multi-agent store: supervisor -> ReAct specialists
+uv run python -m examples.tools
 
-Run from the repository root (examples are a package):
+# Any of them in the browser (one session per tab), or self-test it
+uv run python -m examples.main_web --app router_app   # | qa_guardrail | tools
+uv run python -m examples.main_web --check
 
-```bash
-# Web version
-uv run python -m examples.main_web
-
-# Terminal version
-uv run python -m examples.main_terminal
-
-# Tool-calling multi-agent store (terminal)
-uv run python -m examples.main_tools
+# Messages and custom events, no LM
+uv run python -m examples.message
+uv run python -m examples.log
 
 # Durable memory, smallest first (see pyreact_durable/README.md)
 uv run python -m examples.durable.01_counter
@@ -231,15 +216,9 @@ feedback` shows what it learned from.
 
 ### Error: "DSPy context not available"
 
-This error indicates that:
-1. The API key is not configured
-2. The API key is invalid
-3. The DSPyProvider was not initialized correctly
-
-**Solutions:**
-1. Check if the `OPENAI_API_KEY` variable is defined
-2. Confirm that the API key is valid
-3. Restart the application after configuring the API key
+The DSPyProvider was not mounted above the component, or its LM could not be
+built. For the examples, check `PYREACT_EXAMPLE_LM`: `claude` needs the `claude`
+CLI on your PATH, `openai` needs `OPENAI_API_KEY`; `offline` needs nothing.
 
 ### Error: "No language model configured"
 
