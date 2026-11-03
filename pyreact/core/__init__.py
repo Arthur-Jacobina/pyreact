@@ -1,5 +1,5 @@
 # pyreact/core/__init__.py
-from .hook import HookContext
+from .hook import HookContext, Ref
 from .provider import create_context
 from .runtime import schedule_rerender, run_renders
 from .core import VNode
@@ -13,6 +13,7 @@ from .harness import Blocked, Boundary, HarnessProvider, current_boundary, throu
 
 __all__ = [
     "HookContext",
+    "Ref",
     "create_context",
     "schedule_rerender",
     "run_renders",

@@ -62,15 +62,15 @@ def Chat():
     events = hooks.get_service("event_bus", EventBus)
     call = use_agent_call(ChatSig)
     question, set_question = hooks.use_state(None)  # (n, text): a new value per message
-    latest = hooks.use_memo(lambda: {}, [])
-    latest["conv"] = conv
+    latest = hooks.use_ref(conv)  # read by the long-lived nav listener below
+    latest.current = conv
 
     def say(text: str, sender: str = "assistant") -> None:
         events.publish("message", {"text": text, "sender": sender, "message_type": "chat"})
 
     def redraw_on_connect():
         def on_nav(_ev):
-            msgs = latest["conv"].messages
+            msgs = latest.current.messages
             for m in msgs:
                 say(m["content"], m["role"])
             say(f"({len(msgs)} message(s) restored)", "system")

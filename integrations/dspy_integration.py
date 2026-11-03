@@ -84,10 +84,9 @@ def DSPyProvider(
 ):
     # Module caches survive env rebuilds (modules are LM-agnostic: the LM is
     # applied per call). Compiled programs are tied to the optimizer.
-    store = hooks.use_memo(
-        lambda: {"caches": {}, "compiled": {}, "compiling": set(), "optimizer": None},
-        [],
-    )
+    store = hooks.use_ref(
+        {"caches": {}, "compiled": {}, "compiling": set(), "optimizer": None}
+    ).current
 
     def _factory():
         model_registry = dict(models or {})

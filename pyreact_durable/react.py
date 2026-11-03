@@ -1,7 +1,8 @@
 """The border between pyreact and the session log.
 
 Everything here is built on pyreact's *public* surface only:
-``hooks.use_state / use_memo / use_effect / use_callback / use_context``,
+``hooks.use_state / use_ref / use_memo / use_effect / use_callback /
+use_context``,
 ``hooks.provide``, ``hooks.path`` / ``hooks.full_path``, ``hooks.get_service`` and the session's
 ``EventBus``. Nothing in ``pyreact`` knows this module exists.
 
@@ -223,11 +224,11 @@ def _use_box(hook: str, key: str, make_initial: Callable[[], Any]) -> Tuple[dict
     in sync with the log position, and a ``commit(new)`` that persists."""
     handle = hooks.use_context(_DurableCtx)
     path = hooks.path
-    box = hooks.use_memo(
-        lambda: {"sync": _UNSET, "value": None, "lock": threading.RLock(),
-                 "mounted": True, "log": None},
-        [],
-    )
+    ref = hooks.use_ref(None)
+    if ref.current is None:  # lazy init: the RLock is created once
+        ref.current = {"sync": _UNSET, "value": None, "lock": threading.RLock(),
+                       "mounted": True, "log": None}
+    box = ref.current
     _tick, bump = hooks.use_state(0)
 
     log = handle.log if handle is not None else None

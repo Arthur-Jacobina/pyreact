@@ -25,6 +25,7 @@ Key pieces:
   - `use_state(initial)`: returns `[state, set_state]`; calls `schedule_rerender` when value changes.
   - `use_reducer(reducer, initial, init_fn=None, deps=None)`: returns `[state, dispatch]`; supports lazy init and dependency‑based re‑init.
   - `use_memo(factory, deps)`, `use_callback(fn, deps)`: memoization primitives.
+  - `use_ref(initial)`: a `Ref` whose `.current` persists across renders (React `useRef`); mutating it does not rerender. Use it for "latest value" boxes read by long-lived callbacks.
 
 ### 4) Effects ↔ Agent side‑effects and async work
 - React `useEffect` runs after commit when dependencies change.

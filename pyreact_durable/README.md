@@ -276,7 +276,7 @@ session 4f8185e0-…  v1  52 entries  2 branch point(s)  leaf=50072721
   opt-in layer composed *around* it. `tests/test_durable_lm.py` asserts that
   no module under `pyreact/` mentions or imports `pyreact_durable`. Removing
   the package changes nothing for apps that don't use it.
-- **Only public seams.** State goes through `use_state`/`use_memo`/
+- **Only public seams.** State goes through `use_state`/`use_ref`/`use_memo`/
   `use_effect`; addressing through `hooks.path`; sharing through
   `hooks.provide`/`use_context`; observation through the session `EventBus`;
   LM durability through the `dspy.BaseLM` interface. These are the same seams
