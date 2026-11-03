@@ -5,6 +5,8 @@ from .runtime import schedule_rerender, run_renders
 from .core import VNode
 from .message_buffer import MessageBuffer
 from .core import component, hooks
+from .events import Event, EventBus
+from . import runtime
 
 __all__ = [
     "HookContext",
@@ -15,4 +17,7 @@ __all__ = [
     "MessageBuffer",
     "component",
     "hooks",
+    "Event",
+    "EventBus",
+    "runtime",
 ]
