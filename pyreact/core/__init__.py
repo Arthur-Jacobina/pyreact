@@ -8,6 +8,8 @@ from .core import component, hooks
 from .events import Event, EventBus
 from .turns import Turn, TurnManager, use_turn
 from . import runtime
+from . import harness
+from .harness import Blocked, Boundary, HarnessProvider, through, use_harness
 
 __all__ = [
     "HookContext",
@@ -24,4 +26,10 @@ __all__ = [
     "TurnManager",
     "use_turn",
     "runtime",
+    "harness",
+    "Blocked",
+    "Boundary",
+    "HarnessProvider",
+    "through",
+    "use_harness",
 ]
