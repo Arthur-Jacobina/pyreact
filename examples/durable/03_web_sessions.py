@@ -11,12 +11,14 @@ mounts (escaped with ``safe_session_id``, so it is always safe in a path), and
 the log is closed when the session closes (tab gone for ``session_ttl`` s, or
 server stop). Logs of sessions closed by the TTL are kept by default; pass
 ``Durable(..., on_close="archive" | "delete" | fn)`` to clean them up (server
-shutdown never triggers it). Inside, ``use_conversation()`` is the persisted transcript, so:
+shutdown never triggers it). Inside, ``use_conversation()`` is the persisted
+transcript, so:
 
 - two tabs never see each other's conversation (two files);
-- reloading a tab, or restarting the server and reloading, restores it: on
-  every (re)connect the browser sends ``hello`` -> a ``nav`` event, and the
-  component re-sends the transcript so the page can draw it again.
+- reloading a tab, or restarting the server and reloading, restores it: the
+  component publishes the restored transcript when it mounts, and the web
+  layer replays a session's recent events to every socket that attaches
+  (a reconnect only gets what it missed), so the page draws it again.
 
     uv run python -m examples.durable.03_web_sessions          # http://127.0.0.1:8000
     uv run python -m examples.durable.03_web_sessions --check  # self-test, no browser
@@ -63,25 +65,20 @@ def Chat():
     conv = use_conversation()  # this session's transcript, restored from its file
     events = hooks.get_service("event_bus", EventBus)
     call = use_agent_call(ChatSig)
-    latest = hooks.use_ref(conv)  # read by the long-lived nav listener below
-    latest.current = conv
 
     def say(text: str, sender: str = "assistant") -> None:
         events.publish("message", {"text": text, "sender": sender, "message_type": "chat"})
 
-    def redraw_on_connect():
-        def on_nav(_ev):
-            msgs = latest.current.messages
-            for m in msgs:
-                say(m["content"], m["role"])
-            say(f"({len(msgs)} message(s) restored)", "system")
+    def show_restored():  # on mount; the web layer replays it to the tab
+        for m in conv.messages:
+            say(m["content"], m["role"])
+        say(f"({len(conv.messages)} message(s) restored)", "system")
 
-        return events.subscribe(on_nav, ["nav"])
-
-    hooks.use_effect(redraw_on_connect, [])
+    hooks.use_effect(show_restored, [])
 
     def ask(turn):  # once per input (a repeated question is a new turn)
         if turn.text.strip():
+            say(turn.text.strip(), "user")  # an event, so a reloaded tab replays it too
             call.run(question=turn.text.strip(), history=conv.as_dspy_history())
 
     use_on_turn(ask)
