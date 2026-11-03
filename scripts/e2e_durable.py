@@ -56,17 +56,17 @@ def child(log_path: str, mode: str, crash_after_llm: bool) -> None:
 
         log.subscribe(_die)
 
-    app = start(log, claude_cli_lm.ClaudeCLILM("haiku"), lm_mode=mode)
-    app.event_bus.subscribe(
+    root = start(log, claude_cli_lm.ClaudeCLILM("haiku"), lm_mode=mode)
+    root.events.subscribe(
         lambda ev: emit({"msg": ev.payload.get("text"), "sender": ev.payload.get("sender")}),
-        ["message"],
+        ["message"], replay=True,
     )
     emit({"ready": True, "leaf": log.leaf})
     for line in iter(sys.stdin.readline, ""):
         line = line.rstrip("\n")
-        app.invoke(line, wait=True, timeout=TURN_TIMEOUT)
+        root.send(line, wait=True, timeout=TURN_TIMEOUT)
         emit({"done": line, "calls": len(claude_cli_lm.CALLS)})
-    app.shutdown()
+    root.unmount()
     log.close()
 
 

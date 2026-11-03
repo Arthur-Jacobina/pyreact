@@ -24,11 +24,12 @@ No LLM. Delete the file to start from zero.
 from __future__ import annotations
 
 import argparse
-import asyncio
 
-from pyreact.boot import bootstrap, read_terminal_and_invoke
+from examples._devtools import run_repl
+from pyreact.boot import create_root
 from pyreact.components.keystroke import Keystroke
-from pyreact.core import component, hooks, use_emit
+from pyreact.components.message import Message
+from pyreact.core import component
 from pyreact_durable import Durable, use_persistent_reducer, use_persistent_state
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -43,7 +44,6 @@ def reducer(count: int, action: str) -> int:
 def Counter():
     count, dispatch = use_persistent_reducer(reducer, 0, key="count")
     presses, set_presses = use_persistent_state(0, key="presses")
-    emit = use_emit()
 
     def on_submit(text: str) -> None:
         action = text.strip()
@@ -51,15 +51,15 @@ def Counter():
             dispatch(action)
             set_presses(lambda n: n + 1)
 
-    def show():  # runs on mount (restored values) and after every change
-        emit("message", {"sender": "assistant",
-                                   "text": f"count={count}  (presses so far: {presses})"})
+    return [
+        Keystroke(key="keys", on_submit=on_submit),
+        # published on mount (the restored values) and whenever the text changes
+        Message(key="count", text=f"count={count}  (presses so far: {presses})",
+                sender="assistant"),
+    ]
 
-    hooks.use_effect(show, [count, presses])
-    return [Keystroke(key="keys", on_submit=on_submit)]
 
-
-async def main() -> None:
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default="runs/durable/counter.jsonl")
     log = ap.parse_args().log
@@ -68,14 +68,11 @@ async def main() -> None:
     def App():  # address: App/Counter[counter] (providers add no path segment)
         return [Durable(key="durable", log=log, children=[Counter(key="counter")])]
 
-    app = bootstrap(App)
     print(f"state lives in {log}  (inspect: python -m pyreact_durable state {log})")
     print("type +, - or reset; :q to quit")
-    try:
-        await read_terminal_and_invoke(app, prompt="> ")
-    finally:
-        app.shutdown()
+    with create_root(App, session_id="counter") as root:
+        run_repl(root, prompt="> ")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

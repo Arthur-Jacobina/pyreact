@@ -33,13 +33,14 @@ LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offl
 from __future__ import annotations
 
 import argparse
-import asyncio
 
 import dspy
 
+from examples._devtools import run_repl
 from integrations import DSPyProvider, use_call, use_predict
-from pyreact.boot import bootstrap, read_terminal_and_invoke
-from pyreact.core import component, hooks, use_emit, use_on_turn
+from pyreact.boot import create_root
+from pyreact.components.message import Message
+from pyreact.core import component, hooks, use_on_turn
 from pyreact_durable import (
     Durable,
     SessionLogError,
@@ -69,13 +70,15 @@ class ChatSig(dspy.Signature):
 def DurableChat():
     conv = use_conversation()  # persisted transcript (this branch)
     log = use_durable()
-    emit = use_emit()
     chat = use_predict(ChatSig)
     call = use_call(chat)
     hooks_path = hooks.path
+    # the latest reply (a command's output or an answer), as state:
+    # (n, text, sender) -> rendered as a new Message per reply
+    reply, set_reply = hooks.use_state(None)
 
     def say(text: str, sender: str = "assistant") -> None:
-        emit("message", {"text": text, "sender": sender, "message_type": "chat"})
+        set_reply(lambda prev: ((prev[0] + 1) if prev else 1, text, sender))
 
     def command(line: str) -> None:
         cmd, _, arg = line[1:].partition(" ")
@@ -122,7 +125,10 @@ def DurableChat():
             say(f"LM error: {call.error}", "system")
 
     hooks.use_effect(_remember, [call.ver])
-    return []
+    if reply is None:
+        return []
+    n, text, sender = reply
+    return [Message(key=f"reply-{n}", text=text, sender=sender)]
 
 
 @component
@@ -144,17 +150,18 @@ def default_lm():
     return example_lm()
 
 
-def start(log, lm, lm_mode="replay_or_record"):
-    """Boot the app on ``log`` (path or SessionLog); returns the AppRunner."""
+def start(log, lm, lm_mode="replay_or_record", session_id="chat"):
+    """Mount the app on ``log`` (path or SessionLog); returns its root
+    (``root.send(text, wait=True)``, ``root.unmount()``)."""
 
     @component
     def App():
         return [DurableChatApp(key="app", log=log, lm=lm, lm_mode=lm_mode)]
 
-    return bootstrap(App)
+    return create_root(App, session_id=session_id)
 
 
-async def main() -> None:
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default=DEFAULT_LOG)
     args = ap.parse_args()
@@ -165,12 +172,10 @@ async def main() -> None:
     except ImportError:  # pragma: no cover
         pass
 
-    app = start(args.log, default_lm())
     print(f"durable chat on {args.log} — /help for commands, :q to quit")
-    try:
-        await read_terminal_and_invoke(app, prompt="> ")  # "/..." lines reach the app
-    finally:
-        app.shutdown()
+    with start(args.log, default_lm()) as root:
+        run_repl(root, prompt="> ")  # "/..." lines reach the app
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

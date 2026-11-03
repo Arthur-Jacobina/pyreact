@@ -16,9 +16,10 @@ transcript, so:
 
 - two tabs never see each other's conversation (two files);
 - reloading a tab, or restarting the server and reloading, restores it: the
-  component publishes the restored transcript when it mounts, and the web
-  layer replays a session's recent events to every socket that attaches
-  (a reconnect only gets what it missed), so the page draws it again.
+  component *renders* the transcript (one ``Message`` per entry, keyed by
+  its index), so the restored messages are published when it mounts, and
+  the web layer replays a session's recent events to every socket that
+  attaches (a reconnect only gets what it missed), so the page draws it again.
 
     uv run python -m examples.durable.03_web_sessions          # http://127.0.0.1:8000
     uv run python -m examples.durable.03_web_sessions --check  # self-test, no browser
@@ -45,7 +46,8 @@ import dspy
 from examples._lm import OFFLINE, example_lm
 from integrations import DSPyProvider, use_agent_call
 from pyreact.boot import make_web_app, run_web
-from pyreact.core import component, hooks, use_emit, use_on_turn
+from pyreact.components.message import Message
+from pyreact.core import component, hooks, use_on_turn
 from pyreact_durable import Durable, use_conversation
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -63,22 +65,13 @@ class ChatSig(dspy.Signature):
 @component
 def Chat():
     conv = use_conversation()  # this session's transcript, restored from its file
-    emit = use_emit()
     call = use_agent_call(ChatSig)
-
-    def say(text: str, sender: str = "assistant") -> None:
-        emit("message", {"text": text, "sender": sender, "message_type": "chat"})
-
-    def show_restored():  # on mount; the web layer replays it to the tab
-        for m in conv.messages:
-            say(m["content"], m["role"])
-        say(f"({len(conv.messages)} message(s) restored)", "system")
-
-    hooks.use_effect(show_restored, [])
+    restored = hooks.use_ref(len(conv.messages))  # how many came back on mount
+    pending, set_pending = hooks.use_state(None)  # the question being answered
 
     def ask(turn):  # once per input (a repeated question is a new turn)
         if turn.text.strip():
-            say(turn.text.strip(), "user")  # an event, so a reloaded tab replays it too
+            set_pending(turn.text.strip())
             call.run(question=turn.text.strip(), history=conv.as_dspy_history())
 
     use_on_turn(ask)
@@ -87,12 +80,22 @@ def Chat():
         if call.result is not None:  # call.inputs: what the settled call was asked
             conv.extend([{"role": "user", "content": call.inputs["question"]},  # one entry per pair
                          {"role": "assistant", "content": call.result.answer}])
-            say(call.result.answer)
-        elif call.error is not None:
-            say(f"LM error: {call.error}", "system")
+        set_pending(None)
 
     hooks.use_effect(remember, [call.ver])
-    return []
+
+    # The transcript is rendered: Message i is entry i. A pending question is
+    # rendered under the key its entry will get, so it is published once.
+    out = [Message(key=f"m{i}", text=m["content"], sender=m["role"])
+           for i, m in enumerate(conv.messages)]
+    out.append(Message(key="restored", text=f"({restored.current} message(s) restored)",
+                       sender="system", trigger="mount"))
+    if pending is not None:
+        out.append(Message(key=f"m{len(conv.messages)}", text=pending, sender="user"))
+    if call.error is not None:
+        out.append(Message(key=f"error-{call.ver}", text=f"LM error: {call.error}",
+                           sender="system", message_type="error"))
+    return out
 
 
 def make_app(logs: str, lm):
