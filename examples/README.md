@@ -58,7 +58,7 @@ See [Error recovery](../README.md#error-recovery) in the main README.
 |---|---|---|
 | `stateful.01_suspend_resume` | A coding agent (sandbox tools, durable conversation, a learned prompt) is **suspended mid-turn** into one manifest; a **new process** resumes it: the conversation, the sandbox files, the learned prompt and the cut turn come back, and the turn's answered LLM calls are replayed from the log (`--demo` runs both processes; `--driver local` = no Docker) | yes (≤ 15 calls) |
 
-See [Stateful agents](../README.md#stateful-agents-suspend--resume) in the main README.
+See [Stateful agents](../README.md#stateful-agents-roots-use_dehydrate-activity) in the main README.
 
 ## Learning: architectures & optimizers (`examples/learn/`)
 

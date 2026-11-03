@@ -82,8 +82,8 @@ Key pieces:
 - Stateful across restarts: a `SnapshotStore` (memory, file, or the `pyreact_durable` log) records the sandbox; a new runner reattaches it or restores its snapshot (`autosnapshot="turn"`).
 - `sandbox_tools(sb)` → `run_shell` / `run_python` / `read_file` / `write_file` for `use_agent`; `SandboxInterpreter(sb)` runs RLM's REPL in the sandbox instead of Deno. Example: [`examples/sandbox/01_coding_agent.py`](examples/sandbox/01_coding_agent.py).
 
-### 12) Suspend / resume ↔ Stateful agents
-- An agent is a session's whole state (durable state + conversation, sandbox, pending turns, learned prompts). `session.suspend()` writes it as one manifest through *participants* the libraries register (`pyreact_durable`, `pyreact_sandbox`, `integrations`); `app.resume(session_id)` hands each its fragment before the first render and re-runs the turn that was cut short. `AppRunner(idle_policy="suspend")` makes idle reaping suspend instead of close. See [Stateful agents](#stateful-agents-suspend--resume).
+### 12) Suspend / resume ↔ `createRoot` / `hydrateRoot` + `<Activity>`
+- An agent is its tree's state. Components declare how theirs survives with `use_dehydrate(key, dehydrate=..., hydrate=...)`; `create_root(App, store=...)` / `root.suspend()` hide the tree (cleanup reason `"suspend"`), dehydrate it into a JSON snapshot and unmount; `hydrate_root(App, session_id=...)` gives every hook its slice during the first render and re-runs the turn that was cut short. `Activity(mode="hidden")` keeps a subtree's state while it gets no turns. See [Stateful agents](#stateful-agents-roots-use_dehydrate-activity).
 
 ### Lifecycle overview
 1. A root agent (component) is wrapped in a `HookContext` by the runner.
@@ -105,6 +105,8 @@ If you know React, you know pyreact: every public hook, with its React counterpa
 | context | `use_path()` / `hooks.path` | the component's stable tree path (`App/Chat[chat]`) | `useId`-ish |
 | refs | `hooks.use_ref(initial)` | mutable `Ref` (`.current`) that persists, no rerender | `useRef` |
 | refs | `use_imperative_handle(ref, factory, deps=None, *, name=None)` | expose a handle through a `ref=` prop (`Ref`, callback, or a name in the session's `"refs"` registry) | `useImperativeHandle` |
+| effects | `use_cleanup_reason()` | inside a cleanup: `"unmount"` / `"deps"` / `"hidden"` / `"suspend"` (also passed to a one-argument cleanup) | - |
+| state | `use_dehydrate(key, *, dehydrate, hydrate=None, initial=None)` | a slice of the snapshot owned by the component: hydrated value on the first render, `dehydrate()` on suspend | `hydrateRoot` / TanStack `dehydrate` |
 | turns | `use_turn(policy=None, *, since_mount=False)` | latest `Turn`; rerenders on each input; per-subtree turn policy | - |
 | turns | `use_on_turn(fn, **use_turn_kwargs)` | run `fn(turn)` once per input (async = part of the turn) | - |
 | input | `use_input(types=None)` | latest raw input event (`text`/`submit`/...) with a `seq`; rerenders on each | `onChange` |
@@ -451,192 +453,169 @@ and global bus, with `turn_id` and the component path): `:events`,
 exporters see them. Middleware-level state is on the boundary
 (`b.attempt`, `retries`, `fallback`, `circuit`, `timed_out`).
 
-## Stateful agents: suspend / resume
+## Stateful agents: roots, `use_dehydrate`, `Activity`
 
-An **agent is a session's whole state**: durable component state and its
-conversation, its sandbox (and the files in it), the turns it has queued or
-was in the middle of, the prompts it learned. Making a long-running agent
-sleep and wake up — on idle, on deploy, on another machine — is one explicit,
-observable operation:
+An **agent is its tree's state**: what its components hold (conversation,
+sandbox reference, learned program), plus the turns it has queued or was in
+the middle of. Following [ADR 0001](docs/adr/0001-look-like-react.md), the
+tree is the source of truth: each component declares how its own state
+survives with a hook, and outside code talks to the tree only through its
+**root** (cf. React `createRoot` / `hydrateRoot`):
 
 ```python
-from pyreact.boot import AppRunner, DirectoryManifestStore
-from pyreact_durable import DurableParticipant
-from pyreact_sandbox import SandboxParticipant
-from integrations.stateful import CompiledModulesParticipant
+from pyreact.boot import create_root, hydrate_root, DirectorySnapshots
+from pyreact.core import component, hooks, use_dehydrate, use_on_turn
 
-app = AppRunner(App, default_session=False,
-                participants=[DurableParticipant, SandboxParticipant,
-                              lambda s: CompiledModulesParticipant(s, dir="runs/learned")],
-                manifest_store=DirectoryManifestStore("runs/manifests"))
-s = app.open_session("agent-1")
-s.invoke("write fib.py and run it", wait=True)
-manifest = s.suspend(on_active="wait")       # -> runs/manifests/agent-1.json, tree unmounted
+@component
+def Coder():
+    start = use_dehydrate("history", dehydrate=lambda: history.current, initial=[])
+    history = hooks.use_ref(list(start))
+    use_on_turn(lambda turn: history.current.append(turn.text))
+    return []
+
+store = DirectorySnapshots("state/")
+root = create_root(App, session_id="coder-1", store=store)
+root.send("write fib.py and run it", wait=True)   # a turn; returns its id
+root.suspend(on_active="interrupt")              # -> state/coder-1.json, tree unmounted
 
 # ... later, in another process:
-s = app.resume("agent-1")                    # same id; state, sandbox, prompts, cut turns back
+root = hydrate_root(App, session_id="coder-1", store=store)   # same id, state back, cut turn re-run
 ```
 
-The core keeps the "libraries at the border" rule: `pyreact.boot` only
-defines lifecycle hooks, the participant protocol, manifests and their
-stores; `pyreact_durable`, `pyreact_sandbox` and `integrations` plug their
-state in; nothing in `pyreact/` imports them. Example (two processes, real
-LLM + Docker, or offline with `--driver local`):
-[`examples/stateful/01_suspend_resume.py`](examples/stateful/01_suspend_resume.py).
+### Roots
+
+- `create_root(App, *, session_id=None, store=None, runner=None, **session_opts) -> Root`:
+  a fresh tree. `hydrate_root(App, *, session_id, store=None, snapshot=None,
+  runner=None, resume_turns=True, consume=True, wait=False)`: a tree hydrated
+  from `snapshot` (a dict or a path) or from `store`. Async: `acreate_root` /
+  `ahydrate_root`.
+- Roots sit on top of `AppRunner` / `Session` (the engine). `runner=None`
+  creates a runner owned by the root (stopped with it); pass `runner=r` to
+  host many roots on one loop. `session_opts` go to `open_session`
+  (`turn_policy="interrupt"`).
+- `root.send(text, wait=False, timeout=None)` / `await root.asend(...)`:
+  input (returns the turn id); `root.wait_turn(id)`, `root.wait_idle()`.
+- `root.ref(name)`: the handle a component exposed with
+  `use_imperative_handle(ref, factory, name=name)` (or a `ref="name"` prop),
+  read from the session's `"refs"` registry — never `session.services`.
+- `root.dehydrate() -> Snapshot`: the live tree's snapshot, nothing unmounted.
+- `root.suspend(on_active="wait"|"interrupt", timeout=None) -> Snapshot`:
+  1. `session.suspending`; new input is refused, queued turns are held;
+  2. the active turn ends — `"wait"` lets it finish (interrupted after
+     `timeout` s), `"interrupt"` cancels it now; a cut turn is **carried**;
+  3. the tree is hidden like an `Activity`: every effect cleanup runs with
+     the reason `"suspend"` (async cleanups awaited) — pause or snapshot what
+     you own instead of destroying it;
+  4. the tree is dehydrated and saved to `store`; `session.suspended {ref}`;
+  5. the tree unmounts.
+  If dehydrating or saving fails nothing is unmounted: effects re-run, held
+  turns start, the cut turn is re-queued, `session.suspend.failed`,
+  `SuspendError`.
+- `root.unmount()`; `root.events` / `root.observer` / `root.event_bus`: the
+  session's observability, for devtools (not for rendering).
+- On hydrate, turn numbering continues (`coder-1/t3` after `t2`) and carried
+  turns re-run with the same ids (`turn.resumed`), after the first render.
+  Like `resume_pending`, a re-run is at-least-once for its side effects.
+
+### `use_dehydrate` — hooks own their serialization
+
+```python
+value = use_dehydrate(key, *, dehydrate, hydrate=None, initial=None)
+```
+
+- Registers a slice addressed by `(component path, key)`; the registration
+  follows the component's lifecycle. `dehydrate()` (sync or async) returns
+  JSON; the latest render's function is used.
+- During hydration the hook returns the hydrated value **in the component's
+  first render**: `hydrate(slice)` if given, else the slice; otherwise
+  `initial`. The value is stable across renders (feed it to `use_state` /
+  `use_ref`).
+- An async `hydrate` holds the component (it renders nothing, no effects)
+  until it resolves; a `Hydrating(fallback=Spinner(), children=[...])`
+  ancestor shows its fallback and holds its whole subtree meanwhile.
+- **Hydration mismatches** are never fatal: a slice no hook claims, a hook
+  with no slice (it starts from `initial`) or a failing `hydrate` publish
+  `hydration.mismatch {kind: "unclaimed"|"missing"|"error", path, key}` and
+  warn (`HydrationWarning`); `root.mismatches` lists them. Keep paths stable
+  with keys (providers, `Activity` and `Hydrating` are transparent).
+- Low level: `dehydrate_tree(root_ctx)` / `await adehydrate_tree(root_ctx)`
+  build a snapshot from any mounted tree; a non-JSON value or a failing
+  `dehydrate` raises `SnapshotError` naming the path and key.
+
+### `Activity` and cleanup reasons
+
+`Activity(mode="visible"|"hidden", children=[...])` keeps a subtree mounted
+with its state while hidden: its effects are cleaned up and do not run, so
+it gets **no new turns** (a turn that started while hidden is not delivered
+on reveal); `"visible"` re-runs its effects. Cleanups know why they run —
+`use_cleanup_reason()` (or a cleanup taking one argument) is `"unmount"`,
+`"deps"`, `"hidden"` or `"suspend"`:
+
+```python
+def fx():
+    sb = start_sandbox()
+    def cleanup(reason):
+        sb.snapshot() if reason == "suspend" else sb.destroy()
+    return cleanup
+hooks.use_effect(fx, [])
+```
+
+### Snapshot format
+
+```json
+{
+  "format": "pyreact.snapshot/1",
+  "session_id": "coder-1",
+  "created_at": 1793726199.04,
+  "slices": {
+    "App/Coder[coder]": {"history": [{"user": "write fib.py", "agent": "ok: write fib.py"}]}
+  },
+  "turns": {"next_index": 3, "policy": "queue",
+            "carry": [{"id": "coder-1/t2", "index": 2, "text": "slow", "source": "term", "ts": 1793726198.93}]},
+  "versions": {"snapshot": 1, "pyreact": "0.1.0", "python": "3.13.0"}
+}
+```
+
+(Suspended with `on_active="interrupt"` while `coder-1/t2` was in flight, so
+it is carried.) Stores: `MemorySnapshots()`, `DirectorySnapshots(dir)` (one
+`<id>.json` per session, atomic writes), or anything implementing the
+`SnapshotStore` protocol (`save(snapshot) -> ref`, `load(id)`, `delete(id)`,
+`list()`). `load_snapshot(path)` / `check_snapshot(d)` validate one; a newer
+`format` is refused (`SnapshotError`). A snapshot loaded from a store is
+consumed on hydrate (`consume=True`).
 
 ### Session lifecycle hooks
 
 `app.on_session(open=fn, close=fn, replay=False)` calls `open(session)` on
-the runner loop when a session opens or is resumed — **before its first
-render**, so it can subscribe to `session.event_bus`, seed services or add
-participants — and `close(session)` after its tree unmounted
-(`session.close_reason` is `"closed"`, `"idle"`, `"shutdown"` or
-`"suspend"`). It returns a function removing the hooks. `pyreact_otel`'s
-`attach_app(app)` uses it to bridge sessions opened later.
+the runner loop when a session (or root) opens or is hydrated — **before its
+first render** — and `close(session)` after its tree unmounted
+(`session.close_reason`: `"closed"`, `"idle"`, `"shutdown"`, `"suspend"`).
+`pyreact_otel`'s `attach_app(app)` uses it. Events on the session bus:
+`session.opened {resumed}`, `session.suspending`, `session.suspended {ref,
+turn_seq, carried_turns}`, `session.suspend.failed {error}`,
+`session.resumed {turns, mismatches}`, `hydration.mismatch`,
+`session.closed {reason}`.
 
-Events on the session bus: `session.opened {resumed}`,
-`session.suspending {reason, on_active}`, `session.suspended {ref, turn_seq,
-participants, carried_turns}`, `session.suspend.failed {error}`,
-`session.resumed {turn_seq, participants, degraded, turns}`,
-`session.resume.degraded {participant, reason, ...}`, `session.closed {reason}`.
+### Low level: participants (deprecated soon)
 
-### Suspend and resume
-
-`session.suspend(on_active="wait", timeout=None, store=None, reason="manual")`
-(`asuspend` from a loop, `app.suspend_session(id)`):
-
-1. `session.suspending`; new input is refused, queued turns are held;
-2. the active turn ends — `on_active="wait"` lets it finish (after `timeout`
-   seconds it is interrupted), `"interrupt"` cancels all its tasks now. A turn
-   cut short is **carried**: it re-runs (same id, `resumed: true`) on resume;
-3. each participant's `suspend(session)` returns a JSON fragment;
-4. the manifest is saved to the store; `session.suspended`;
-5. the tree unmounts (`close_reason == "suspend"`): providers keep their
-   files (`Durable(on_close=...)` retention only applies to `idle`/`closed`);
-   then participants' optional `suspended(session)` (e.g. wait for sandbox
-   closes). Returns the manifest (plus `ref`).
-
-`app.resume(session_id, manifest=None, store=None, resume_turns=True,
-consume=True, wait=False)` (`aresume`): `manifest` is a dict, a path, or
-`None` to load it from the store. The session is created with the same id,
-`open` hooks register participants, `session.opened {resumed: true}`, each
-participant's `resume(session, fragment)` runs **before the first render**,
-the tree mounts, optional `resumed(session)` hooks run, carried turns are
-re-queued and so are turns a `TurnStore` saw cut short by a crash
-(`resume_pending`), then `session.resumed`. With `consume` the manifest is
-deleted from the store it came from (an old manifest must not be resumed
-twice). Turn numbering continues (`agent-1/t3` after `t2`).
-
-Policies:
-
-- `AppRunner(idle_policy="suspend")`: idle reaping (`close_idle_sessions(ttl)`,
-  the web server's reaper) suspends instead of closing (`reason: "idle"`);
-  a session that fails to suspend stays open.
-- `AppRunner(auto_resume=True)` (default with `idle_policy="suspend"`):
-  `open_session(id)` resumes a session that has a manifest — a browser tab
-  reconnecting after its session was reaped gets its agent back.
-- `on_active`: `"wait"` (default) / `"interrupt"`, with `timeout=` as the
-  wait's upper bound.
-- `SandboxParticipant(mode="snapshot"|"suspend"|"keep")`: snapshot + destroy
-  (survives a machine change), pause and reattach (fast), or leave running.
-
-### Manifest format
-
-```json
-{
-  "format": "pyreact.manifest/1",
-  "session_id": "coder-1",
-  "created_at": 1793720847.46, "suspended_at": 1793720877.92,
-  "reason": "manual", "turn_seq": 2, "turn_policy": "queue",
-  "app": "__main__:make_app.<locals>.App",
-  "participants": {
-    "turns": {"next_index": 3, "carry": [{"id": "coder-1/t2", "index": 2, "text": "Extend the fib.py ...", "source": "term", "ts": 1793720872.88}]},
-    "durable": {"logs": [{"path": "/abs/runs/stateful/logs/coder-1.jsonl", "log_id": "8089a346-…",
-                          "leaf": "d88b31a2", "entries": 25, "version": 1, "pending_turns": []}]},
-    "sandbox": {"mode": "snapshot", "sandboxes": [{"key": "default", "store_key": "coder-1/default",
-                "driver": "docker", "sandbox_id": null, "spec": {"image": "python:3.12-slim", "...": "..."},
-                "snapshot": {"driver": "docker", "id": "pyreact-sandbox:pyrsbx-e4835141d5-suspend",
-                             "sandbox_id": "pyrsbx-e4835141d5", "label": "suspend", "...": "..."}}]},
-    "dspy.compiled": {"modules": [{"key": ["ReAct", "Coder", "coder"], "key_str": "ReAct:Coder:coder",
-                      "provider": "App/DSPyProvider[dspy]", "arch": "react",
-                      "path": "runs/stateful/learned/coder.json"}]}
-  },
-  "versions": {"manifest": 1, "pyreact": "0.1.0", "python": "3.13.0",
-               "participants": {"turns": "1", "durable": "1", "sandbox": "1", "dspy.compiled": "1"}}
-}
-```
-
-(From the real run of the example: suspended while the follow-up turn
-`coder-1/t2` was in flight, so it is carried.)
-
-Stores: `MemoryManifestStore` (default; same process), `DirectoryManifestStore(dir)`
-(one `<id>.json` per session, atomic writes), or any `ManifestStore`
-(`save(manifest) -> ref`, `load(id)`, `delete(id)`, `list()`).
-`load_manifest(path)` reads and validates one; a newer `format` is refused
-(`ManifestError`).
-
-### Participants
-
-| Participant | Name | Fragment | On resume (before the first render) |
-|---|---|---|---|
-| built in | `turns` | next turn index, carried turns | numbering continues; carried turns re-run after the first render |
-| `pyreact_durable.DurableParticipant` | `durable` | per mounted `Durable` log: path, header id, leaf, pending turns | checks the log is there and the same; `Durable` checks it out at the leaf → persistent state + conversation as suspended; `durable_lm` replays a re-run turn's answered calls |
-| `pyreact_sandbox.SandboxParticipant` | `sandbox` | per `use_sandbox` handle: driver, spec, snapshot ref / live id | the record wins over the provider's `SnapshotStore`: restore from the snapshot, or reattach + unpause |
-| `integrations.stateful.CompiledModulesParticipant` | `dspy.compiled` | per program in `env.compiled`: its `integrations.learn` result path (or one saved under `dir`, or the state inline) | the state is loaded into the module `use_module` / `use_agent` builds for that key; the optimized prompt survives restarts |
-
-Writing one — any object with a `name` and two coroutines:
+Before roots, libraries plugged state into `Session.suspend()` /
+`AppRunner.resume()` as *participants* writing a `pyreact.manifest/1`:
 
 ```python
-class Scratchpad:
-    name = "scratchpad"            # its key in manifest["participants"]
-    version = "1"                  # optional, recorded in manifest["versions"]
-
-    def __init__(self, session):   # factories get the session
-        self.session = session
-
-    async def suspend(self, session) -> dict:      # JSON-able, or the suspend fails
-        return {"notes": session.services.get("notes", [])}
-
-    async def resume(self, session, fragment):     # before the first render
-        session.services["notes"] = fragment["notes"]   # components read it on mount
-
-    # optional: async def suspended(self, session)  -- after the tree unmounted
-    # optional: async def resumed(self, session)    -- after the first render
-
-app = AppRunner(App, participants=[Scratchpad])   # or app.add_participant(Scratchpad)
+app = AppRunner(App, participants=[DurableParticipant, SandboxParticipant],
+                manifest_store=DirectoryManifestStore("runs/manifests"),
+                idle_policy="suspend")             # idle reaping suspends; open_session auto-resumes
+manifest = app.open_session("agent-1").suspend()  # participants' fragments -> manifest
+s = app.resume("agent-1")                         # fragments handed back before the first render
 ```
 
-The pattern the bundled ones follow: a provider component registers its live
-object in a session service on mount (so `suspend` can find it); `resume`
-puts what it restored in another service that the provider reads on its
-first render.
-
-### Failure semantics
-
-- **Suspend is all or nothing.** If a participant raises, returns something
-  that is not JSON, or the store cannot save, nothing is unmounted: held
-  turns start again, a turn cut short is re-queued, `session.suspend.failed`
-  is published and `SuspendError` raised. (Side effects a participant already
-  made stay — e.g. a sandbox snapshot that is simply never referenced.)
-- **Resume degrades, it never fails because of one participant.** A fragment
-  no registered participant claims, a participant whose `resume` raises, or
-  one that reports a partial restore with `session.degrade(name, reason,
-  **info)` is recorded in `session.degraded` and published as
-  `session.resume.degraded`; the session goes on with what was restored:
-  - sandbox snapshot gone (or the paused container, or the driver changed) →
-    a **fresh sandbox** boots (`reason: "snapshot missing"`, `"sandbox gone"`,
-    `"restore failed"`, `"driver changed"`);
-  - durable log missing / replaced / leaf gone → the provider opens the file
-    as usual (a fresh log if it is gone);
-  - a learned program's result file missing → that module starts from its
-    signature (`reason: "result missing"`).
-- Resume fails outright only for the envelope: wrong `session_id`,
-  unsupported `format` (`ManifestError`), or the session is already open.
-- Re-running a carried turn is at-least-once for its side effects, like
-  `resume_pending`: answered LLM calls are replayed by `durable_lm`, tools
-  run again (make them idempotent).
-- Do not `await session.asuspend(on_active="wait")` from inside one of that
-  session's turns: it would wait for itself.
+It still works while `pyreact_durable`, `pyreact_sandbox` and `integrations`
+move to `use_dehydrate` (`DurableParticipant`, `SandboxParticipant`,
+`CompiledModulesParticipant`); new code should use roots. The manifest also
+carries the tree's `use_dehydrate` slices (`manifest["slices"]`), hydrated on
+`resume`, so components can migrate first. Example (two processes, real LLM
++ Docker, or offline with `--driver local`):
+[`examples/stateful/01_suspend_resume.py`](examples/stateful/01_suspend_resume.py).
 
 ## Running the examples
 
