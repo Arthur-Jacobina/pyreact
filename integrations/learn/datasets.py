@@ -52,18 +52,45 @@ def _as_dict(ev: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+def _read_lines(path: Any) -> Iterable[str]:
+    """Lines of a JSONL file, or of a SQLite session log (a ``lines(seq, line)``
+    table holding the same JSON lines, as written by ``pyreact_durable``).
+    Reads the format only; nothing here imports that library."""
+    with open(path, "rb") as f:
+        magic = f.read(len(_SQLITE_MAGIC))
+    if magic == _SQLITE_MAGIC:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{os.fspath(path)}?mode=ro", uri=True)
+        try:
+            for (line,) in con.execute("SELECT line FROM lines ORDER BY seq"):
+                yield line
+        finally:
+            con.close()
+        return
+    with open(path, encoding="utf-8") as f:
+        yield from f
+
+
 def iter_events(source: Any) -> Iterable[Dict[str, Any]]:
     """Normalize any supported event source into event dicts."""
     if source is None:
         return
     if isinstance(source, (str, os.PathLike)):
-        with open(source, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    d = _as_dict(json.loads(line))
-                    if d is not None:
-                        yield d
+        for line in _read_lines(source):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:  # torn tail of a log still being written
+                continue
+            d = _as_dict(obj)
+            if d is not None:
+                yield d
         return
     log = getattr(source, "events", None)  # AppRunner / Session
     if log is not None and hasattr(log, "recent"):

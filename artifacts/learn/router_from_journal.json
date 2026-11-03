@@ -1,0 +1,90 @@
+{
+  "format": "pyreact.learn/1",
+  "created": "2026-11-03T02:02:05",
+  "optimizer": "gepa",
+  "budget": 24,
+  "baseline": 0.625,
+  "score": 1.0,
+  "calls": 42,
+  "seconds": 67.37,
+  "train_size": 12,
+  "val_size": 8,
+  "metric": "route_metric",
+  "arch": "cot",
+  "signature": "message, specialists -> name",
+  "signature_class": "examples.tools:RouteSpecialistSig",
+  "module_key": null,
+  "details": {
+    "val_aggregate_scores": [
+      0.625,
+      1.0
+    ],
+    "best_idx": 1,
+    "candidates": 2,
+    "total_metric_calls": 25,
+    "calls_by_phase": {
+      "baseline": 8,
+      "compile": 26,
+      "evaluate": 8
+    },
+    "log_dir": null
+  },
+  "state": {
+    "predict": {
+      "traces": [],
+      "train": [],
+      "demos": [],
+      "signature": {
+        "instructions": "You are a routing classifier for a Brazilian Portuguese e-commerce assistant. Given a customer message and a list of specialists, choose the single specialist best suited to handle the message. Return ONLY the exact `name` of one of the provided specialists, with no punctuation, explanation, or extra text.\n\nSpecialists (use their exact names):\n- `catalog`: what products exist, listing the catalog, searching products, and product prices.\n- `order`: stock/availability of a specific item, buying or ordering, and finalizing orders.\n- `shipping`: shipping cost, delivery time or deadline, and free-shipping eligibility.\n\nMessages are informal Brazilian Portuguese. Expect contractions and slang such as \"pra\" (para), \"vocês\" (you all, meaning the store), \"tá/tem\", and \"sai\" (costs). Match on meaning, not exact wording.\n\nRouting rules, in priority order:\n\n1. **Shipping first.** If the message asks anything about frete, entrega, envio, or delivery (cost, deadline, free shipping, or delivery to a place such as \"pra SP\" or \"para o BR\"), route to `shipping`. This holds even when the message also contains a purchase or order request. Example: \"fechar pedido de 2 tênis e calcular a entrega pra SP\" -> `shipping`. Customers need the delivery answer before they order.\n   - \"quanto custa/sai\" is a price question. It becomes `shipping` only when the item or context is about frete or entrega. Otherwise it is a product price question, which goes to `catalog`.\n\n2. **Availability goes to order.** Stock and current availability are about a specific item: \"ainda tem\", \"tem em estoque\", \"pronta entrega\" (in stock now). These are NOT shipping, even though they sound like delivery. Route them to `order`.\n\n3. **Purchase and checkout go to order.** Requests to buy, order, or close a purchase go to `order`, with or without a quantity. Examples: \"quero comprar 2 chapéus\", \"quero comprar 2 unidades\", \"fazer um pedido\", \"fechar pedido\". This applies when the message has no shipping question.\n\n4. **Catalog for what the store sells.** Questions about what products exist, or whether the store carries a product type, go to `catalog`. Examples: \"vocês vendem boné?\", \"vocês têm camisa?\", \"quais produtos estão disponíveis\", \"liste os produtos\", \"o que vocês vendem\". Asking the price of a product also goes to `catalog`, for example \"qual o preço da camisa\".\n   - \"vocês vendem/têm <tipo de produto>?\" asks about the catalog, not about stock. Do not route it to `order`.\n\nDecision procedure:\n- Check for any shipping/delivery signal first. If present, choose `shipping`.\n- Otherwise, if the message is about buying, ordering, or stock of a specific item, choose `order`.\n- Otherwise, if it asks what is sold, lists products, or asks about prices, choose `catalog`.\n- If the message is ambiguous, choose the specialist whose description and example utterances most closely match the customer's main action. Shipping outranks order, and order outranks catalog.\n\nOutput: the exact specialist name only, such as `order`, `shipping`, or `catalog`.",
+        "fields": [
+          {
+            "prefix": "Message:",
+            "description": "${message}"
+          },
+          {
+            "prefix": "Specialists:",
+            "description": "Available specialists with description and utterances"
+          },
+          {
+            "prefix": "Reasoning:",
+            "description": "${reasoning}"
+          },
+          {
+            "prefix": "Name:",
+            "description": "${name}"
+          }
+        ]
+      },
+      "lm": null
+    }
+  },
+  "baseline_state": {
+    "predict": {
+      "traces": [],
+      "train": [],
+      "demos": [],
+      "signature": {
+        "instructions": "Choose the best specialist for the message.\n\nInstructions:\n- Return ONLY the exact name of one of the provided specialists.\n- Consider each specialist's description and example utterances.\n- \"quais produtos / listar / catálogo / preço\" -> catalog.\n- \"estoque de um item / comprar / pedido\" -> order.\n- \"frete / entrega / frete grátis\" -> shipping.",
+        "fields": [
+          {
+            "prefix": "Message:",
+            "description": "${message}"
+          },
+          {
+            "prefix": "Specialists:",
+            "description": "Available specialists with description and utterances"
+          },
+          {
+            "prefix": "Reasoning:",
+            "description": "${reasoning}"
+          },
+          {
+            "prefix": "Name:",
+            "description": "${name}"
+          }
+        ]
+      },
+      "lm": null
+    }
+  }
+}

@@ -181,7 +181,33 @@ result.save("artifacts/router.json"); result.hot_swap(app, "supervisor")
 - **CLI**: `python -m integrations.learn optimize mod:program --data events.jsonl --module-key
   supervisor --optimizer gepa --budget 40 --out artifacts/x.json`; `inspect x.json`; `diff a.json b.json`.
 - **Examples** (`examples/learn/`, dev LM via `claude -p`): `01_architectures`,
-  `02_optimizers`, `03_live_feedback_loop [--demo]`, `04_custom_architecture_and_optimizer`.
+  `02_optimizers`, `03_live_feedback_loop [--demo]`, `04_custom_architecture_and_optimizer`,
+  `05_durable_learning_loop` (below).
+
+### The whole loop across restarts (durable + learn)
+
+The two libraries only meet at the border: `pyreact_durable` journals what
+happened, `integrations.learn` reads the journal later as a dataset. The app
+code knows about neither.
+
+```python
+# serve: wrap the tree once; turns, LLM calls and feedback land in the journal
+Durable(log="runs/store.jsonl", journal=("turn.*", "llm.*", "feedback"), children=[App()])
+send_feedback(turn_id, 0.0, "should be shipping", expected={"name": "shipping"})
+
+# learn (offline, another process): rated calls only; corrections become labels
+data = dataset_from_events("runs/store.jsonl", "supervisor", require_feedback=True)
+optimize(router, trainset=..., valset=..., metric=route_metric, optimizer="gepa").save(path)
+
+# serve again: load the artifact and hot-swap it at boot
+load(path).hot_swap(app, "supervisor")
+```
+
+`uv run python -m examples.learn.05_durable_learning_loop all` runs the three
+phases with the dev LM. One run (haiku): trained on 12 rated conversations,
+held-out routing went 0.62 → 1.00 (8 messages, so a small sample) for 42 GEPA
+LM calls; `python -m pyreact_durable events runs/store_router.jsonl --kind
+feedback` shows what it learned from.
 
 ### Debug checklist
 
