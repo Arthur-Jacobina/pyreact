@@ -9,12 +9,15 @@ import pytest
 from integrations import DSPyProvider, telemetry, use_agent_call, use_call, use_predict
 from integrations.claude_cli_lm import _wrap
 from integrations.learn import (
+    LearnedProgram,
     configure_learning,
     explain,
+    find_registries,
     inspect_program,
     list_modules,
     run_optimization,
     set_debug,
+    use_learned,
 )
 from integrations.learn.devtools import _CONFIG, LearnConfig, _parse_feedback
 from pyreact.boot import bootstrap, handle_command, register_command
@@ -151,20 +154,25 @@ def learn_cfg():
     _CONFIG.setdefault(None, LearnConfig())
 
 
-def test_live_feedback_optimize_hot_swap(capsys, learn_cfg, tmp_path):
+@pytest.mark.parametrize("provider", [True, False], ids=["learned-program", "legacy-env"])
+def test_live_feedback_optimize_hot_swap(capsys, learn_cfg, tmp_path, provider):
     answers = []
 
     @component
     def Clf():
         turn = use_turn()
-        call = use_agent_call("text -> label", arch="predict")
+        call = use_agent_call("text -> label", arch="predict",
+                              program=use_learned("clf") if provider else None)
         hooks.use_effect(lambda: turn and call.run(text=turn.text), [turn and turn.id])
         hooks.use_effect(lambda: call.ver and answers.append(call.result.label), [call.ver])
         return []
 
     @component
     def App():
-        return [DSPyProvider(key="dspy", lm=RuleLM(), children=[Clf(key="clf")])]
+        kids = [Clf(key="clf")]
+        if provider:  # the learned program is a prop: :optimize swaps it via the provider
+            kids = [LearnedProgram(key="clf", src=None, children=kids)]
+        return [DSPyProvider(key="dspy", lm=RuleLM(), children=kids)]
 
     app = bootstrap(App)
     try:
@@ -202,6 +210,10 @@ def test_live_feedback_optimize_hot_swap(capsys, learn_cfg, tmp_path):
         assert "optimize.progress" in kinds
         end = app.events.recent(1, ["optimize.end"])[0].payload
         assert end["swapped"] and end["path"].startswith(str(tmp_path))
+        assert end["via"] == ("provider" if provider else "env")
+        if provider:  # the provider's state now points at the saved artifact
+            [(_path, reg)] = find_registries(app)
+            assert reg.programs == {"clf": end["path"]}
         (row,) = list_modules(app)
         assert row["compiled"] and row["swaps"] == 1
 

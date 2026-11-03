@@ -12,7 +12,10 @@ Terminal commands (registered on import of :mod:`integrations.learn` through
     :optimize <key> [optimizer] [budget]
                                       optimize from this session's runs + feedback in a
                                       worker thread; publishes optimize.* events and
-                                      hot-swaps the result when it is not worse
+                                      hot-swaps the result when it is not worse: the
+                                      LearnedProgram provider that declares <key> gets
+                                      it as its new src (a re-render); apps without one
+                                      fall back to replacing the module in the env
 
 ``<key>`` is anything that identifies a module: its full key
 (``ChainOfThought:RouteSig:App/...#supervisor``), its component key / scope
@@ -32,6 +35,7 @@ from typing import Any, Dict, List, Optional
 from integrations.feedback import key_str
 
 from .hmr import hot_swap_into, list_modules, resolve_module
+from .programs import swap_learned
 
 __all__ = [
     "configure_learning",
@@ -267,15 +271,21 @@ def run_optimization(app: Any, key: str, optimizer: Optional[str] = None,
             path = res.save(os.path.join(cfg.save_dir,
                                          f"{scope}-{optimizer}-{time.strftime('%H%M%S')}.json"))
         ok = res.score is None or res.baseline is None or res.score >= res.baseline
-        swapped = False
+        swapped, via = False, None
         if ok or cfg.swap_if_worse:
-            hot_swap_into(app, k, res.program)
+            # a prop change: the provider that declares the program re-renders with it
+            if swap_learned(app, k, res) is not None:
+                via = "provider"
+            else:  # legacy: no LearnedProgram in the app
+                hot_swap_into(app, k, res.program)
+                via = "env"
             swapped = True
         pub("optimize.end", {"optimizer": optimizer, "baseline": res.baseline,
                              "score": res.score, "calls": res.calls, "seconds": res.seconds,
-                             "swapped": swapped, "path": path})
+                             "swapped": swapped, "via": via, "path": path})
         print(f"\n{BOLD}=== optimize {ks} ==={RESET}\n{res.report()}\n\n{res.diff()}\n")
-        print(f"{GREEN}[learn] hot-swapped: the next call uses the optimized program{RESET}"
+        print(f"{GREEN}[learn] hot-swapped ({via}): the next call uses the optimized "
+              f"program{RESET}"
               if swapped else f"{YELLOW}[learn] not better than baseline: kept the current "
                                f"program (configure_learning(swap_if_worse=True) to force){RESET}")
 
