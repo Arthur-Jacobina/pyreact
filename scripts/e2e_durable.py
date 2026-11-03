@@ -1,6 +1,6 @@
 """End-to-end check of durable agent memory against a real LM (`claude -p`).
 
-Drives ``examples/durable_chat.py`` in child processes and kills them with
+Drives ``examples/durable/04_llm_chat.py`` in child processes and kills them with
 SIGKILL (no graceful shutdown):
 
   (a) tell a fact, kill -9, restart -> the agent remembers it
@@ -36,7 +36,9 @@ TURN_TIMEOUT = 240
 
 # --------------------------------------------------------------------- child
 def child(log_path: str, mode: str, crash_after_llm: bool) -> None:
-    from examples.durable_chat import start
+    import importlib
+
+    start = importlib.import_module("examples.durable.04_llm_chat").start
     from integrations import claude_cli_lm
     from pyreact_durable import SessionLog
 

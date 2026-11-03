@@ -25,6 +25,22 @@ def App():
 Kill the process any way you like (`kill -9` included), start it again: `Chat`
 comes back with the same `turns` and transcript.
 
+## Examples
+
+Smallest first, in [`examples/durable/`](../examples/durable/) (each module
+docstring has the run and inspect commands):
+
+| example | teaches | LLM |
+|---|---|---|
+| `01_counter` | `use_persistent_state` / `use_persistent_reducer` under `Durable(log=...)` | no |
+| `02_branches_sqlite` | SQLite backend; `/label`, `/checkout`, `/fork`, `/tree` via `use_durable()` | no |
+| `03_web_sessions` | `run_web` + `Durable(log_factory=...)`: one log per browser tab | yes |
+| `04_llm_chat` | everything: `use_conversation`, branches, `durable_lm` replay | yes |
+
+```bash
+uv run python -m examples.durable.01_counter   # type + + -, :q, run again
+```
+
 ## Layers
 
 | module | depends on | role |
