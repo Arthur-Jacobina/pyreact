@@ -17,7 +17,7 @@ import os
 import sys
 from typing import Any, Dict, Iterable, List, Optional
 
-from examples._devtools import collect, show_messages
+from examples._devtools import collect
 from examples._lm import OFFLINE, example_models
 from examples.message import Message
 from integrations.dspy_integration import DSPyProvider
@@ -121,7 +121,7 @@ def ask(question: str, *, models: Optional[Dict[str, Any]] = None,
                      session_id="rlm") as root:
         out["events"] = collect(root, ["llm.*", "rlm.*"])  # devtools: the RLM's trace
         if show:
-            show_messages(root)
+            root.render_to("console")
         root.send(question, wait=True, timeout=timeout)
     return out
 

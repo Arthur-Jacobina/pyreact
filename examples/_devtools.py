@@ -6,14 +6,13 @@ tree only through its root. Events are for devtools -- so this module is the
 
     trace(root, ["tool.*", "llm.end"])         # print events as they happen
     ends = collect(root, ["llm.end"])          # a live list, for a metrics table
-    show_messages(root)                        # the root-level renderer for Message
     run_repl(root, prompt="> ")                # stdin -> root.send(...); ":" commands
 
-``trace`` / ``collect`` / ``show_messages`` subscribe to ``root.events`` (the
-session's event log) with ``replay=True``, so what the first render published
-before the call is not missed. ``trace`` / ``show_messages`` return their
-unsubscribe; ``collect`` returns the list (it stops filling when the root
-unmounts).
+``trace`` / ``collect`` subscribe to ``root.events`` (the session's event
+log) with ``replay=True``, so what the first render published before the call
+is not missed. ``trace`` returns its unsubscribe; ``collect`` returns the list
+(it stops filling when the root unmounts). ``Message`` output is rendered by
+the root itself: ``root.render_to("console")``.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from pyreact.boot import handle_command, parse_command
 from pyreact.core.events import Event
 from pyreact.observability import ConsoleSink, format_event
 
-__all__ = ["trace", "collect", "show_messages", "command", "run_repl", "Format"]
+__all__ = ["trace", "collect", "command", "run_repl", "Format"]
 
 # fmt(event) -> the line to print, or None to skip the event
 Format = Callable[[Event], Optional[str]]
@@ -68,15 +67,6 @@ def collect(root: Any, kinds: Optional[Iterable[str]] = None, *,
     return out
 
 
-def show_messages(root: Any, kinds: Sequence[str] = ConsoleSink.DEFAULT_KINDS, *,
-                  replay: bool = True) -> Callable[[], None]:
-    """Render ``Message`` components (and errors) to the terminal: a stand-in
-    for a root-level renderer (``root.render_to(console)`` in the ADR).
-    Returns the detach function."""
-    sink = ConsoleSink(kinds=kinds)
-    return sink.attach(root.events, replay=replay)
-
-
 def command(root: Any, line: str) -> bool:
     """Run one ``:command`` line (``:events llm``, ``:turns``, ``:feedback +``...)
     against ``root``. Returns False if it is not a terminal command."""
@@ -106,8 +96,8 @@ def run_repl(root: Any, *, prompt: str = "> ",
     """Read lines from stdin; each line is a turn (``root.send(line,
     wait=True)``), lines starting with ``:`` are terminal commands (``:help``;
     ``:q`` quits). ``Message`` output (``console_kinds``) is printed as it is
-    published. Returns on ``:q``, EOF or Ctrl+C."""
-    detach = show_messages(root, console_kinds) if console_kinds else (lambda: None)
+    published (``root.render_to("console")``). Returns on ``:q``, EOF or Ctrl+C."""
+    detach = root.render_to("console", kinds=console_kinds) if console_kinds else (lambda: None)
     try:
         while not root.closed:
             try:

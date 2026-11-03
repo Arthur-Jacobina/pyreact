@@ -32,7 +32,7 @@ from typing import Annotated, Literal
 import dspy
 from pydantic import Field
 
-from examples._devtools import show_messages, trace
+from examples._devtools import trace
 from examples._lm import example_lm
 from integrations import DSPyProvider, use_agent, use_agent_call
 from integrations.harness import (
@@ -204,7 +204,7 @@ KINDS = ["llm.start", "llm.end", "llm.error", "tool.*", "guard.*", "verify.*", "
 def main(request: str) -> None:
     with create_root(Root, session_id="shop") as root:
         trace(root, KINDS, decision)  # the trace of every decision (devtools)
-        show_messages(root)           # what the shop says (Message components)
+        root.render_to("console")  # what the shop says (Message components)
         print(f"> {request}")
         tid = root.send(request, wait=True, timeout=600)
     spent = BUDGET.spent(tid)
