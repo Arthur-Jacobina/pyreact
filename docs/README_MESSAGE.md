@@ -73,7 +73,7 @@ def MyComponent():
 - **Message**: Aparece como balões de chat coloridos na área de mensagens
 
 ### No Terminal:
-- **Log**: Aparece quando `"log"` está em `console_kinds` de `read_terminal_and_invoke`
+- **Log**: Aparece quando `"log"` está em `console_kinds` de `run_repl(root, ...)` (`examples/_devtools.py`)
 - **Message**: Aparece com cores ANSI baseadas no sender e tipo:
   - User: Azul
   - Assistant: Verde
