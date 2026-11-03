@@ -38,7 +38,7 @@ import asyncio
 import dspy
 
 from integrations import DSPyProvider, use_call, use_predict
-from pyreact.boot import bootstrap
+from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.keystroke import Keystroke
 from pyreact.core import EventBus, component, hooks
 from pyreact_durable import (
@@ -174,25 +174,11 @@ async def main() -> None:
         pass
 
     app = start(args.log, default_lm())
-
-    def show(ev):
-        color = "\x1b[32m" if ev.payload.get("sender") == "assistant" else "\x1b[90m"
-        print(f"{color}{ev.payload.get('text')}\x1b[0m", flush=True)
-
-    app.event_bus.subscribe(show, ["message"])
     print(f"durable chat on {args.log} — /help for commands, :q to quit")
-    loop = asyncio.get_running_loop()
     try:
-        while True:
-            line = await loop.run_in_executor(None, input, "> ")
-            if line.strip() in (":q", ":quit", ":exit"):
-                break
-            await app.ainvoke(line, wait=True)
-    except (KeyboardInterrupt, EOFError):
-        pass
+        await read_terminal_and_invoke(app, prompt="> ")  # "/..." lines reach the app
     finally:
         app.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(main())

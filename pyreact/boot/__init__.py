@@ -1,5 +1,10 @@
 from .bootstrap import bootstrap
-from .terminal import handle_command, read_terminal_and_invoke, register_command
+from .terminal import (
+    handle_command,
+    parse_command,
+    read_terminal_and_invoke,
+    register_command,
+)
 from .web import run_web
 from .app_runner import AppRunner
 from .session import Session, current_session, session_of, DEFAULT_SESSION_ID
@@ -15,4 +20,5 @@ __all__ = [
     "read_terminal_and_invoke",
     "register_command",
     "handle_command",
+    "parse_command",
 ]
