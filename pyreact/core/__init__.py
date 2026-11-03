@@ -1,6 +1,7 @@
 # pyreact/core/__init__.py
 from .hook import HookContext, Ref, use_cleanup_reason
 from .activity import Activity
+from .dehydrate import Hydrating, HydrationWarning, use_dehydrate
 from .provider import create_context
 from .runtime import schedule_rerender, run_renders
 from .core import VNode
@@ -22,6 +23,9 @@ __all__ = [
     "Ref",
     "use_cleanup_reason",
     "Activity",
+    "Hydrating",
+    "HydrationWarning",
+    "use_dehydrate",
     "create_context",
     "schedule_rerender",
     "run_renders",
