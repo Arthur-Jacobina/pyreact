@@ -23,13 +23,19 @@ _instances: Dict[str, SandboxDriver] = {}
 _lock = threading.Lock()
 
 
+def _docker(**kw: Any) -> SandboxDriver:
+    from .docker import DockerDriver
+
+    return DockerDriver(**kw)
+
+
 def _local(**kw: Any) -> SandboxDriver:
     from .local import LocalDriver
 
     return LocalDriver(**kw)
 
 
-_BUILTINS: Dict[str, DriverFactory] = {"local": _local}
+_BUILTINS: Dict[str, DriverFactory] = {"docker": _docker, "local": _local}
 
 
 def register_driver(name: str, factory: DriverFactory, *, replace: bool = False) -> None:

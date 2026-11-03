@@ -41,6 +41,7 @@ from .registry import gc, get_driver, list_drivers, register_driver, unregister_
 __all__ = [
     "BlockingDriver",
     "BlockingSandbox",
+    "DockerDriver",
     "ExecResult",
     "LocalDriver",
     "NotSupported",
@@ -61,6 +62,7 @@ __all__ = [
 ]
 
 _LAZY = {
+    "DockerDriver": ".docker",
     "LocalDriver": ".local",
 }
 
