@@ -21,10 +21,13 @@ require_otel()
 __version__ = "0.1.0"
 
 from . import attributes  # noqa: E402
+from .bridge import DEFAULT_KINDS, EventBridge  # noqa: E402
 from .metrics import BoundaryMetrics  # noqa: E402
 from .tracing import Enricher, SpanInfo, otel_middleware, provider_of, turn_span  # noqa: E402
 
 __all__ = [
+    "DEFAULT_KINDS",
+    "EventBridge",
     "BoundaryMetrics",
     "Enricher",
     "INSTALL_HINT",
