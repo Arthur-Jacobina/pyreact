@@ -36,12 +36,13 @@ No LLM.
 from __future__ import annotations
 
 import argparse
-import asyncio
 from pathlib import Path
 
-from pyreact.boot import bootstrap, read_terminal_and_invoke
+from examples._devtools import run_repl
+from pyreact.boot import create_root
 from pyreact.components.keystroke import Keystroke
-from pyreact.core import component, hooks, use_emit
+from pyreact.components.message import Message
+from pyreact.core import component, hooks
 from pyreact_durable import Durable, SessionLogError, use_durable, use_persistent_state
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -54,10 +55,11 @@ SMOKE = {"args": ["--log", "{tmp}/state.sqlite"],
 def ShoppingList():
     items, set_items = use_persistent_state([], key="items")
     log = use_durable()
-    emit = use_emit()
+    # the reply to the last command, as state: (n, text) -> a new Message per reply
+    notice, set_notice = hooks.use_state(None)
 
     def say(text: str) -> None:
-        emit("message", {"sender": "assistant", "text": text})
+        set_notice(lambda prev: ((prev[0] + 1) if prev else 1, text))
 
     def on_submit(text: str) -> None:
         cmd, _, arg = text.strip().partition(" ")
@@ -69,7 +71,7 @@ def ShoppingList():
                 log.label(arg)
                 say(f"labelled the current position {arg!r}")
             elif cmd == "/checkout" and arg:
-                say(f"leaf -> {log.checkout(arg)}")  # hooks reload; the effect below prints
+                say(f"leaf -> {log.checkout(arg)}")  # hooks reload: the list re-renders
             elif cmd == "/fork" and arg:
                 path = log.path.with_name(f"{log.path.stem}-{arg}{log.path.suffix}")
                 with log.fork_file(path, at=arg) as new:
@@ -81,11 +83,15 @@ def ShoppingList():
         except SessionLogError as exc:  # unknown label, file already exists, ...
             say(f"error: {exc}")
 
-    hooks.use_effect(lambda: say(f"list: {items or '(empty)'}"), [items])
-    return [Keystroke(key="keys", on_submit=on_submit)]
+    out = [Keystroke(key="keys", on_submit=on_submit)]
+    if notice is not None:
+        out.append(Message(key=f"notice-{notice[0]}", text=notice[1], sender="assistant"))
+    # published on mount and whenever the list changes (add, /checkout)
+    out.append(Message(key="list", text=f"list: {items or '(empty)'}", sender="assistant"))
+    return out
 
 
-async def main() -> None:
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default="runs/durable/state.sqlite")
     log = ap.parse_args().log
@@ -95,13 +101,11 @@ async def main() -> None:
     def App():
         return [Durable(key="durable", log=log, children=[ShoppingList(key="list")])]
 
-    app = bootstrap(App)
     print(f"durable list in {log}; :q to quit")
-    try:
+    with create_root(App, session_id="list") as root:
         # "/label" etc. are app input: terminal commands use ":" (":q", ":help").
-        await read_terminal_and_invoke(app, prompt="> ")
-    finally:
-        app.shutdown()
+        run_repl(root, prompt="> ")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
