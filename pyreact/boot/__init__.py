@@ -8,6 +8,8 @@ from .terminal import (
 from .web import make_web_app, run_web
 from .app_runner import AppRunner
 from .session import Session, current_session, session_of, DEFAULT_SESSION_ID
+from .root import Root, acreate_root, ahydrate_root, create_root, hydrate_root
+from .snapshots import DirectorySnapshots, MemorySnapshots, SnapshotStore, load_snapshot
 from .stateful import (
     DirectoryManifestStore,
     ManifestError,
@@ -22,6 +24,15 @@ __all__ = [
     "make_web_app",
     "bootstrap",
     "AppRunner",
+    "Root",
+    "create_root",
+    "hydrate_root",
+    "acreate_root",
+    "ahydrate_root",
+    "SnapshotStore",
+    "MemorySnapshots",
+    "DirectorySnapshots",
+    "load_snapshot",
     "Session",
     "current_session",
     "session_of",

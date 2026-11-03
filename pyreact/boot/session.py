@@ -35,6 +35,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from pyreact.core import runtime
+from pyreact.core.dehydrate import begin_hydration
 from pyreact.core.events import EventBus
 from pyreact.core.hook import HookContext
 from pyreact.core.turns import TurnManager
@@ -205,13 +206,18 @@ class Session:
             pass
 
     # ---------------------------------------------------------- loop-side ops
-    def _mount(self) -> None:
-        """Create and schedule the root. Must run on the runner loop."""
+    def _mount(self, slices: Optional[Dict[str, Dict[str, Any]]] = None) -> None:
+        """Create and schedule the root. Must run on the runner loop.
+
+        ``slices`` (``{path: {key: value}}``): hydrate the tree from them
+        (``use_dehydrate`` hooks get their slice during the first render)."""
         self.root = HookContext(
             self.app_component_fn.__name__,
             self.app_component_fn,
             services=self.services,
         )
+        if slices is not None:
+            begin_hydration(self.root, slices)
         self.turns.configure(owner=self.root, loop=asyncio.get_running_loop())
         runtime.schedule_rerender(self.root, reason=f"session {self.id} mount")
 
@@ -240,7 +246,8 @@ class Session:
         root = self.root
         if root is not None:
             try:
-                root.unmount()
+                # cleanups see use_cleanup_reason() == "suspend" | "unmount"
+                root.unmount("suspend" if reason == "suspend" else "unmount")
             except Exception as exc:
                 runtime.report_error(exc, root, "unmount")
             for t in runtime.pending_tasks(self.owns):
