@@ -333,6 +333,8 @@ async def invoke_module(
     call_id: Optional[str] = None,
     debug: Optional[bool] = None,
     harness: Optional[Harness] = None,
+    models: Optional[Dict[str, Any]] = None,
+    model_key: Optional[str] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Run one module call with per-call settings and publish llm.* events.
 
@@ -348,6 +350,15 @@ async def invoke_module(
     ``call_next`` again re-runs the module, not calling it short-circuits
     with the middleware's prediction, :class:`~pyreact.core.harness.Blocked`
     fails the call (``llm.blocked`` + ``llm.error``).
+
+    Model switching (the hook point of
+    :func:`integrations.recovery.fallback_model`): with a ``models``
+    registry (``DSPyProvider(models=...)``; ``use_call`` passes it) the
+    boundary also carries ``model_key`` (the registry key in use, ``None``
+    for an explicit ``lm=``) and ``model_names`` (``{key: model name}``). A
+    middleware that sets ``b.attrs["model_key"]`` to another key before
+    ``call_next`` makes that run use ``models[key]``; ``b.attrs["model"]``
+    and the ``llm.end`` payload then name the model that actually answered.
 
     Architectures with a custom runner (e.g. ``rlm``: worker thread +
     cooperative cancellation) are awaited through it; everything else via
@@ -368,6 +379,9 @@ async def invoke_module(
     if turn_id is None:
         turn_id = tm.current_turn_id()
     model = tm.model_name(lm if lm is not None else dspy.settings.lm)
+    models = dict(models or {})
+    if model_key is not None and model_key not in models:
+        model_key = None
     mkey = getattr(module, "_pyreact_key", None)
     arch = arch_of(module)
     base = {"call_id": call_id, "module": label, "component": component, "model": model}
@@ -402,21 +416,38 @@ async def invoke_module(
             lm_calls = tm.lm_calls_of(recorder.history)
         tm.record_call({
             "call_id": call_id, "module": label, "module_key": base.get("module_key"),
-            "arch": arch, "component": component, "turn_id": turn_id, "model": model,
+            "arch": arch, "component": component, "turn_id": turn_id, "model": used["model"],
             "inputs": tm.brief(inputs, 4000), "outputs": tm.outputs_of(result),
             "error": error, "latency": latency, "lm_calls": lm_calls, "ts": time.time(),
         })
         return lm_calls
 
     extra: Dict[str, Any] = {}
+    used = {"model": model, "model_key": model_key}
+
+    def _overrides_for(b: Boundary) -> Dict[str, Any]:
+        # A middleware may switch the model by registry key (fallback_model).
+        key = b.attrs.get("model_key")
+        if not models or key is None or key == model_key:
+            used.update(model=model, model_key=model_key)
+            b.attrs["model"] = model
+            return overrides
+        if key not in models:
+            raise ValueError(f"model_key {key!r} is not in the DSPyProvider models "
+                             f"({sorted(models)})")
+        chosen = models[key]
+        used.update(model=tm.model_name(chosen), model_key=key)
+        b.attrs["model"] = used["model"]
+        return {**overrides, "lm": chosen}
 
     async def _attempt(b: Boundary):
         # One run of the module (a retrying middleware calls this again).
         nonlocal extra
         args = b.inputs
+        settings = _overrides_for(b)
         t_run = time.perf_counter()
         try:
-            with dspy.context(**overrides):
+            with dspy.context(**settings):
                 if runner is not None:
                     result, more = await runner(
                         module, args, call_id=call_id,
@@ -438,11 +469,13 @@ async def invoke_module(
     token = tm.enter_scope(tm.CallScope(call_id, label, component, turn_id,
                                         loop=asyncio.get_running_loop()))
     t0 = time.perf_counter()
+    attrs: Dict[str, Any] = {"call_id": call_id, "module_key": base.get("module_key"),
+                             "arch": arch, "model": model}
+    if models:
+        attrs["model_key"] = model_key
+        attrs["model_names"] = {k: tm.model_name(v) for k, v in models.items()}
     try:
-        result = await through(
-            "llm", label, inputs, _attempt, harness=harness,
-            call_id=call_id, module_key=base.get("module_key"), arch=arch, model=model,
-        )
+        result = await through("llm", label, inputs, _attempt, harness=harness, **attrs)
     except asyncio.CancelledError:
         _record(error="cancelled", latency=time.perf_counter() - t0)
         pub("llm.cancel", {**base, "latency": time.perf_counter() - t0})
@@ -467,6 +500,9 @@ async def invoke_module(
         raise
     finally:
         tm.exit_scope(token)
+    if used["model"] != model:  # a middleware switched models (fallback_model)
+        base["model"] = used["model"]
+        base["model_key"] = used["model_key"]
     usage = recorder.summary()
     usage["latency"] = time.perf_counter() - t0
     usage["call_id"] = call_id
@@ -601,6 +637,9 @@ def _use_call_machine(
     ref["cfg"] = {
         "module": module,
         "lm": env.lm_for(model, lm) if env is not None else lm,
+        "models": env.models if env is not None else None,
+        "model_key": (None if lm is not None or env is None
+                      else (model if model in env.models else "default")),
         "adapter": env.adapter if env is not None else None,
         "env": env,
         "policy": policy,
@@ -669,6 +708,7 @@ def _use_call_machine(
                     call_id=call_id, debug=cfg["debug"],
                     # scoped middleware captured at render + process-wide now
                     harness=resolve_harness(cfg["harness"]),
+                    models=cfg["models"], model_key=cfg["model_key"],
                 )
             except Exception as exc:
                 result, usage, err = None, getattr(exc, "usage", None), exc
