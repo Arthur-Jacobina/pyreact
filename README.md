@@ -60,6 +60,13 @@ Key pieces:
 - `use_turn()` (from `pyreact.core`) returns the latest turn and rerenders on each new one, so a repeated identical message still triggers effects keyed on the turn. `Keystroke(on_submit=fn)` calls `fn(text)` or `fn(text, turn)`.
 - `app.invoke(text, wait=True)` blocks until that turn ends; `app.wait_turn(turn_id)` waits for an earlier one.
 
+### 10) Durable memory ↔ Persistence at the border
+- Agent memory that survives restarts lives in a separate library, [`pyreact_durable`](pyreact_durable/README.md); `pyreact` never imports it.
+- `Durable(log="chat.jsonl", children=[...])` provides a pi-style append-only JSONL session log (a tree: branches, labels, checkpoints) and journals `EventBus` events into it.
+- `use_persistent_state(initial, key=...)`, `use_persistent_reducer`, `use_conversation()` are `use_state`-like hooks restored from the log; `use_durable()` exposes it for `label` / `checkout` / `fork_file`.
+- `durable_lm(lm, log)` journals LM calls so re-running a turn after a crash replays the answer instead of calling the model again.
+- Inspect files with `python -m pyreact_durable show chat.jsonl`; try `uv run python -m examples.durable_chat`.
+
 ### Lifecycle overview
 1. A root agent (component) is wrapped in a `HookContext` by the runner.
 2. State changes or context updates call `schedule_rerender`.
@@ -122,6 +129,9 @@ uv run python -m examples.main_terminal
 
 # Tool-calling multi-agent store (terminal)
 uv run python -m examples.main_tools
+
+# Chat with durable, branchable memory (see pyreact_durable/README.md)
+uv run python -m examples.durable_chat
 ```
 
 ### Tests
@@ -130,6 +140,8 @@ uv run python -m examples.main_tools
 uv run pytest
 # End-to-end turn model check against a real LLM via the `claude -p` CLI
 uv run python -m scripts.e2e_turns
+# Durable memory: kill -9 + restart, branches, LM replay (real LLM)
+uv run python scripts/e2e_durable.py
 ```
 
 ## Troubleshooting

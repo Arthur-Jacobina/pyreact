@@ -36,6 +36,7 @@ __all__ = [
     "DurableStateError",
     "Conversation",
     "use_durable",
+    "use_durable_lm",
     "use_persistent_state",
     "use_persistent_reducer",
     "use_conversation",
@@ -357,3 +358,19 @@ def use_conversation(key: str = "history") -> Conversation:
     """A persisted message list (see :class:`Conversation`)."""
     messages, set_messages = use_persistent_state([], key=key)
     return Conversation(messages or [], set_messages)
+
+
+def use_durable_lm(lm: Any, *, mode: str = "replay_or_record", **kwargs: Any):
+    """``durable_lm(lm, <provider log>)``, memoized; returns ``lm`` unchanged
+    without a :func:`Durable` provider."""
+    log = use_durable()
+
+    def _make():
+        if log is None:
+            return lm
+        from .lm import durable_lm
+
+        return durable_lm(lm, log, mode=mode, **kwargs)
+
+    return hooks.use_memo(_make, [id(lm), id(log), mode])
+
