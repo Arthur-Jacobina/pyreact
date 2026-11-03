@@ -6,7 +6,7 @@ from .core import VNode
 from .message_buffer import MessageBuffer
 from .core import component, hooks, use_path
 from .events import Event, EventBus
-from .turns import Turn, TurnManager, use_turn
+from .turns import Turn, TurnManager, TurnStore, use_turn
 from .turn_hooks import use_on_turn
 from . import runtime
 from . import harness
@@ -29,6 +29,7 @@ __all__ = [
     "EventBus",
     "Turn",
     "TurnManager",
+    "TurnStore",
     "use_turn",
     "use_on_turn",
     "runtime",

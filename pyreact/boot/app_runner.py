@@ -339,6 +339,27 @@ class AppRunner:
         ``{"status", "duration"}``."""
         return self.default_session.wait_turn(turn_id, timeout=timeout)
 
+    def resume_pending(self, *, wait: bool = False,
+                       timeout: Optional[float] = None) -> Dict[str, List[str]]:
+        """Resume, in every open session, the turns that started but never
+        ended (e.g. before a crash): ``{session_id: [turn ids]}``.
+
+        Waits for the app to be idle first, so stores attached on mount
+        (e.g. by a ``Durable`` provider) are in place. Sessions without a
+        ``TurnStore`` resume nothing."""
+        self.wait_idle(timeout=timeout)
+        out: Dict[str, List[str]] = {}
+        for sess in self.sessions():
+            ids = sess.resume_pending(wait=wait, timeout=timeout)
+            if ids:
+                out[sess.id] = ids
+        return out
+
+    def resume_turn(self, turn_id: str, *, wait: bool = False,
+                    timeout: Optional[float] = None) -> str:
+        """:meth:`Session.resume_turn` on the default session."""
+        return self.default_session.resume_turn(turn_id, wait=wait, timeout=timeout)
+
     def wait_idle(self, timeout: Optional[float] = None) -> None:
         """Block until no renders or component tasks are pending (all sessions)."""
         try:

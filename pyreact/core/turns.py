@@ -42,8 +42,8 @@ import itertools
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, List, Literal, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Deque, Dict, List, Literal, Optional, Protocol
 
 from . import runtime
 from .events import EventBus
@@ -59,9 +59,31 @@ class Turn:
     text: str
     source: str = "term"
     ts: float = field(default_factory=time.time)
+    resumed: bool = False  # re-run of a turn that started but never ended
 
 
 TurnListener = Callable[[Turn], None]
+
+
+class TurnStore(Protocol):
+    """Where a TurnManager remembers turns, so interrupted or crashed turns
+    can be resumed (``TurnManager.resume`` / ``Session.resume_turn`` /
+    ``AppRunner.resume_pending``). The core ships no implementation: a
+    persistence layer provides one (the durable-memory package's ``DurableTurnStore``
+    reads the ``turn.*`` events its ``Durable`` provider journals).
+
+    - ``on_turn_start(turn)`` / ``on_turn_end(turn, result)``: called by the
+      manager around every turn (``result`` = ``{"status", "duration"}``);
+      a store fed by the event journal may ignore them;
+    - ``pending()``: turns that started but never ended, oldest first;
+    - ``get(turn_id)`` (optional): the last recorded start of any turn.
+    """
+
+    def on_turn_start(self, turn: Turn) -> None: ...
+
+    def on_turn_end(self, turn: Turn, result: Dict[str, Any]) -> None: ...
+
+    def pending(self) -> List[Turn]: ...
 
 
 def _effective_policy(owner: Any, default: str) -> str:
@@ -110,6 +132,7 @@ class TurnManager:
         self._interrupted: set = set()  # turns that had tasks cancelled
         self._interrupt_req: set = set()  # turns asked to give way
         self._listeners: List[TurnListener] = []
+        self.store: Optional[TurnStore] = None  # see TurnStore / resume()
         self._pump: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Session scoping (set by pyreact.boot.session.Session):
@@ -131,6 +154,7 @@ class TurnManager:
         owner: Any = None,
         owner_filter: Optional[Callable[[Any], bool]] = None,
         id_factory: Optional[Callable[[int], str]] = None,
+        store: Optional[TurnStore] = None,
     ) -> "TurnManager":
         """Configure the manager. Session wiring:
 
@@ -140,7 +164,10 @@ class TurnManager:
           turn's input is dispatched;
         - ``owner_filter``: restricts "renders pending" checks to this
           session's components, so busy sessions don't delay each other.
+        - ``store``: a :class:`TurnStore` (enables :meth:`resume`).
         """
+        if store is not None:
+            self.store = store
         if id_prefix is not None:
             self.id_prefix = id_prefix
         if id_factory is not None:
@@ -245,6 +272,51 @@ class TurnManager:
         self.interrupt()
         self._ensure_pump()
 
+    # ------------------------------------------------------------------
+    # resume
+    # ------------------------------------------------------------------
+    def pending_turns(self) -> List[Turn]:
+        """Turns the :class:`TurnStore` saw start but never end (e.g. the
+        process was killed mid-turn), minus those queued or running now."""
+        if self.store is None:
+            return []
+        busy = {t.id for t in self._queue}
+        if self._active is not None:
+            busy.add(self._active.id)
+        return [t for t in self.store.pending() if t.id not in busy]
+
+    def resume(self, turn_id: str) -> Turn:
+        """Run a recorded turn again, with the same id, index, text and
+        source (``turn.resumed`` is True; ``turn.start`` carries
+        ``"resumed": true``). Must run on the render loop.
+
+        Resumable: a pending turn (started, never ended), or any turn the
+        store can ``get`` (e.g. one that ended ``interrupted``). Raises
+        ``KeyError`` for an unknown turn, ``ValueError`` for one that is
+        queued or running, ``RuntimeError`` without a store.
+
+        Re-running is at-least-once for the turn's side effects: make
+        turns idempotent (commit results atomically at the end) and put
+        LLM calls behind a record/replay LM (``durable_lm``) so the calls that
+        already answered are replayed, not paid for again.
+        """
+        if self.store is None:
+            raise RuntimeError("TurnManager.resume needs a TurnStore (configure(store=...))")
+        if (self._active is not None and self._active.id == turn_id) or any(
+                t.id == turn_id for t in self._queue):
+            raise ValueError(f"turn {turn_id!r} is already queued or running")
+        rec = next((t for t in self.store.pending() if t.id == turn_id), None)
+        if rec is None:
+            get = getattr(self.store, "get", None)
+            rec = get(turn_id) if callable(get) else None
+        if rec is None:
+            raise KeyError(f"no recorded turn {turn_id!r} to resume")
+        turn = replace(rec, resumed=True, ts=time.time())
+        self.advance_to(turn.index + 1)
+        self._results.pop(turn.id, None)
+        self.enqueue(turn)
+        return turn
+
     def interrupt(self) -> None:
         """Ask the active turn to give way: its interruptible tasks (those
         whose effective policy is ``"interrupt"``) are cancelled now and as
@@ -341,11 +413,24 @@ class TurnManager:
             status = self._status(turn)  # short-circuited / failed: settle as usual
         self._finish(turn, status, t0)
 
+    def _store_call(self, method: str, *args: Any) -> None:
+        fn = getattr(self.store, method, None) if self.store is not None else None
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception as exc:  # a failing store must not break turns
+            runtime.report_error(exc, None, "turn-store", turn=None)
+
     async def _lifecycle(self, turn: Turn, b: Any, t0: float) -> str:
         try:
+            self._store_call("on_turn_start", turn)
+            payload = {"index": turn.index, "text": turn.text, "source": turn.source}
+            if turn.resumed:
+                payload["resumed"] = True
             self.event_bus.publish(
                 "turn.start",
-                {"index": turn.index, "text": turn.text, "source": turn.source},
+                payload,
                 turn_id=turn.id,
                 source=turn.source,
             )
@@ -407,6 +492,7 @@ class TurnManager:
         self._results[turn.id] = res
         while len(self._results) > self.max_history:
             self._results.popitem(last=False)
+        self._store_call("on_turn_end", turn, res)
         self.event_bus.publish(
             "turn.end",
             {"index": turn.index, **res},

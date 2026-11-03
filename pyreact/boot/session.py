@@ -267,6 +267,49 @@ class Session:
         await asyncio.wait_for(asyncio.wrap_future(fut), timeout)
         return turn.id
 
+    # ----------------------------------------------------------------- resume
+    def pending_turns(self) -> list:
+        """Turns this session's ``TurnStore`` saw start but never end (see
+        :meth:`TurnManager.pending_turns`); ``[]`` without a store."""
+        async def _get():
+            return self.turns.pending_turns()
+
+        return self.runner._submit(_get()).result()
+
+    async def _resume(self, turn_ids, wait: bool) -> list:
+        turns = [self.turns.resume(tid) for tid in turn_ids]
+        if wait:
+            for t in turns:
+                await self.turns.wait(t.id)
+        return [t.id for t in turns]
+
+    def resume_turn(self, turn_id: str, *, wait: bool = False,
+                    timeout: Optional[float] = None) -> str:
+        """Re-run a recorded turn (same id/text; see
+        :meth:`TurnManager.resume`). Returns the turn id; with ``wait=True``
+        blocks until it ends."""
+        self._check_open()
+        self.touch()
+        fut = self.runner._submit(self._resume([turn_id], wait))
+        try:
+            return fut.result(timeout=timeout)[0]
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"turn {turn_id} not done after {timeout}s") from None
+
+    def resume_pending(self, *, wait: bool = False,
+                       timeout: Optional[float] = None) -> list:
+        """Re-run every turn that started but never ended (oldest first,
+        queued like new input). Returns their ids."""
+        self._check_open()
+        ids = [t.id for t in self.pending_turns()]
+        if not ids:
+            return []
+        fut = self.runner._submit(self._resume(ids, wait))
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"resumed turns not done after {timeout}s") from None
+
     def wait_turn(self, turn_id: str, timeout: Optional[float] = None) -> dict:
         """Block until ``turn_id`` ends; returns ``{"status", "duration"}``."""
         try:
