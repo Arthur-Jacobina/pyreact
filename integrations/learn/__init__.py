@@ -28,6 +28,7 @@ from integrations.architectures import (
 )
 from integrations.hooks import use_agent_call, use_module
 
+from .datasets import call_records, dataset_from_events, iter_events, split
 from .hmr import find_envs, hot_swap_into, list_modules, resolve_module
 from .metrics import Metric, MetricError, as_metric, contains, exact_match, llm_judge
 from .optimizers import (
@@ -72,6 +73,11 @@ __all__ = [
     "exact_match",
     "contains",
     "llm_judge",
+    # datasets
+    "dataset_from_events",
+    "call_records",
+    "iter_events",
+    "split",
     # hot swap
     "find_envs",
     "list_modules",
