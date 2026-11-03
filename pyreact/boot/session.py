@@ -119,6 +119,10 @@ class Session:
         self.root: Optional[HookContext] = None
         self.created_at = self.last_active = time.time()
         self.closed = False
+        # Why the session was closed (set before its tree unmounts, so
+        # cleanups can read it): "idle" (reaped after its TTL), "closed"
+        # (close_session) or "shutdown" (the runner stopped). None while open.
+        self.close_reason: Optional[str] = None
 
         def _on_nav(url: str) -> None:
             self.event_bus.publish("nav", {"path": url}, source="nav")
@@ -173,10 +177,11 @@ class Session:
             await runtime.run_renders()
             await asyncio.sleep(0)
 
-    def _unmount(self) -> None:
+    def _unmount(self, reason: str = "closed") -> None:
         """Unmount the tree and stop its turns and tasks. Must run on the
         runner loop."""
         self.closed = True
+        self.close_reason = reason
         try:
             self.nav_service.subs.remove(self._nav_listener)
         except ValueError:
@@ -199,7 +204,9 @@ class Session:
             except Exception:
                 pass
         self._unsubs.clear()
-        self.event_bus.publish("session.closed", {"session_id": self.id})
+        self.event_bus.publish(
+            "session.closed", {"session_id": self.id, "reason": reason}
+        )
 
     async def _enqueue_turn(self, turn, wait: bool) -> Dict[str, Any]:
         self.turns.enqueue(turn)

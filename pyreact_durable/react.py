@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 
 from pyreact.core import EventBus, TurnManager, component, create_context, hooks
 
-from .log import SessionLog
+from .log import SessionLog, archive_log, delete_log, safe_session_id
 
 __all__ = [
     "DEFAULT_JOURNAL",
@@ -75,14 +75,21 @@ class DurableHandle:
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
+ON_CLOSE = ("keep", "archive", "delete")
+
+
+def _session() -> Any:
+    return hooks.get_service("session", lambda: None)
+
+
 def _session_id() -> str:
-    sess = hooks.get_service("session", lambda: None)
-    return str(getattr(sess, "id", None) or "default")
+    return str(getattr(_session(), "id", None) or "default")
 
 
 def _open(log: Any, log_factory: Optional[Callable[[str], Any]], session_id: str):
-    """-> (SessionLog, owned). Logs we open from a path/factory are ours to close."""
-    src = log_factory(session_id) if log_factory is not None else log
+    """-> (SessionLog, owned). Logs we open from a path/factory are ours to close.
+    The factory gets the session id escaped for use in a file name."""
+    src = log_factory(safe_session_id(session_id)) if log_factory is not None else log
     if src is None:
         raise ValueError("Durable needs log=SessionLog|path or log_factory=fn(session_id)")
     if isinstance(src, SessionLog):
@@ -126,8 +133,23 @@ def _last_turn_index(log: SessionLog) -> int:
     return last
 
 
+def _retire(slog: SessionLog, on_close: Any, archive_dir: Any, session_id: str) -> None:
+    """Apply the ``on_close`` retention policy to a closed, owned log."""
+    try:
+        if on_close == "archive":
+            archive_log(slog.path, archive_dir)
+        elif on_close == "delete":
+            delete_log(slog.path)
+        elif callable(on_close):
+            on_close(slog.path, session_id)
+    except Exception as exc:  # retention must never break unmounting
+        warnings.warn(f"Durable(on_close={on_close!r}) failed for {slog.path}: {exc}",
+                      RuntimeWarning, stacklevel=2)
+
+
 @component(transparent=True)
-def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
+def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep",
+            archive_dir=None, children=None):
     """Provide a :class:`SessionLog` to the subtree and journal bus events.
 
     - ``log``: a :class:`SessionLog` (caller owns it) or a path (opened on
@@ -135,7 +157,21 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
     - ``log_factory``: ``fn(session_id) -> SessionLog | path`` — one log per
       session when the same app is mounted in several sessions, e.g.
       ``Durable(log_factory=lambda sid: f"logs/{sid}.jsonl", children=[...])``.
-      Logs it returns are closed on unmount.
+      Logs it returns are closed on unmount. The factory receives the id
+      escaped by :func:`~pyreact_durable.log.safe_session_id` (ids made of
+      ``[A-Za-z0-9_-]`` are unchanged; ``/``, ``.``... are percent-encoded),
+      so it is safe to put in a path.
+    - ``on_close``: what happens to a log *this provider opened* (from a path
+      or the factory) when its **session is closed** — reaped after its TTL
+      (``session.close_reason == "idle"``) or ``close_session()``
+      (``"closed"``); never on runner shutdown or when only this subtree
+      unmounts:
+
+      * ``"keep"`` (default): leave the file;
+      * ``"archive"``: move it (and backend sidecars) to ``archive_dir``
+        (default ``<log dir>/archive/``);
+      * ``"delete"``: remove it;
+      * ``fn(path, session_id)``: your own policy, called after closing.
     - ``journal``: EventBus kinds appended as ``event`` entries (``"x.*"``
       prefixes allowed; ``None`` or ``()`` disables journaling).
 
@@ -143,6 +179,10 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
     highest turn index journaled in the log (``TurnManager.advance_to``), so
     turn ids (``t1``, ``t2``, ...) are not reused across restarts.
     """
+    if not (on_close in ON_CLOSE or callable(on_close)):
+        raise ValueError(f"Durable: on_close must be one of {ON_CLOSE} or a callable, "
+                         f"got {on_close!r}")
+    session = _session()
     sid = _session_id() if log_factory is not None else None
     # Keyed on the log identity / path and the session, not on the factory's
     # identity (an inline lambda is a new object every render).
@@ -153,11 +193,18 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
     slog, owned = opened
 
     gen, set_gen = hooks.use_state(0)
+    retention = hooks.use_ref(None)
+    retention.current = (on_close, archive_dir)
 
     def _own():
         def _close():
-            if owned:
-                slog.close()
+            if not owned:
+                return
+            slog.close()
+            policy, where = retention.current
+            reason = getattr(session, "close_reason", None)
+            if policy != "keep" and reason in ("idle", "closed"):
+                _retire(slog, policy, where, str(getattr(session, "id", "")))
 
         return _close
 

@@ -7,9 +7,11 @@ keeps its session id in ``sessionStorage``, so a reload asks for the same id).
     Durable(log_factory=lambda session_id: f"runs/web/{session_id}.sqlite", ...)
 
 The factory is called with the ``"session"`` service's id when the session
-mounts (ids are ``[A-Za-z0-9_-]{8,128}``, safe as file names), and the log is
-closed when the session closes (tab gone for ``session_ttl`` s, or server
-stop). Inside, ``use_conversation()`` is the persisted transcript, so:
+mounts (escaped with ``safe_session_id``, so it is always safe in a path), and
+the log is closed when the session closes (tab gone for ``session_ttl`` s, or
+server stop). Logs of sessions closed by the TTL are kept by default; pass
+``Durable(..., on_close="archive" | "delete" | fn)`` to clean them up (server
+shutdown never triggers it). Inside, ``use_conversation()`` is the persisted transcript, so:
 
 - two tabs never see each other's conversation (two files);
 - reloading a tab, or restarting the server and reloading, restores it: on

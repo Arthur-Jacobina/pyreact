@@ -14,7 +14,11 @@ from .log import (
     SessionLocked,
     SessionLog,
     SessionLogError,
+    archive_log,
+    delete_log,
+    log_files,
     register_migration,
+    safe_session_id,
 )
 from .render import render_tree
 
@@ -27,7 +31,8 @@ _LM = {"durable_lm", "ReplayMissError", "DurableLM", "llm_entries"}
 
 __all__ = [
     "FORMAT_VERSION", "SessionLocked", "SessionLog", "SessionLogError",
-    "register_migration", "render_tree", *sorted(_REACT), *sorted(_LM),
+    "register_migration", "render_tree", "safe_session_id", "log_files",
+    "archive_log", "delete_log", *sorted(_REACT), *sorted(_LM),
 ]
 
 

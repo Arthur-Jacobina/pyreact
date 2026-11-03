@@ -222,33 +222,40 @@ class AppRunner:
             self._submit(self._aopen_on_loop(sid, app, turn_policy))
         )
 
-    def _close_on_loop(self, session_id: str) -> bool:
+    def _close_on_loop(self, session_id: str, reason: str = "closed") -> bool:
         with self._sessions_lock:
             sess = self._sessions.pop(session_id, None)
         if sess is None:
             return False
         if sess is self._default:
             self._default = None
-        sess._unmount()
+        sess._unmount(reason)
         return True
 
-    async def _aclose_on_loop(self, session_id: str) -> bool:
-        return self._close_on_loop(session_id)
+    async def _aclose_on_loop(self, session_id: str, reason: str = "closed") -> bool:
+        return self._close_on_loop(session_id, reason)
 
-    def close_session(self, session_id: str) -> bool:
+    def close_session(self, session_id: str, *, reason: str = "closed") -> bool:
         """Unmount a session, cancel its turns/tasks and flush its state.
-        Returns False if unknown."""
+        Returns False if unknown.
+
+        ``reason`` is exposed as ``session.close_reason`` (readable by the
+        tree's cleanups) and in the ``session.closed`` event: ``"closed"``
+        (default), ``"idle"`` (TTL reaping) or ``"shutdown"`` (runner stop).
+        """
         if self._on_loop_thread():
-            return self._close_on_loop(session_id)
+            return self._close_on_loop(session_id, reason)
         if not self.is_running:
             return False
-        return self._submit(self._aclose_on_loop(session_id)).result()
+        return self._submit(self._aclose_on_loop(session_id, reason)).result()
 
-    async def aclose_session(self, session_id: str) -> bool:
+    async def aclose_session(self, session_id: str, *, reason: str = "closed") -> bool:
         """Async :meth:`close_session`."""
         if not self.is_running:
             return False
-        return await asyncio.wrap_future(self._submit(self._aclose_on_loop(session_id)))
+        return await asyncio.wrap_future(
+            self._submit(self._aclose_on_loop(session_id, reason))
+        )
 
     def close_idle_sessions(
         self, ttl: float, *, keep: Optional[Callable[[Session], bool]] = None
@@ -261,7 +268,7 @@ class AppRunner:
         """
         closed = []
         for sid in self._idle_session_ids(ttl, keep):
-            if self.close_session(sid):
+            if self.close_session(sid, reason="idle"):
                 closed.append(sid)
         return closed
 
@@ -271,7 +278,7 @@ class AppRunner:
         """Async :meth:`close_idle_sessions`."""
         closed = []
         for sid in self._idle_session_ids(ttl, keep):
-            if await self.aclose_session(sid):
+            if await self.aclose_session(sid, reason="idle"):
                 closed.append(sid)
         return closed
 
@@ -565,7 +572,7 @@ class AppRunner:
     def _shutdown_on_loop(self) -> None:
         for sess in self.sessions():
             try:
-                self._close_on_loop(sess.id)
+                self._close_on_loop(sess.id, "shutdown")
             except Exception:
                 pass
         for t in runtime.pending_tasks():
