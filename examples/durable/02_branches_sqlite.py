@@ -41,7 +41,7 @@ from pathlib import Path
 
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.keystroke import Keystroke
-from pyreact.core import EventBus, component, hooks
+from pyreact.core import component, hooks, use_emit
 from pyreact_durable import Durable, SessionLogError, use_durable, use_persistent_state
 
 # Offline smoke run (tests/test_examples_smoke.py).
@@ -54,10 +54,10 @@ SMOKE = {"args": ["--log", "{tmp}/state.sqlite"],
 def ShoppingList():
     items, set_items = use_persistent_state([], key="items")
     log = use_durable()
-    events = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
 
     def say(text: str) -> None:
-        events.publish("message", {"sender": "assistant", "text": text})
+        emit("message", {"sender": "assistant", "text": text})
 
     def on_submit(text: str) -> None:
         cmd, _, arg = text.strip().partition(" ")

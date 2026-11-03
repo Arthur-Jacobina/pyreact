@@ -67,7 +67,7 @@ from integrations.recovery import (
 )
 from pyreact.boot import bootstrap
 from pyreact.components.message import Message
-from pyreact.core import ErrorBoundary, EventBus, component, current_boundary, hooks, use_turn
+from pyreact.core import ErrorBoundary, component, current_boundary, hooks, use_emit, use_turn
 from pyreact.core.harness import HarnessProvider
 from pyreact.tools import make_tool
 
@@ -188,7 +188,7 @@ def city_of(text: str) -> str:
 @component
 def Assistant(tools: Dict[str, Any]):
     turn = use_turn()
-    bus = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
     mod = use_module(Answer, name="answer")
     call = use_call(mod)
 
@@ -204,11 +204,11 @@ def Assistant(tools: Dict[str, Any]):
 
     async def deliver():
         if call.error is not None:
-            bus.publish("message", {"text": f"sorry, no model could answer ({call.error})",
+            emit("message", {"text": f"sorry, no model could answer ({call.error})",
                                     "sender": "assistant", "message_type": "error"})
             return
         answer = call.result.answer
-        bus.publish("message", {"text": answer, "sender": "assistant", "message_type": "chat"})
+        emit("message", {"text": answer, "sender": "assistant", "message_type": "chat"})
         await call_tool(tools["save_note"], kwargs={"text": answer})
 
     hooks.use_effect(lambda: deliver() if call.ver and not call.loading else None, [call.ver])

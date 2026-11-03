@@ -37,7 +37,7 @@ from examples._lm import example_models
 from integrations import DSPyProvider, use_agent, use_call, use_module
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.message import Message
-from pyreact.core import EventBus, component, hooks, runtime, use_turn
+from pyreact.core import component, hooks, use_emit, use_turn
 from pyreact.tools import ToolProvider, use_tool
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
@@ -177,11 +177,11 @@ class RouteSpecialistSig(dspy.Signature):
 def use_publish(kind: str, payload: Optional[dict], deps: list) -> None:
     """Custom hook: publish an app event when ``deps`` change (``None`` payload
     = nothing to say). The event is attributed to the current turn."""
-    bus = hooks.get_service("event_bus", EventBus)
+    emit = use_emit()
 
     def _pub():
         if payload is not None:
-            bus.publish(kind, payload, turn_id=runtime.current_turn_id(), source="store")
+            emit(kind, payload, source="store")
 
     hooks.use_effect(_pub, deps)
 

@@ -26,7 +26,7 @@ from typing import Literal
 
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.message import Message
-from pyreact.core import EventBus, component, hooks, runtime, use_path, use_turn
+from pyreact.core import component, hooks, use_emit, use_turn
 
 # Offline smoke run (tests/test_examples_smoke.py).
 SMOKE = {"stdin": "hello\nhello\n:events log\n:q\n"}
@@ -35,11 +35,12 @@ SMOKE = {"stdin": "hello\nhello\n:events log\n:q\n"}
 @component
 def Log(text: str, trigger: Literal["change", "mount"] = "change"):
     """Publish ``text`` as a ``log`` event ({"text"}) on mount or on change."""
-    bus = hooks.get_service("event_bus", EventBus)
-    source = use_path()  # this component's stable path, e.g. Echo/Log[seen-1]
+    # publishes on the session bus with this component's stable path as the
+    # source (e.g. Echo/Log[seen-1]) and the current turn id
+    emit = use_emit()
 
     def _publish():
-        bus.publish("log", {"text": text}, turn_id=runtime.current_turn_id(), source=source)
+        emit("log", {"text": text})
 
     hooks.use_effect(_publish, [] if trigger == "mount" else [text])
     return []
