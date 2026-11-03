@@ -10,6 +10,7 @@ from .dehydrate import (
     adehydrate_tree,
     check_snapshot,
     dehydrate_tree,
+    report_hydration_mismatch,
     use_dehydrate,
 )
 from .provider import create_context
@@ -36,6 +37,7 @@ __all__ = [
     "Hydrating",
     "HydrationWarning",
     "use_dehydrate",
+    "report_hydration_mismatch",
     "SNAPSHOT_FORMAT",
     "Snapshot",
     "SnapshotError",

@@ -189,3 +189,33 @@ def test_hooks_proxy_and_duplicate_keys():
 
     asyncio.run(_mount(Dup))
     assert errors and "used twice" in str(errors[0])
+
+
+def test_report_hydration_mismatch_after_hydration_and_without_one():
+    from pyreact.core import EventBus, report_hydration_mismatch
+    from pyreact.core.dehydrate import finish_hydration
+
+    @component
+    def Box():
+        use_dehydrate("ref", dehydrate=lambda: "x")
+        return []
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        root, state = asyncio.run(_mount(Box, {"Box": {"ref": "snap-1"}}))
+        finish_hydration(root)
+        # later (e.g. when the resource boots), the library finds it is gone
+        rec = report_hydration_mismatch("ref", "snapshot snap-1 is gone", ctx=root,
+                                        snapshot="snap-1")
+        assert rec == {"kind": "error", "path": "Box", "key": "ref",
+                       "message": "snapshot snap-1 is gone", "snapshot": "snap-1"}
+        assert state.mismatches == [rec]
+
+        # a tree that was not hydrated: event on its bus + warning only
+        bus = EventBus()
+        seen = []
+        bus.subscribe(lambda ev: seen.append((ev.kind, ev.payload["key"])))
+        plain = HookContext("Plain", Box, services={"event_bus": bus})
+        report_hydration_mismatch("k", "gone", ctx=plain)
+    assert seen == [("hydration.mismatch", "k")]
+    assert sum(issubclass(w.category, HydrationWarning) for w in caught) == 2
