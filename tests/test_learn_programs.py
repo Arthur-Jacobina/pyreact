@@ -10,8 +10,19 @@ import pytest
 from dspy.utils import DummyLM
 
 from integrations import DSPyProvider, use_agent, use_call, use_dspy_env, use_module
-from integrations.learn import LearnedProgram, OptimizationResult, SavedProgram, use_learned
+from integrations.learn import (
+    LearnedProgram,
+    LearnedPrograms,
+    OptimizationResult,
+    SavedProgram,
+    find_envs,
+    find_registries,
+    resolve_module,
+    use_learned,
+    use_learned_registry,
+)
 from integrations.optimize import ModuleVersions
+from pyreact.boot import bootstrap
 from pyreact.core import component, hooks, runtime
 from pyreact.core.hook import HookContext
 from pyreact.core.runtime import schedule_rerender
@@ -242,3 +253,145 @@ def test_bad_src_type_is_a_type_error():
         from integrations.learn.programs import _resolve
 
         _resolve("x", 42, {}, False)
+
+
+# ---------------------------------------------------------------------------
+# LearnedPrograms + declarative swap from outside the tree
+# ---------------------------------------------------------------------------
+def test_learned_programs_prop_from_the_root_is_the_swap():
+    seen = []
+    box = {}
+
+    @component
+    def Leaf():
+        qa = use_module(QA, name="qa", program=use_learned("qa"))
+        seen.append(qa.signature.instructions)
+        return []
+
+    @component
+    def Root():
+        programs, set_programs = hooks.use_state({})
+        box["set"] = set_programs
+        return [DSPyProvider(key="dspy", lm=DummyLM([]), children=[
+            LearnedPrograms(programs=programs, children=[Leaf(key="leaf")])])]
+
+    p = learned("ROOT PROP")
+    run(Root, lambda: box["set"]({"qa": p}), lambda: box["set"]({}))
+    assert "ROOT PROP" in seen and seen[-1] == "Answer the question."
+
+
+@pytest.fixture
+def app():
+    made = []
+
+    def _make(App):
+        a = bootstrap(App)
+        made.append(a)
+        return a
+
+    yield _make
+    for a in made:
+        a.shutdown()
+
+
+def _app_tree(seen, *, wrap="program", initial=None, name="qa"):
+    @component
+    def Leaf():
+        qa = use_module(QA, name=name, program=use_learned(name if name else hooks.path))
+        seen.append(qa.signature.instructions)
+        return []
+
+    @component
+    def Leaf2():  # no explicit name: the module key's scope is this component's path
+        qa = use_module(QA, program=use_learned("anon"))
+        seen.append(("anon", qa.signature.instructions))
+        return []
+
+    @component
+    def App():
+        kids = [Leaf(key="leaf"), Leaf2(key="anon")]
+        if wrap == "program":
+            kids = [LearnedProgram(key=name, src=initial, children=kids)]
+        elif wrap == "programs":
+            kids = [LearnedPrograms(programs={}, children=kids)]
+        return [DSPyProvider(key="dspy", lm=DummyLM([]), children=kids)]
+
+    return App
+
+
+@pytest.mark.parametrize("wrap", ["program", "programs"])
+def test_hot_swap_updates_the_provider_state(app, tmp_path, wrap):
+    seen = []
+    a = app(_app_tree(seen, wrap=wrap))
+    a.wait_idle(timeout=5)
+    res = OptimizationResult(program=learned("SWAPPED"), optimizer="gepa", arch="predict",
+                             module_key=("Predict", "QA", "qa"))
+    res.save(str(tmp_path / "qa.json"))
+    users = res.hot_swap(a, "qa")
+    a.wait_idle(timeout=5)
+    assert users == ["App/Leaf[leaf]"]
+    assert [s for s in seen if isinstance(s, str)][-1] == "SWAPPED"
+    [(path, reg)] = find_registries(a)
+    assert reg.programs == {"qa": str(tmp_path / "qa.json")}  # JSON-able: {name: path}
+    # by module key tuple, too (no file: the program itself is the state)
+    res2 = OptimizationResult(program=learned("AGAIN"), optimizer="gepa")
+    assert res2.hot_swap(a, ("Predict", "QA", "qa")) == ["App/Leaf[leaf]"]
+    a.wait_idle(timeout=5)
+    assert [s for s in seen if isinstance(s, str)][-1] == "AGAIN"
+    # the env was never mutated from outside: the compiled entry is the live module
+    env = find_envs(a)[0][1]
+    assert env.compiled[("Predict", "QA", "qa")] is env.caches[("Predict", "QA", "qa")]
+
+
+def test_hot_swap_matches_users_by_module_key_scope(app):
+    seen = []
+    a = app(_app_tree(seen, wrap="programs"))
+    a.wait_idle(timeout=5)
+    _env, key, mod = resolve_module(a, "anon")
+    assert key[-1].endswith("Leaf2#anon")
+    res = OptimizationResult(program=learned("ANON"), optimizer="gepa", module_key=key)
+    assert res.hot_swap(a) == ["App/Leaf2[anon]"]
+    a.wait_idle(timeout=5)
+    assert seen[-1] == ("anon", "ANON")
+    [(_p, reg)] = find_registries(a)
+    assert "anon" in reg.programs
+
+
+def test_hot_swap_without_a_provider_falls_back_to_the_env(app):
+    seen = []
+    a = app(_app_tree(seen, wrap=None))
+    a.wait_idle(timeout=5)
+    assert find_registries(a) == []
+    res = OptimizationResult(program=learned("LEGACY"), optimizer="gepa")
+    res.hot_swap(a, "qa")
+    a.wait_idle(timeout=5)
+    env = find_envs(a)[0][1]
+    assert env.compiled[("Predict", "QA", "qa")] is res.program
+
+
+def test_use_learned_registry_swaps_from_inside_and_unmount_unregisters():
+    seen = []
+    box = {}
+
+    @component
+    def Leaf():
+        qa = use_module(QA, name="qa", program=use_learned("qa"))
+        reg = use_learned_registry()
+        box["reg"] = reg
+        seen.append(qa.signature.instructions)
+        return []
+
+    @component
+    def Root():
+        show, set_show = hooks.use_state(True)
+        box["show"] = set_show
+        kids = [LearnedPrograms(key="lp", programs={}, children=[Leaf(key="leaf")])] if show else []
+        return [DSPyProvider(key="dspy", lm=DummyLM([]), children=kids)]
+
+    p = learned("INSIDE")
+    run(Root,
+        lambda: box["reg"].set("qa", p),
+        lambda: (box.__setitem__("regs", find_registries(None)), box["show"](False)))
+    assert seen[-1] == "INSIDE"
+    assert [r for _p, r in box["regs"]] == [box["reg"]]
+    assert box["reg"] not in [r for _p, r in find_registries(None)]

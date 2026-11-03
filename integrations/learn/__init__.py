@@ -5,6 +5,8 @@
     learned prog  a prop / context              LearnedProgram(key="supervisor", src="x.json")
                                                 use_module(sig, program=use_learned("supervisor"))
     hot swap      HMR = a re-render             src changes -> users re-render with it
+                                                (result.hot_swap(app, "supervisor") updates
+                                                 that provider's state)
     events        the trace you debug/learn from dataset_from_events(app.events, key)
                                                 explain(call_id) / inspect_program(program)
 
@@ -18,7 +20,9 @@ Quick start::
                       optimizer="gepa", budget=40, lm=lm, reflection_lm=lm)
     print(result.report()); print(result.diff())
     result.save("artifacts/router.json")
-    result.hot_swap(app, "supervisor")
+    # in the app: LearnedProgram(key="supervisor", src="artifacts/router.json", children=[...])
+    #             use_module(RouteSig, program=use_learned("supervisor"))
+    result.hot_swap(app, "supervisor")  # live: re-renders the provider with the new src
 
 Importing this package also registers the ``:modules``, ``:inspect``,
 ``:explain``, ``:feedback`` and ``:optimize`` terminal commands.
@@ -57,7 +61,16 @@ from .optimizers import (
     register_optimizer,
     unregister_optimizer,
 )
-from .programs import LearnedProgram, SavedProgram, use_learned
+from .programs import (
+    LearnedProgram,
+    LearnedPrograms,
+    LearnedRegistry,
+    SavedProgram,
+    find_registries,
+    swap_learned,
+    use_learned,
+    use_learned_registry,
+)
 from .result import OptimizationResult, diff_states, load
 
 install_commands()
@@ -82,7 +95,12 @@ __all__ = [
     "load",
     # learned programs are props
     "LearnedProgram",
+    "LearnedPrograms",
+    "LearnedRegistry",
     "use_learned",
+    "use_learned_registry",
+    "find_registries",
+    "swap_learned",
     "SavedProgram",
     "diff_states",
     "count_lm_calls",

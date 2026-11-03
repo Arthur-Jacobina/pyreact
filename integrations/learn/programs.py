@@ -23,6 +23,15 @@
 - ``watch=True`` polls file sources every ``interval`` seconds (off by
   default) and re-renders when a file changes on disk.
 
+Many at once, from the root: ``LearnedPrograms(programs={name: src}, ...)``.
+The provider *holds* its programs as state (``{name: path}``): re-rendering
+it with another ``programs`` / ``src`` prop resets that state (declarative
+swap from the root); :meth:`OptimizationResult.hot_swap` and ``:optimize``
+update the state of the provider that owns the name (or that its users read
+from) through :class:`LearnedRegistry`, and fall back to the legacy env
+mutation only for apps that have no provider. In the tree,
+:func:`use_learned_registry` returns the nearest provider's handle.
+
 Providers are transparent (``@component(transparent=True)``): wrapping a
 subtree in one does not change its components' paths.
 """
@@ -32,14 +41,31 @@ from __future__ import annotations
 import asyncio
 import copy
 import os
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from pyreact.core.core import _context_stack, component, hooks
 from pyreact.core.provider import create_context
 from pyreact.core.runtime import schedule_rerender
 
-__all__ = ["LearnedProgram", "use_learned", "LearnedContext", "SavedProgram"]
+__all__ = [
+    "LearnedProgram",
+    "LearnedPrograms",
+    "LearnedRegistry",
+    "use_learned",
+    "use_learned_registry",
+    "find_registries",
+    "swap_learned",
+    "LearnedContext",
+    "SavedProgram",
+    "LEARNED_SERVICE",
+]
+
+# Session service: {provider path: LearnedRegistry}. Internal plumbing for
+# OptimizationResult.hot_swap / :optimize (outside code is handed a root in
+# a later step of ADR 0001: root.ref(...)); components use use_learned.
+LEARNED_SERVICE = "learn.programs"
 
 
 class SavedProgram:
@@ -65,9 +91,100 @@ class LearnedScope:
     """The context value: every learned program visible here, by name."""
 
     programs: Mapping[str, Any] = field(default_factory=dict)
+    owners: Mapping[str, "LearnedRegistry"] = field(default_factory=dict)
+    nearest: Optional["LearnedRegistry"] = None
 
     def get(self, name: str) -> Any:
         return self.programs.get(name)
+
+
+class LearnedRegistry:
+    """Handle on one provider's state (``{name: src}``).
+
+    ``set(name, src)`` / ``update({...})`` / ``remove(name)`` change it and
+    re-render the provider's subtree (thread-safe: from another thread the
+    change runs on the app loop and the call waits for it to be applied).
+    ``programs`` is the current state; ``consumers`` the component paths
+    that read each name with :func:`use_learned` (the last render).
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.consumers: Dict[str, Set[str]] = {}
+        # the same users as telemetry.component_path (the scope of their module keys)
+        self._scopes: Dict[str, Set[str]] = {}
+        self._ctx: Any = None
+        self._state: Callable[[], Dict[str, Any]] = dict
+        self._set: Callable[[Any], None] = lambda v: None
+        self._cache: Dict[str, Any] = {}
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def programs(self) -> Dict[str, Any]:
+        return dict(self._state())
+
+    def names(self) -> Set[str]:
+        return set(self._state()) | {n for n, c in self.consumers.items() if c}
+
+    def _store(self, src: Any) -> Any:
+        """What the state keeps for ``src``: a result's file path when it has
+        one (JSON-able, and the program is primed in the cache so it is not
+        re-read), the path again for a path (re-read: the file may be new)."""
+        from .result import OptimizationResult
+
+        if isinstance(src, OptimizationResult) and src.path:
+            apath = os.path.abspath(src.path)
+            self._cache[apath] = (_mtime(src.path), _of_result(src), None)
+            return src.path
+        if _is_path(src):
+            self._cache.pop(os.path.abspath(os.fspath(src)), None)
+            return os.fspath(src)
+        return src
+
+    def _apply(self, change: Callable[[Dict[str, Any]], Dict[str, Any]]) -> None:
+        def run():
+            new = change(dict(self._state()))
+            self._set(lambda _old: new)
+            ctx = self._ctx
+            if ctx is not None and getattr(ctx, "_mounted", False):
+                schedule_rerender(ctx, reason="learned program swapped")  # also when equal
+
+        loop = self._loop
+        if (loop is None or loop.is_closed() or not loop.is_running()
+                or threading.current_thread() is self._thread):
+            run()
+            return
+        done = threading.Event()
+        err: List[BaseException] = []
+
+        def on_loop():
+            try:
+                run()
+            except BaseException as exc:  # pragma: no cover - surfaced to the caller
+                err.append(exc)
+            finally:
+                loop.call_soon(done.set)  # after the rerender is enqueued
+
+        loop.call_soon_threadsafe(on_loop)
+        if not done.wait(10):
+            raise TimeoutError(f"learned program swap on {self.path} not applied in 10s")
+        if err:
+            raise err[0]
+
+    def set(self, name: str, src: Any) -> None:
+        stored = self._store(src)
+        self._apply(lambda cur: {**cur, str(name): stored})
+
+    def update(self, programs: Mapping[str, Any]) -> None:
+        stored = {str(k): self._store(v) for k, v in programs.items()}
+        self._apply(lambda cur: {**cur, **stored})
+
+    def remove(self, name: str) -> None:
+        self._apply(lambda cur: {k: v for k, v in cur.items() if k != str(name)})
+
+    def __repr__(self) -> str:
+        return f"<LearnedRegistry {self.path} {sorted(self._state())}>"
 
 
 LearnedContext = create_context(default=None, name="Learned")
@@ -152,8 +269,7 @@ def _declared_sig(declared: Mapping[str, Any]) -> Any:
 # ---------------------------------------------------------------------------
 # The provider
 # ---------------------------------------------------------------------------
-def _use_watch(ctx: Any, box: Dict[str, Any], paths: tuple, watch: bool,
-               interval: float) -> None:
+def _use_watch(ctx: Any, paths: tuple, watch: bool, interval: float) -> None:
     """Poll ``paths`` (loop timers, not a task: never holds ``wait_idle``)."""
 
     def start():
@@ -192,26 +308,50 @@ def _use_learned_provider(declared: Mapping[str, Any], *, watch: bool, interval:
     #       dehydrate=lambda: dehydrate_programs(programs), hydrate=hydrate_programs)
     # so the learned program reference survives suspend/resume as state of the
     # provider (replacing CompiledModulesParticipant).
+    state_idx = ctx.hook_idx
     programs, set_programs = hooks.use_state(dict(declared))
     box = hooks.use_ref(None)
     if box.current is None:
-        box.current = {"declared": _declared_sig(declared), "cache": {}}
+        box.current = {"declared": _declared_sig(declared), "registry": LearnedRegistry(ctx.path)}
     st = box.current
+    reg: LearnedRegistry = st["registry"]
     sig = _declared_sig(declared)
     if sig != st["declared"]:  # the prop changed: it wins (a re-render = the swap)
         st["declared"] = sig
         programs = dict(declared)
-        set_programs(programs)
+        set_programs(lambda _old: programs)
     outer = hooks.use_context(LearnedContext)
 
+    # the handle outside code (hot_swap, :optimize) and use_learned_registry use
+    reg._ctx, reg._set = ctx, set_programs
+    reg._state = lambda: ctx.hooks[state_idx]  # the current value of the state above
+    try:
+        reg._loop, reg._thread = asyncio.get_running_loop(), threading.current_thread()
+    except RuntimeError:
+        reg._loop = reg._thread = None
+    reg.consumers, reg._scopes = {}, {}  # refilled by use_learned while the subtree renders
+    services = hooks.get_service(LEARNED_SERVICE, dict)
+    services[ctx.path] = reg
+
+    def _mount():
+        def _unmount():
+            if services.get(ctx.path) is reg:
+                del services[ctx.path]
+
+        return _unmount
+
+    hooks.use_effect(_mount, [])
+
     resolved = dict(outer.programs) if outer is not None else {}
+    owners = dict(outer.owners) if outer is not None else {}
     for name, src in programs.items():
-        resolved[name] = _resolve(name, src, st["cache"], watch)
+        resolved[name] = _resolve(name, src, reg._cache, watch)
+        owners[name] = reg
     paths = tuple(sorted(os.path.abspath(os.fspath(s)) for s in programs.values()
                          if _is_path(s)))
-    _use_watch(ctx, st, paths, watch, interval)
+    _use_watch(ctx, paths, watch, interval)
 
-    hooks.provide(LearnedContext, LearnedScope(programs=resolved))
+    hooks.provide(LearnedContext, LearnedScope(programs=resolved, owners=owners, nearest=reg))
     return list(children or [])
 
 
@@ -225,6 +365,16 @@ def LearnedProgram(*, src: Any = None, watch: bool = False, interval: float = 1.
     if name is None:
         raise TypeError("LearnedProgram needs key=<name> (the name use_learned(name) reads)")
     return _use_learned_provider({str(name): src}, watch=watch, interval=interval,
+                                 children=children)
+
+
+@component(transparent=True)
+def LearnedPrograms(*, programs: Optional[Mapping[str, Any]] = None, watch: bool = False,
+                    interval: float = 1.0, children: Any = None):
+    """``LearnedPrograms(programs={name: src, ...}, watch=False, children=[...])``:
+    many learned programs at once, typically at the root. Re-render it with a
+    new ``programs`` prop to swap (each ``src`` as for :func:`LearnedProgram`)."""
+    return _use_learned_provider(dict(programs or {}), watch=watch, interval=interval,
                                  children=children)
 
 
@@ -246,7 +396,85 @@ def use_learned(name_or_key: Any) -> Any:
     scope = hooks.use_context(LearnedContext)
     if scope is None:
         return None
-    for n in _names_for(name_or_key):
+    names = _names_for(name_or_key)
+    name = next((n for n in names if n in scope.owners), names[-1])
+    owner = scope.owners.get(name, scope.nearest)
+    if owner is not None:  # so a swap from outside finds who reads the name
+        from integrations import telemetry as tm
+
+        owner.consumers.setdefault(name, set()).add(hooks.path)
+        owner._scopes.setdefault(name, set()).add(tm.component_path(_context_stack.get()))
+    for n in names:
         if n in scope.programs:
             return scope.programs[n]
     return None
+
+
+def use_learned_registry() -> Optional[LearnedRegistry]:
+    """The nearest ``LearnedProgram`` / ``LearnedPrograms`` provider's handle
+    (``None`` without one): ``reg.set("router", "artifacts/new.json")`` from
+    an effect re-renders that provider's subtree with the new program."""
+    scope = hooks.use_context(LearnedContext)
+    return scope.nearest if scope is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Swapping from outside the tree (thin: it updates a provider's state)
+# ---------------------------------------------------------------------------
+def find_registries(target: Any = None) -> List[Tuple[str, LearnedRegistry]]:
+    """``[(provider path, LearnedRegistry)]`` mounted in an AppRunner / Session
+    (``None``: headless trees)."""
+    from .hmr import _services_of
+
+    out: List[Tuple[str, LearnedRegistry]] = []
+    for services in _services_of(target):
+        for path, reg in list((services.get(LEARNED_SERVICE) or {}).items()):
+            if all(reg is not r for _p, r in out):
+                out.append((path, reg))
+    return out
+
+
+def _wanted(key: Any) -> Tuple[Set[str], Optional[str]]:
+    from integrations.feedback import key_str
+
+    if isinstance(key, tuple):
+        return {key_str(key), str(key[-1])}, str(key[-1])
+    return {str(key)}, None
+
+
+def _match(reg: LearnedRegistry, key: Any) -> Optional[Tuple[int, str]]:
+    from integrations.feedback import key_str
+
+    from .hmr import _scope_match
+
+    names, scope = _wanted(key)
+    best = None
+    for name in reg.names():
+        users = reg.consumers.get(name) or set()
+        hit = (name in names or _scope_match(key_str(key), name)
+               or (scope is not None and scope in (reg._scopes.get(name) or ())))
+        if hit:
+            rank = (2 if users else 0) + (1 if name in reg._state() else 0)
+            if best is None or rank > best[0]:
+                best = (rank, name)
+    return best
+
+
+def swap_learned(target: Any, key: Any, src: Any) -> Optional[List[str]]:
+    """Swap ``src`` in as the learned program for ``key`` by updating the
+    state of the provider that owns it (preferring one whose users read it).
+
+    ``key``: a learned name, or a module key (tuple / ``key_str`` / scope)
+    matched against the names and their users. Returns the paths of the
+    components that read it (they re-render), or ``None`` when no provider in
+    ``target`` matches (the caller may fall back to the env mutation)."""
+    best = None
+    for _path, reg in find_registries(target):
+        m = _match(reg, key)
+        if m is not None and (best is None or m[0] > best[0][0]):
+            best = (m, reg)
+    if best is None:
+        return None
+    (_rank, name), reg = best
+    reg.set(name, src)
+    return sorted(reg.consumers.get(name) or ())
