@@ -64,6 +64,7 @@ Key pieces:
 - `use_turn()` (from `pyreact.core`) returns the latest turn and rerenders on each new one, so a repeated identical message still triggers effects keyed on the turn. `Keystroke(on_submit=fn)` calls `fn(text)` or `fn(text, turn)`.
 - **Handle each input once**: `use_state` drops a value equal to the current one, so don't store the submitted text to trigger work (two identical inputs would look like one). Key the work on the turn instead: `use_on_turn(lambda turn: call.run(question=turn.text))` calls the handler once per turn after commit (async handlers are part of the turn), and `Message(..., trigger="turn")` publishes once per `(turn, text)` (the default `trigger="change"` dedupes on text).
 - `app.invoke(text, wait=True)` blocks until that turn ends; `app.wait_turn(turn_id)` waits for an earlier one.
+- Turn ids are `t1`, `t2`, ... per session (non-default sessions prefix them with `<session id>/`). A process restart starts again at `t1`; to keep ids unique across restarts, configure the session's `TurnManager` with `id_factory=lambda i: f"t-{run_id}-{i}"` or call `turns.advance_to(n)` (`pyreact_durable.Durable` does the latter from its log).
 
 ### 10) Durable memory ↔ Persistence at the border
 - Agent memory that survives restarts lives in a separate library, [`pyreact_durable`](pyreact_durable/README.md); `pyreact` never imports it.

@@ -184,6 +184,10 @@ log.close()                               # also a context manager
   unmount; a `SessionLog` you pass stays yours. It also watches the log: when
   the leaf *jumps* (checkout / branch) it rerenders its subtree so persistent
   hooks reload from the new position.
+- **Turn ids continue across restarts**: on mount `Durable` calls
+  `TurnManager.advance_to(last journaled turn index + 1)`, so a restarted app
+  numbers its turns `t5`, `t6`, ... instead of reusing `t1` (journaled
+  `turn_id`s stay unique; needs `turn.*` in `journal`, the default).
 - **Multiple sessions** (one app tree per user on one `AppRunner`): give each
   session its own file with a factory — it receives the session id:
 

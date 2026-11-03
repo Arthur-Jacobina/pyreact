@@ -26,7 +26,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
-from pyreact.core import EventBus, component, create_context, hooks
+from pyreact.core import EventBus, TurnManager, component, create_context, hooks
 
 from .log import SessionLog
 
@@ -115,6 +115,17 @@ def _jsonable(obj: Any) -> Any:
         return repr(obj)
 
 
+def _last_turn_index(log: SessionLog) -> int:
+    """Highest turn index journaled in ``log`` (any branch), 0 if none."""
+    last = 0
+    for e in log.entries:
+        if e.get("type") == "event" and str(e.get("kind", "")).startswith("turn."):
+            idx = (e.get("payload") or {}).get("index")
+            if isinstance(idx, int) and idx > last:
+                last = idx
+    return last
+
+
 @component(transparent=True)
 def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
     """Provide a :class:`SessionLog` to the subtree and journal bus events.
@@ -127,6 +138,10 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
       Logs it returns are closed on unmount.
     - ``journal``: EventBus kinds appended as ``event`` entries (``"x.*"``
       prefixes allowed; ``None`` or ``()`` disables journaling).
+
+    On mount the session's ``TurnManager`` continues numbering after the
+    highest turn index journaled in the log (``TurnManager.advance_to``), so
+    turn ids (``t1``, ``t2``, ...) are not reused across restarts.
     """
     sid = _session_id() if log_factory is not None else None
     # Keyed on the log identity / path and the session, not on the factory's
@@ -171,6 +186,15 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, children=None):
         return bus.subscribe(on_event, kinds)
 
     hooks.use_effect(_journal, [slog, bus, kinds])
+
+    turns = hooks.get_service("turns", TurnManager)
+
+    def _continue_turn_ids():
+        last = _last_turn_index(slog)
+        if last:
+            turns.advance_to(last + 1)
+
+    hooks.use_effect(_continue_turn_ids, [slog, turns])
 
     hooks.provide(_DurableCtx, DurableHandle(slog, gen))
     return list(children or [])
