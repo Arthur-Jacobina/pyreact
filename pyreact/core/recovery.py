@@ -17,6 +17,7 @@ the session doing the call (and the process-global bus), with the boundary's
 
     recovery.retry      {kind, name, boundary_id, attempt, delay, error, hint}
     recovery.exhausted  {kind, name, boundary_id, attempts, error}
+    recovery.fallback   {kind, name, boundary_id, to, error}
 
 DSPy-aware recovery (switching models) lives in :mod:`integrations.recovery`.
 """
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import email.utils
+import inspect
 import random
 import time
 from typing import Any, Callable, Iterable, Optional, Tuple, Type, Union
@@ -35,6 +37,8 @@ __all__ = [
     "Backoff",
     "RetryOn",
     "exponential",
+    "fallback",
+    "should_fall_back",
     "is_retryable",
     "publish_recovery",
     "retry",
@@ -92,14 +96,24 @@ def is_retryable(exc: BaseException) -> bool:
     return getattr(exc, "retryable", True) is not False
 
 
-def _predicate(on: Optional[RetryOn]) -> Callable[[BaseException], bool]:
+def should_fall_back(exc: BaseException) -> bool:
+    """Default ``on`` of the fallbacks: any ``Exception`` except guard
+    refusals (:class:`Blocked`). Unlike :func:`is_retryable` it includes
+    non-retryable errors such as an open circuit: that is when a substitute
+    is most useful."""
+    return isinstance(exc, Exception) and not isinstance(exc, Blocked)
+
+
+def _predicate(on: Optional[RetryOn],
+               default: Callable[[BaseException], bool] = is_retryable,
+               ) -> Callable[[BaseException], bool]:
     if on is None:
-        return is_retryable
+        return default
     if isinstance(on, type) or isinstance(on, tuple):
         types = on
 
         def by_type(exc: BaseException) -> bool:
-            return isinstance(exc, types) and is_retryable(exc)
+            return isinstance(exc, types) and default(exc)
 
         return by_type
     if callable(on):
@@ -245,3 +259,42 @@ def retry(
                 b.attempt += 1
 
     return _retry
+
+
+# ---------------------------------------------------------------------------
+# fallback
+# ---------------------------------------------------------------------------
+def fallback(
+    fn: Callable[[Boundary, BaseException], Any],
+    on: Optional[RetryOn] = None,
+    kinds: Optional[Iterable[str]] = None,
+    *,
+    name: str = "fallback",
+) -> Middleware:
+    """When the call fails, return ``fn(b, exc)`` (sync or async) instead.
+
+    The substitute must be what the owner expects: a ``dspy.Prediction`` for
+    ``llm`` boundaries, the tool's result type for ``tool``. ``on``: exception
+    type(s) or ``predicate(exc)`` (default :func:`should_fall_back`: every
+    ``Exception`` but :class:`Blocked`). Sets ``b.attrs["fallback"] = True``
+    and publishes ``recovery.fallback``.
+    """
+    should = _predicate(on, should_fall_back)
+
+    @middleware(kinds=kinds, name=name)
+    async def _fallback(b: Boundary, call_next: Next) -> Any:
+        try:
+            return await call_next(b)
+        except Exception as exc:
+            if not should(exc) or _cancelling():
+                raise
+            b.attrs["fallback"] = True
+            publish_recovery("recovery.fallback", {
+                **_base(b), "to": getattr(fn, "__name__", "substitute"),
+                "error": _brief(exc)}, b)
+            out = fn(b, exc)
+            if inspect.isawaitable(out):
+                out = await out
+            return out
+
+    return _fallback
