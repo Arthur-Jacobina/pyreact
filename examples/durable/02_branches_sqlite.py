@@ -39,10 +39,9 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from pyreact.boot import bootstrap
+from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.components.keystroke import Keystroke
 from pyreact.core import EventBus, component, hooks
-from pyreact.observability import ConsoleSink
 from pyreact_durable import Durable, SessionLogError, use_durable, use_persistent_state
 from pyreact_durable.__main__ import render_tree
 
@@ -98,19 +97,12 @@ async def main() -> None:
         return [Durable(key="durable", log=log, children=[ShoppingList(key="list")])]
 
     app = bootstrap(App)
-    ConsoleSink().attach(app.events, replay=True)
     print(f"durable list in {log}; :q to quit")
-    loop = asyncio.get_running_loop()
     try:
-        # Our own loop (not read_terminal_and_invoke): that one treats every
-        # "/word" as a terminal command, and here the app owns the slashes.
-        while (line := await loop.run_in_executor(None, input, "> ")).strip() != ":q":
-            await app.ainvoke(line, wait=True)
-    except (EOFError, KeyboardInterrupt):
-        pass
+        # "/label" etc. are app input: terminal commands use ":" (":q", ":help").
+        await read_terminal_and_invoke(app, prompt="> ")
     finally:
         app.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(main())

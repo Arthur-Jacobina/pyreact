@@ -141,6 +141,25 @@ def handle_command(app: AppRunner, cmd: str, args_str: str = "") -> bool:
     return False
 
 
+def parse_command(
+    line: str, prefixes: Iterable[str] = (":",)
+) -> Optional[Tuple[str, str]]:
+    """``(cmd, args)`` if ``line`` is a terminal command line, else ``None``.
+
+    Only ``prefixes`` (default ``":"``) mark terminal commands: ``/word`` is
+    plain input that the app owns (e.g. its own slash commands).
+    """
+    s = (line or "").strip()
+    for prefix in prefixes:
+        if prefix and s.startswith(prefix):
+            rest = s[len(prefix):].strip()
+            if not rest:
+                return None
+            parts = rest.split(None, 1)
+            return parts[0], (parts[1] if len(parts) > 1 else "")
+    return None
+
+
 async def read_terminal_and_invoke(
     app: AppRunner,
     *,
@@ -148,6 +167,7 @@ async def read_terminal_and_invoke(
     wait: bool = True,
     console: bool = True,
     console_kinds: Optional[Iterable[str]] = ConsoleSink.DEFAULT_KINDS,
+    command_prefixes: Iterable[str] = (":",),
 ):
     """Minimal async loop that reads lines from stdin and forwards to app.invoke().
 
@@ -155,12 +175,18 @@ async def read_terminal_and_invoke(
     events (default: chat messages and errors) as they are published,
     including those emitted before the prompt started.
 
-    Built-in commands (prefix with ':' or '/'): see ``:help`` -- ``:events``,
-    ``:usage``, ``:turns``, ``:tree``, ``:trace``, ``:route``, ``:nav``, ``:q``.
+    Terminal commands start with ``:`` (``command_prefixes``): see ``:help``
+    -- ``:events``, ``:usage``, ``:turns``, ``:tree``, ``:trace``, ``:route``,
+    ``:nav``, ``:q``. Everything else is a turn of the app, including
+    ``/word`` lines (apps own their slash commands) and unknown ``:word``
+    commands (sent to the app, with a hint). Pass
+    ``command_prefixes=(":", "/")`` for the old behaviour where ``/word`` ran
+    a terminal command.
 
     - Reading happens via run_in_executor to avoid blocking the event loop.
     - Stop the loop by sending :q / :quit / :exit (case-sensitive) or Ctrl+C.
     """
+    prefixes = tuple(command_prefixes)
     sink = None
     if console and app.events is not None:
         sink = ConsoleSink(kinds=console_kinds)
@@ -171,18 +197,18 @@ async def read_terminal_and_invoke(
         while True:
             txt = await loop.run_in_executor(None, input, prompt)
             s = (txt or "").strip()
-            if s.startswith(":") or s.startswith("/"):
-                rest = s[1:].strip()
-                if not rest:
-                    continue
-                parts = rest.split(None, 1)
-                cmd = parts[0]
-                args_str = parts[1] if len(parts) > 1 else ""
+            parsed = parse_command(s, prefixes)
+            if parsed is None and s in prefixes:
+                continue  # a bare ":" is a no-op
+            if parsed is not None:
+                cmd, args_str = parsed
                 if cmd in ("q", "quit", "exit"):
                     break
-                if not handle_command(app, cmd, args_str):
-                    print(f"{GRAY}unknown command :{cmd} (try :help){RESET}")
-                continue
+                if handle_command(app, cmd, args_str):
+                    continue
+                # Not a terminal command: the app may own it.
+                print(f"{GRAY}(:{cmd} is not a terminal command; sent to the app. "
+                      f":help lists terminal commands){RESET}")
             try:
                 await app.ainvoke(txt, wait=wait)
             except Exception as exc:

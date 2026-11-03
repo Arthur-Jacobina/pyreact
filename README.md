@@ -216,7 +216,8 @@ In your own app, pass any `dspy.LM` to `DSPyProvider(lm=...)` or
 
 Run from the repository root (examples are a package). In the terminal every
 line is a turn; `:help` lists the dev commands (`:events`, `:usage`, `:turns`,
-`:route`, `:nav`, `:q`).
+`:route`, `:nav`, `:q`). Only `:` starts a terminal command: `/word` lines (and
+unknown `:word` commands) are app input, so apps can own their slash commands.
 
 ```bash
 # Routing: pages are routes; an LLM turns free text into a navigation
