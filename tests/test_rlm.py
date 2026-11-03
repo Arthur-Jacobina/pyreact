@@ -243,7 +243,7 @@ class ToolInterpreter(FakeInterpreter):
 def test_rlm_tools_run_as_tool_boundaries_from_the_worker_thread():
     import threading
 
-    seen, threads = [], []
+    seen, threads, ids = [], [], []
 
     def shout(text: str) -> str:
         """Shout the text.
@@ -256,6 +256,7 @@ def test_rlm_tools_run_as_tool_boundaries_from_the_worker_thread():
         out = await call_next(b)
         seen.append((b.kind, b.name, dict(b.inputs), b.attrs.get("result"),
                      b.attrs.get("call_id")))
+        ids.append((b.id, b.parent_id))
         return out
 
     hs = {}
@@ -284,3 +285,4 @@ def test_rlm_tools_run_as_tool_boundaries_from_the_worker_thread():
     assert tool == [("tool", "shout", {"text": "hi"}, "HI", hs["cid"])]
     assert threads and threads[0] != "MainThread"  # sync tool still off the loop
     assert [s[0] for s in seen] == ["tool", "llm"]
+    assert ids[0][1] == ids[1][0]  # the REPL's tool call nests under the RLM call

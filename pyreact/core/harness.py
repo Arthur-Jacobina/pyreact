@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -47,6 +48,7 @@ __all__ = [
     "HarnessProvider",
     "Middleware",
     "Next",
+    "current_boundary",
     "install",
     "middleware",
     "resolve_harness",
@@ -56,6 +58,24 @@ __all__ = [
 ]
 
 _ids = itertools.count(1)
+
+# The boundary whose call is running (set for the whole middleware chain).
+# A ContextVar: it follows tasks spawned inside the call and the worker
+# threads of ``asyncio.to_thread``, so nested boundaries find their parent.
+_current: ContextVar[Optional["Boundary"]] = ContextVar("pyreact_boundary", default=None)
+# turn id -> its running "turn" boundary: the parent of boundaries started by
+# that turn's work outside the turn's own context (effects -> spawned tasks).
+_turns: Dict[str, "Boundary"] = {}
+
+
+def current_boundary() -> Optional["Boundary"]:
+    """The boundary being run in this context (``None`` outside any).
+
+    Inside a middleware or the owner's call this is the boundary itself;
+    inside a tool run by an LLM call it is the tool's; in a worker thread
+    started with ``asyncio.to_thread`` from a boundary, that boundary.
+    """
+    return _current.get()
 
 
 class Blocked(Exception):
@@ -94,7 +114,7 @@ class Boundary:
     attrs: Dict[str, Any] = field(default_factory=dict)
     attempt: int = 1
     id: str = field(default_factory=lambda: f"b{next(_ids)}")
-    parent_id: Optional[str] = None
+    parent_id: Optional[str] = None  # enclosing boundary (turn -> llm -> tool)
 
 
 Next = Callable[[Boundary], Awaitable[Any]]
@@ -132,6 +152,18 @@ class Harness:
         return Harness([*self.middleware, *more])
 
     async def run(self, b: Boundary, fn: Next) -> Any:
+        token = _current.set(b)
+        is_turn = b.kind == "turn" and b.turn_id is not None
+        if is_turn:
+            _turns[b.turn_id] = b
+        try:
+            return await self._run(b, fn)
+        finally:
+            if is_turn and _turns.get(b.turn_id) is b:
+                del _turns[b.turn_id]
+            _current.reset(token)
+
+    async def _run(self, b: Boundary, fn: Next) -> Any:
         chain = [mw for mw in self.middleware if _applies(mw, b.kind)]
         if not chain:  # fast path: an empty pipeline is a plain call
             return await fn(b)
@@ -254,6 +286,10 @@ async def through(
     owner of the current task; it scopes provider middleware and fills
     ``component`` / ``session_id`` / ``turn_id``. Pass ``harness`` to use an
     already-resolved one (e.g. captured with :func:`use_harness`).
+
+    ``parent_id`` defaults to the boundary running in this context
+    (:func:`current_boundary`), else the running ``"turn"`` boundary of the
+    call's turn: turn -> llm -> tool nest without any plumbing.
     """
     from . import runtime
 
@@ -261,13 +297,19 @@ async def through(
     if harness is None:
         harness = resolve_harness(_scoped_from(ctx))
     session = (getattr(ctx, "session_services", None) or {}).get("session") if ctx else None
+    turn_id = runtime.current_turn_id(ctx) if ctx is not None else runtime.current_turn_id()
+    if parent_id is None:
+        parent = _current.get()
+        if parent is None and turn_id is not None and kind != "turn":
+            parent = _turns.get(turn_id)
+        parent_id = parent.id if parent is not None else None
     b = Boundary(
         kind=kind,
         name=name,
         inputs=dict(inputs or {}),
         component=getattr(ctx, "path", None) if ctx is not None else None,
         session_id=getattr(session, "id", None),
-        turn_id=runtime.current_turn_id(ctx) if ctx is not None else runtime.current_turn_id(),
+        turn_id=turn_id,
         attrs=dict(attrs),
         parent_id=parent_id,
     )
