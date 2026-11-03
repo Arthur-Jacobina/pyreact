@@ -57,9 +57,16 @@ See [Error recovery](../README.md#error-recovery) in the main README.
 | `learn.05_durable_learning_loop` | The whole loop across restarts: serve → journal → learn with GEPA → serve better |
 | `optimize_router` | The GEPA run behind `artifacts/router_gepa.json`, plus a live hot-swap demo |
 
+## Guards & verification (`examples/harness/`)
+
+| Example | Idea | LLM |
+|---|---|---|
+| `harness.01_guarded_agent` | A tool agent wrapped by guards (PII redaction, tool allowlist, per-turn token budget) and a schema/assert verifier that retries with feedback; prints every decision | yes (≤ 10 calls) |
+
 ## Paths through the examples
 
 - **New to pyreact:** `message` → `qa_guardrail` → `tools` → `main_web --app tools`.
 - **Need memory:** `durable.01_counter` → `durable.02_branches_sqlite` → `durable.04_llm_chat`.
 - **Going to production:** `harness.02_resilient_agent` (recovery), then `durable.04_llm_chat`.
 - **Want better prompts:** `learn.01` → `learn.02` → `learn.03` → `learn.05`.
+- **Need guardrails:** `qa_guardrail` (a guard as a component) → `harness.01_guarded_agent` (guards and verifiers as middleware).
