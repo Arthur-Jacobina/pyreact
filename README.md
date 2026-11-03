@@ -37,6 +37,7 @@ Key pieces:
   - `Context(value=..., children=[...])`: provider component.
   - `get()`/`set(value)`: read/update. `set` notifies subscribed `HookContext`s via `schedule_rerender`.
 - Agents read with `hooks.use_context(Context)`. Subscriptions are tracked so unmount cleans them up.
+- **Services are an escape hatch.** Each session also owns a services dict (`input_bus`, `event_bus`, `nav_service`, `turns`, `session`, `refs`, plus what libraries add) reachable with `hooks.get_service(key, factory)`. That is a low-level service locator for library authors implementing hooks, not part of the app-facing API: components use the hooks that wrap it (`use_input`, `use_on_turn`, `use_event` / `use_emit`, `use_navigate` / `use_location`, context, and a `ref=` prop + `use_imperative_handle`). Examples never call it (enforced by a test).
 - Every component has a stable address, `hooks.path` (e.g. `App/Chat[chat]`: `Name[key]`, or `Name[#index]` when unkeyed), used for durable state and traces. **Providers are transparent**: context providers, `DSPyProvider`, `ToolProvider`, `HarnessProvider`, `Durable` and any `@component(transparent=True)` add no segment to their descendants' paths, so wrapping a tree in another provider never changes the paths below it. `hooks.full_path` keeps every node. `use_path()` (from `pyreact.core`) returns the calling component's path during render or in its effects, so output components (like `Message`) can tag what they publish without touching the render stack.
 
 ### 6) Reconciler/scheduler ↔ Agent commit loop

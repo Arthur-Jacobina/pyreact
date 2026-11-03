@@ -30,6 +30,16 @@ def _resolve_service(services: dict, key, factory):
 class _ServiceAccessor:
     """Descriptor making ``get_service`` scope-aware.
 
+    ``hooks.get_service(key, factory)`` is a **low-level escape hatch** (a
+    service locator), for libraries that implement hooks and for the
+    framework itself. Application components should not need it (ADR 0001):
+    use ``use_input()`` / ``use_on_turn(fn)`` instead of ``"input_bus"``,
+    ``use_event(kinds, fn)`` / ``use_emit()`` instead of ``"event_bus"``,
+    ``use_navigate()`` / ``use_location()`` instead of ``"nav_service"``,
+    context (``create_context``) for shared values, and a ``ref=`` prop +
+    ``use_imperative_handle`` instead of reading ``session.services`` from
+    outside the tree. Examples must not use it (``tests/test_examples_react_style.py``).
+
     - ``ctx.get_service(key, factory)`` (instance call, which is what
       ``hooks.get_service`` resolves to) → services of ``ctx``'s *session
       root* (the top-most ancestor). Each session root owns its own dict, so
