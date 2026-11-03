@@ -1,14 +1,7 @@
 import asyncio
-import time
 from typing import Optional, Callable, Dict
-from pyreact.core.runtime import get_render_idle
+from pyreact.core.turns import TurnManager
 from pyreact.input.bus import InputBus
-
-
-def _emit_text_submit(bus: InputBus, txt: str):
-    now = time.time()
-    bus.emit({"type": "text", "value": txt, "source": "term", "ts": now})
-    bus.emit({"type": "submit", "value": txt, "source": "term", "ts": now})
 
 
 class TerminalInput:
@@ -21,8 +14,10 @@ class TerminalInput:
         bus: InputBus,
         prompt: str = ">> ",
         commands: Optional[Dict[str, Callable[[str], None]]] = None,
+        turns: Optional[TurnManager] = None,
     ):
         self.bus = bus
+        self.turns = turns or TurnManager(input_bus=bus)
         self.prompt = prompt
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
@@ -57,10 +52,9 @@ class TerminalInput:
                     # do not emit to app input bus for command lines
                     await asyncio.sleep(0)  # yield
                     continue
-            _emit_text_submit(self.bus, txt)
-
-            await asyncio.sleep(0.1)
-            await get_render_idle().wait()
+            # Each line is a turn; wait for it to end before prompting again.
+            turn = self.turns.submit(txt, source="term")
+            await self.turns.wait(turn.id)
 
     def start(self):
         if self._task is None:

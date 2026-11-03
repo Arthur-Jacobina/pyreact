@@ -4,7 +4,7 @@ from integrations.dspy_agent import use_dspy_agent
 from integrations.use_dspy import use_dspy_call
 from integrations.dspy_integration import use_dspy_module
 from .message import Message
-from pyreact.components.keystroke import Keystroke
+from pyreact.core import EventBus, runtime, use_turn
 from pyreact.core.core import component, hooks
 from pyreact.tools import ToolProvider, use_tool
 import dspy
@@ -146,6 +146,30 @@ class RouteSpecialistSig(dspy.Signature):
     name: str = dspy.OutputField()
 
 
+def _use_publish(kind: str, payload_fn, deps):
+    """Publish an app event (attributed to the current turn) when deps change."""
+    bus = hooks.get_service("event_bus", EventBus)
+
+    def _pub():
+        payload = payload_fn()
+        if payload is not None:
+            bus.publish(kind, payload, turn_id=runtime.current_turn_id(), source="store")
+
+    hooks.use_effect(_pub, deps)
+
+
+def _use_publish_answer(specialist: str, question: str, result, error):
+    # Fires once per settled call (result carries a version that bumps on settle).
+    def _payload():
+        if result[0] is None and error is None:
+            return None
+        answer = getattr(result[0], "answer", None) if result[0] is not None else None
+        return {"specialist": specialist, "question": question, "answer": answer,
+                "error": str(error) if error else None}
+
+    _use_publish("agent.answer", _payload, [result, error])
+
+
 def _render_result(result, loading, error):
     # Shared loading/error/result rendering for the specialist agents.
     if loading:
@@ -172,6 +196,7 @@ def CatalogAgent(question: str, turn: int = 0):
         model="reasoning",
     )
     hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
+    _use_publish_answer("catalog", question, result, error)
     return _render_result(result, loading, error)
 
 
@@ -188,6 +213,7 @@ def ShippingAgent(question: str, turn: int = 0):
         ShippingSig, tools=["estimate_shipping", free_shipping], model="reasoning"
     )
     hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
+    _use_publish_answer("shipping", question, result, error)
     return _render_result(result, loading, error)
 
 
@@ -197,6 +223,7 @@ def OrderAgent(question: str, turn: int = 0):
         OrderSig, tools=["check_stock", "place_order"], model="reasoning"
     )
     hooks.use_effect(lambda: call(question=question) if question.strip() else None, [question, turn])
+    _use_publish_answer("order", question, result, error)
     return _render_result(result, loading, error)
 
 
@@ -212,6 +239,7 @@ def SupervisorAgent(*, message: str, turn: int, on_route: Callable[[str, str, in
     # Classifier agent (no tools) that picks a specialist, like RouterAgent.
     choose_mod = use_dspy_module(RouteSpecialistSig, dspy.ChainOfThought, name="supervisor")
     call_llm, llm_result, llm_loading, _error = use_dspy_call(choose_mod, model="fast")
+    bus = hooks.get_service("event_bus", EventBus)
 
     def _decide():
         if not message.strip():
@@ -224,6 +252,8 @@ def SupervisorAgent(*, message: str, turn: int, on_route: Callable[[str, str, in
         if llm_result is None or llm_result[0] is None:
             return
         name = getattr(llm_result[0], "name", None)
+        bus.publish("agent.route", {"specialist": name, "message": message},
+                    turn_id=runtime.current_turn_id(), source="store")
         on_route(name, message, llm_result[1])
 
     hooks.use_effect(_emit, [llm_result])
@@ -235,15 +265,14 @@ def SupervisorAgent(*, message: str, turn: int, on_route: Callable[[str, str, in
 
 @component
 def StoreHome():
-    # (turn, text): the turn counter makes a repeated identical message a new
-    # turn instead of a no-op state update.
-    (turn, last_message), set_last_message = hooks.use_state((0, ""))
+    # Each user input is a Turn (id, index, text, ...). A repeated identical
+    # message is a new turn, so it re-triggers the supervisor via turn.index.
+    # Turns are queued by default: a burst of questions is answered in order.
+    turn = use_turn()
+    last_message = turn.text if turn is not None else ""
+    turn_index = turn.index if turn is not None else 0
     active, set_active = hooks.use_state(None)  # (name, question, ver)
     handled_ver, set_handled_ver = hooks.use_state(-1)
-
-    def on_enter(line: str):
-        if line.strip():
-            set_last_message(lambda prev: (prev[0] + 1, line))
 
     def on_route(name: str, message: str, ver: int):
         if ver == handled_ver or name not in SPECIALIST_COMPONENTS:
@@ -258,8 +287,7 @@ def StoreHome():
             sender="assistant",
             message_type="info",
         ),
-        Keystroke(key="store_input", on_submit=on_enter),
-        SupervisorAgent(key="supervisor", message=last_message, turn=turn, on_route=on_route),
+        SupervisorAgent(key="supervisor", message=last_message, turn=turn_index, on_route=on_route),
     ]
 
     if active is not None:

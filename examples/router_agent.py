@@ -3,7 +3,7 @@ import dspy
 
 from .message import Message
 from pyreact.core.core import component, hooks
-from pyreact.router import use_route, use_routes_catalog
+from pyreact.router import use_routes_catalog
 from integrations.use_dspy import use_dspy_call
 from integrations.dspy_integration import use_dspy_module
 

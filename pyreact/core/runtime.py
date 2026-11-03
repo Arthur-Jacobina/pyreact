@@ -1,5 +1,6 @@
 # runtime.py -------------------------------------------------
 import asyncio
+import contextvars
 import sys
 import threading
 import traceback
@@ -22,6 +23,16 @@ _rendering: bool = False
 # Tracked so callers can wait for a whole "turn" to settle.
 _tasks: set = set()
 
+# Turn attribution (see pyreact.core.turns). Every tracked task is tagged with
+# the turn that spawned it so a turn can end when *its* work is done, and be
+# interrupted by cancelling only its tasks.
+_UNSET: Any = object()
+_turn_var: contextvars.ContextVar = contextvars.ContextVar("pyreact_turn", default=None)
+_active_turn: Optional[str] = None  # turn currently being processed (set by TurnManager)
+_task_turn: dict = {}  # task -> turn id (or None)
+_task_owner: dict = {}  # task -> owner (HookContext or None)
+_turn_errors: dict = {}  # turn id -> [(phase, exc)]
+
 ErrorHandler = Callable[[BaseException, Any, str], None]
 _error_handler: Optional[ErrorHandler] = None
 
@@ -41,6 +52,10 @@ def bind_loop(loop: Optional[asyncio.AbstractEventLoop]) -> None:
         _enqueued.clear()
     rerender_queue = asyncio.Queue()
     _tasks.clear()
+    _task_turn.clear()
+    _task_owner.clear()
+    _turn_errors.clear()
+    set_active_turn(None)
 
 
 def _target_loop() -> asyncio.AbstractEventLoop:
@@ -85,7 +100,12 @@ def set_error_handler(handler: Optional[ErrorHandler]) -> None:
     _error_handler = handler
 
 
-def report_error(exc: BaseException, ctx: Any = None, phase: str = "render") -> None:
+def report_error(
+    exc: BaseException, ctx: Any = None, phase: str = "render", *, turn: Any = _UNSET
+) -> None:
+    tid = current_turn_id() if turn is _UNSET else turn
+    if tid is not None:
+        _turn_errors.setdefault(tid, []).append((phase, exc))
     if _error_handler is not None:
         try:
             _error_handler(exc, ctx, phase)
@@ -98,24 +118,89 @@ def report_error(exc: BaseException, ctx: Any = None, phase: str = "render") -> 
 
 
 # ---------------------------------------------------------------------------
+# Turn attribution
+# ---------------------------------------------------------------------------
+def set_active_turn(turn_id: Optional[str]) -> None:
+    """Mark ``turn_id`` as the turn being processed (``None``: no turn)."""
+    global _active_turn
+    _active_turn = turn_id
+
+
+def current_turn_id() -> Optional[str]:
+    """Turn the calling code belongs to.
+
+    Inside a tracked task this is the turn the task was spawned for (inherited
+    through a contextvar, also by tasks it spawns); elsewhere (renders,
+    effects) it is the turn currently being processed, if any.
+    """
+    tid = _turn_var.get()
+    return tid if tid is not None else _active_turn
+
+
+def task_turn(task: asyncio.Task) -> Optional[str]:
+    return _task_turn.get(task)
+
+
+def task_owner(task: asyncio.Task) -> Any:
+    return _task_owner.get(task)
+
+
+def pending_turn_tasks(turn_id: Optional[str]) -> list:
+    return [t for t in pending_tasks() if _task_turn.get(t) == turn_id]
+
+
+def pop_turn_errors(turn_id: Optional[str]) -> list:
+    return _turn_errors.pop(turn_id, [])
+
+
+def renders_pending() -> bool:
+    with _enqueued_lock:
+        queued = bool(_enqueued)
+    return queued or _rendering
+
+
+def is_turn_idle(turn_id: Optional[str]) -> bool:
+    """No queued/running renders and no pending tasks tagged with ``turn_id``."""
+    return not renders_pending() and not pending_turn_tasks(turn_id)
+
+
+# ---------------------------------------------------------------------------
 # Background tasks
 # ---------------------------------------------------------------------------
-def spawn(coro: Coroutine, *, owner: Any = None, name: Optional[str] = None) -> asyncio.Task:
+def spawn(
+    coro: Coroutine,
+    *,
+    owner: Any = None,
+    name: Optional[str] = None,
+    turn: Any = _UNSET,
+) -> asyncio.Task:
     """Run ``coro`` as a tracked task on the render loop.
 
     Exceptions are routed to the error handler instead of being lost, and
     :func:`wait_idle` waits for tracked tasks to finish.
+
+    ``turn`` tags the task with a turn id; by default the current turn
+    (:func:`current_turn_id`). A turn does not end while its tasks are
+    pending, and interrupting a turn cancels them. Pass ``turn=None`` for
+    long-lived background work that must not hold a turn open.
     """
-    task = asyncio.get_running_loop().create_task(coro, name=name)
+    tid = current_turn_id() if turn is _UNSET else turn
+    ctx = contextvars.copy_context()
+    ctx.run(_turn_var.set, tid)
+    task = asyncio.get_running_loop().create_task(coro, name=name, context=ctx)
     _tasks.add(task)
+    _task_turn[task] = tid
+    _task_owner[task] = owner
 
     def _done(t: asyncio.Task) -> None:
         _tasks.discard(t)
+        _task_turn.pop(t, None)
+        _task_owner.pop(t, None)
         if t.cancelled():
             return
         exc = t.exception()
         if exc is not None:
-            report_error(exc, owner, "task")
+            report_error(exc, owner, "task", turn=tid)
 
     task.add_done_callback(_done)
     return task
