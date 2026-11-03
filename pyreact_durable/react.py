@@ -99,6 +99,24 @@ def _open(log: Any, log_factory: Optional[Callable[[str], Any]], session_id: str
     raise TypeError(f"Durable: unsupported log {src!r}")
 
 
+# Session services shared with pyreact_durable.stateful.DurableParticipant.
+LOGS_SERVICE = "pyreact_durable.logs"        # {resolved path: SessionLog} of mounted providers
+RESTORE_SERVICE = "pyreact_durable.restore"  # {resolved path: {"leaf": id}} from a manifest
+
+
+def _log_key(slog: SessionLog) -> str:
+    return str(Path(slog.path).resolve())
+
+
+def _apply_restore(slog: SessionLog, restore: Dict[str, Any]) -> None:
+    """Put the log back at the leaf a manifest recorded (resume): the state
+    the children restore on their first render is the suspended one."""
+    rec = restore.pop(_log_key(slog), None) if restore else None
+    leaf = (rec or {}).get("leaf")
+    if leaf and leaf != slog.leaf and leaf in slog.by_id and not slog.readonly:
+        slog.checkout(leaf)
+
+
 def _jsonable(obj: Any) -> Any:
     try:
         json.dumps(obj, allow_nan=False)
@@ -193,9 +211,15 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
     # Keyed on the log identity / path and the session, not on the factory's
     # identity (an inline lambda is a new object every render).
     log_src = log if isinstance(log, SessionLog) else (str(log) if log is not None else None)
-    opened = hooks.use_memo(
-        lambda: _open(log, log_factory, sid), [log_src, log_factory is None, sid]
-    )
+    restore = hooks.get_service(RESTORE_SERVICE, dict)
+    registry = hooks.get_service(LOGS_SERVICE, dict)
+
+    def _open_and_restore():
+        slog, owned = _open(log, log_factory, sid)
+        _apply_restore(slog, restore)
+        return slog, owned
+
+    opened = hooks.use_memo(_open_and_restore, [log_src, log_factory is None, sid])
     slog, owned = opened
 
     gen, set_gen = hooks.use_state(0)
@@ -215,6 +239,13 @@ def Durable(log=None, log_factory=None, journal=DEFAULT_JOURNAL, on_close="keep"
         return _close
 
     hooks.use_effect(_own, [slog])
+
+    def _register():  # so a DurableParticipant can checkpoint this log
+        key = _log_key(slog)
+        registry[key] = slog
+        return lambda: registry.get(key) is slog and registry.pop(key, None)
+
+    hooks.use_effect(_register, [slog])
 
     def _watch():
         return slog.subscribe(lambda _entry, moved: moved and set_gen(lambda g: g + 1))

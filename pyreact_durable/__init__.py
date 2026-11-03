@@ -4,6 +4,8 @@
 - :mod:`pyreact_durable.react` ``Durable`` provider + persistent hooks
 - :mod:`pyreact_durable.lm`    ``durable_lm`` record/replay at the LM boundary
 - :mod:`pyreact_durable.turns` ``DurableTurnStore``: resume turns cut short by a crash
+- :mod:`pyreact_durable.stateful` ``DurableParticipant``: the logs in a session's
+  suspend manifest (``Session.suspend`` / ``AppRunner.resume``)
 
 ``render_tree(log)`` / ``log.render()`` draw the entry tree as text. Only the
 storage layer (and its text rendering) is imported eagerly, so ``from pyreact_durable import
@@ -22,6 +24,7 @@ from .log import (
     safe_session_id,
 )
 from .render import render_tree
+from .stateful import DurableParticipant
 
 _REACT = {
     "DEFAULT_JOURNAL", "Durable", "DurableHandle", "DurableStateError", "Conversation",
@@ -33,7 +36,7 @@ _LM = {"durable_lm", "ReplayMissError", "DurableLM", "llm_entries"}
 __all__ = [
     "FORMAT_VERSION", "SessionLocked", "SessionLog", "SessionLogError",
     "register_migration", "render_tree", "safe_session_id", "log_files",
-    "archive_log", "delete_log", "DurableTurnStore", *sorted(_REACT), *sorted(_LM),
+    "archive_log", "delete_log", "DurableTurnStore", "DurableParticipant", *sorted(_REACT), *sorted(_LM),
 ]
 
 
