@@ -47,3 +47,12 @@ def test_router_query_and_params_do_not_tear():
     asyncio.run(main())
     assert renders[-1] == ("2", "2")
     assert all(pid == q for pid, q in renders), renders
+
+
+def test_build_url_keeps_query_and_fragment_written_in_the_path():
+    from pyreact.router import build_url
+
+    assert build_url("/p/:id?tab=specs#top", {"id": 7}) == "/p/7?tab=specs#top"
+    assert build_url("/p?tab=a&x=1", query={"tab": "b"}) == "/p?tab=b&x=1"
+    assert build_url("/p#a", fragment="b") == "/p#b"
+    assert build_url("/p", query={"q": None}) == "/p"
