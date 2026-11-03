@@ -12,7 +12,12 @@ of the shared :class:`~pyreact.boot.app_runner.AppRunner`:
 - Inputs (``submit``/``nav``/``debug``) go to that session only.
 - Outputs are forwarded only to the sockets attached to the session:
     * session EventBus events of kinds :data:`FORWARDED_EVENT_KINDS` as
-      ``{"channel": "events", "event": ev.to_dict()}``;
+      ``{"channel": "events", "event": ev.to_dict()}``. A newly attached
+      socket first gets the session's recent events (its ``EventLog``), so
+      messages published while the app mounted (welcome messages, a restored
+      transcript) reach the page. ``hello`` may carry ``"last_event": <id>``
+      (the last event id the page already has, e.g. on a reconnect): only
+      newer events are replayed, so nothing is shown twice;
     * legacy channels: ``ui/nav``, ``chat/message`` (``__MESSAGE__:`` lines)
       and ``logs/stdout``. Stdout is attributed to a session when written
       from its render/effects/tasks; unattributable output (server logs) goes
@@ -25,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import time
 from typing import Callable, Dict, Optional, Set
 from urllib.parse import parse_qs
@@ -52,6 +58,7 @@ class Connection:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
         self.session: Optional[Session] = None
         self.dropped = 0
+        self.unsubscribe: Optional[Callable[[], None]] = None
 
     def put(self, msg: dict) -> None:
         try:
@@ -93,7 +100,6 @@ class SessionHub:
         self.event_kinds = tuple(event_kinds)
         self._conns: Dict[str, Set[Connection]] = {}
         self._all: Set[Connection] = set()
-        self._unsubs: Dict[str, Callable[[], None]] = {}
 
     # ------------------------------------------------------------ routing
     def publish(self, session_id: Optional[str], msg: dict) -> None:
@@ -131,14 +137,30 @@ class SessionHub:
             msg = {"channel": "logs", "type": "stdout", "data": ansi_to_html(text)}
         self.publish_threadsafe(sid, msg)
 
-    def _forward_event(self, session_id: str, ev: Event) -> None:
-        # Runs on whichever thread published the event.
-        self.publish_threadsafe(session_id, {"channel": "events", "event": ev.to_dict()})
-        if ev.kind == "nav":
-            path = (ev.payload or {}).get("path", "/")
-            self.publish_threadsafe(
-                session_id, {"channel": "ui", "type": "nav", "data": path}
-            )
+    def _put_threadsafe(self, conn: Connection, msg: dict) -> None:
+        try:
+            self.loop.call_soon_threadsafe(conn.put, msg)
+        except RuntimeError:
+            pass  # server loop closed
+
+    def _subscribe_events(self, conn: Connection, session: Session, since: int) -> None:
+        """Forward ``session``'s events to ``conn``: first those recorded in
+        its EventLog with ``id > since`` (replay), then live ones -- the log
+        makes the switch atomic (no gap, no duplicates)."""
+        replaying = threading.get_ident()  # replay runs synchronously, here
+
+        def forward(ev: Event) -> None:
+            # Runs on whichever thread published the event (or here, for replay).
+            replay = replaying is not None and threading.get_ident() == replaying
+            if replay and ev.id <= since:
+                return
+            self._put_threadsafe(conn, {"channel": "events", "event": ev.to_dict()})
+            if ev.kind == "nav" and not replay:  # don't re-navigate on replay
+                path = (ev.payload or {}).get("path", "/")
+                self._put_threadsafe(conn, {"channel": "ui", "type": "nav", "data": path})
+
+        conn.unsubscribe = session.events.subscribe(forward, self.event_kinds, replay=True)
+        replaying = None
 
     # -------------------------------------------------------- attach/detach
     def _normalize_id(self, requested) -> Optional[str]:
@@ -150,7 +172,9 @@ class SessionHub:
             return requested
         return None
 
-    async def attach(self, conn: Connection, requested_id=None) -> Session:
+    async def attach(self, conn: Connection, requested_id=None, last_event=None) -> Session:
+        """Attach ``conn`` to a (new or resumed) session; ``last_event``: id of
+        the newest event the client already shows (replay only newer ones)."""
         sid = self._normalize_id(requested_id)
         existing = self.runner.get_session(sid) if sid else None
         resumed = existing is not None and not existing.closed
@@ -158,11 +182,6 @@ class SessionHub:
         conn.session = session
         self._conns.setdefault(session.id, set()).add(conn)
         self._all.add(conn)
-        if session.id not in self._unsubs:
-            sid_ = session.id
-            self._unsubs[sid_] = session.event_bus.subscribe(
-                lambda ev: self._forward_event(sid_, ev), self.event_kinds
-            )
         conn.put(
             {
                 "channel": "session",
@@ -170,10 +189,15 @@ class SessionHub:
                 "data": {"id": session.id, "resumed": resumed},
             }
         )
+        since = last_event if isinstance(last_event, int) and resumed else 0
+        self._subscribe_events(conn, session, since)
         return session
 
     def detach(self, conn: Connection) -> None:
         self._all.discard(conn)
+        if conn.unsubscribe is not None:
+            conn.unsubscribe()
+            conn.unsubscribe = None
         sess = conn.session
         if sess is None:
             return
@@ -185,9 +209,10 @@ class SessionHub:
         sess.touch()  # TTL counts from the last disconnect
 
     def _forget(self, session_id: str) -> None:
-        unsub = self._unsubs.pop(session_id, None)
-        if unsub is not None:
-            unsub()
+        for conn in list(self._conns.get(session_id, ())):
+            if conn.unsubscribe is not None:
+                conn.unsubscribe()
+                conn.unsubscribe = None
 
     async def reap_once(self) -> list:
         """Close sessions idle > ttl with no socket attached."""
@@ -199,7 +224,7 @@ class SessionHub:
         for sid in closed:
             self._forget(sid)
         # Also drop forwarders of sessions closed by other means.
-        for sid in list(self._unsubs):
+        for sid in list(self._conns):
             sess = self.runner.get_session(sid)
             if sess is None or sess.closed:
                 self._forget(sid)
@@ -214,7 +239,7 @@ class SessionHub:
                 pass
 
     def close(self) -> None:
-        for sid in list(self._unsubs):
+        for sid in list(self._conns):
             self._forget(sid)
 
     # ---------------------------------------------------------- inputs

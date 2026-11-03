@@ -17,6 +17,11 @@
   function loadSessionId() { try { return sessionStorage.getItem(SESSION_KEY); } catch { return null; } }
   function saveSessionId(id) { try { sessionStorage.setItem(SESSION_KEY, id); } catch {} }
 
+  // Newest event id this page has shown. Sent in `hello` so a reconnect only
+  // replays what we missed; a reload starts from null (full replay of the
+  // session's recent events, the page is empty again).
+  let lastEventId = null;
+
   // The same chat message may arrive both as a legacy `chat` message and as
   // an EventBus `message` event; render it once (only cross-channel copies
   // within 2s are treated as duplicates).
@@ -92,6 +97,7 @@
           JSON.stringify({
             t: 'hello',
             session: loadSessionId(),
+            last_event: lastEventId,
             path: location.pathname,
             query: location.search || '',
             fragment: location.hash || ''
@@ -113,6 +119,7 @@
         }
         if (msg.channel === 'events' && msg.event) {
           const e = msg.event;
+          if (typeof e.id === 'number' && (lastEventId === null || e.id > lastEventId)) lastEventId = e.id;
           if (e.kind === 'message') appendChatMessage(e.payload || {}, 'events');
           return;
         }
