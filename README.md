@@ -542,6 +542,29 @@ value = use_dehydrate(key, *, dehydrate, hydrate=None, initial=None)
   build a snapshot from any mounted tree; a non-JSON value or a failing
   `dehydrate` raises `SnapshotError` naming the path and key.
 
+- Libraries mismatch-report what they find later (a sandbox snapshot
+  gone when the sandbox boots) with `report_hydration_mismatch(key, message,
+  ctx=...)` — it lands in `root.mismatches` too.
+
+### The libraries' slices: the whole agent, no participants
+
+Every library state is dehydrated by the hook / provider that owns it, so
+`root.suspend()` carries the whole agent with no runner configuration:
+
+| owner | slice (`path` → `key`) | value | on hydrate |
+|---|---|---|---|
+| `Durable(log=...)` | `…/Durable[k]` → `"log"` | `{path, log_id, leaf, entries, version, pending_turns}` | log reopened at the leaf before the children render (`durable_lm` replays a re-run turn) |
+| `SandboxProvider` | `…/SandboxProvider[k]` → `"sandboxes"` | `{key: {driver, spec, sandbox_id, snapshot}}` | restore from the snapshot / reattach; else fresh + mismatch |
+| `use_sandbox(scope="component")` / provider-less | `…/Comp[k]` → `"sandbox"` | one record | same |
+| `LearnedProgram` / `LearnedPrograms` | `…/LearnedProgram[name]` → `"programs"` | `{name: path \| {"state": ...} \| None}` (the last swap) | the program is applied on the first render |
+| `DSPyProvider` | `…/DSPyProvider[k]` → `"compiled"` | `[{key, key_str, arch, path \| state}]` (`env.compiled`) | applied when `use_module` / `use_agent` build the module |
+| the turn manager | `snapshot["turns"]` | `{next_index, policy, carry}` | numbering continues; carried turns re-run once hydration completed |
+
+On suspend, effect cleanups see `use_cleanup_reason() == "suspend"`:
+`Durable` records its leaf before closing the log, sandboxes snapshot or
+pause per `on_close` (`resolve_policy(on_close, "suspend")` never destroys
+implicitly). A hidden `Activity` keeps logs open and sandboxes running.
+
 ### `Activity` and cleanup reasons
 
 `Activity(mode="visible"|"hidden", children=[...])` keeps a subtree mounted
@@ -596,26 +619,27 @@ turn_seq, carried_turns}`, `session.suspend.failed {error}`,
 `session.resumed {turns, mismatches}`, `hydration.mismatch`,
 `session.closed {reason}`.
 
-### Low level: participants (deprecated soon)
+### Deprecated: participants, `session.suspend()`, `app.resume()`
 
 Before roots, libraries plugged state into `Session.suspend()` /
 `AppRunner.resume()` as *participants* writing a `pyreact.manifest/1`:
 
 ```python
-app = AppRunner(App, participants=[DurableParticipant, SandboxParticipant],
-                manifest_store=DirectoryManifestStore("runs/manifests"),
-                idle_policy="suspend")             # idle reaping suspends; open_session auto-resumes
-manifest = app.open_session("agent-1").suspend()  # participants' fragments -> manifest
-s = app.resume("agent-1")                         # fragments handed back before the first render
+app = AppRunner(App, participants=[DurableParticipant, SandboxParticipant],   # DeprecationWarning
+                manifest_store=DirectoryManifestStore("runs/manifests"))
+manifest = app.open_session("agent-1").suspend()  # DeprecationWarning -> root.suspend()
+s = app.resume("agent-1")                         # DeprecationWarning -> hydrate_root(...)
 ```
 
-It still works while `pyreact_durable`, `pyreact_sandbox` and `integrations`
-move to `use_dehydrate` (`DurableParticipant`, `SandboxParticipant`,
-`CompiledModulesParticipant`); new code should use roots. The manifest also
-carries the tree's `use_dehydrate` slices (`manifest["slices"]`), hydrated on
-`resume`, so components can migrate first. Example (two processes, real LLM
-+ Docker, or offline with `--driver local`):
-[`examples/stateful/01_suspend_resume.py`](examples/stateful/01_suspend_resume.py).
+They are kept for one release as thin wrappers over the root machinery
+(same events; the manifest carries the tree's slices in
+`manifest["slices"]` and the turns in `participants.turns`), and
+`participants=` / `add_participant` / `session.suspend` / `app.resume` warn
+(`DeprecationWarning`, pointing to ADR 0001). `DurableParticipant` and
+`CompiledModulesParticipant` have nothing left to do (empty fragments; they
+still read older manifests); `SandboxParticipant(mode=...)` still overrides
+the suspend policy. `idle_policy="suspend"` / `auto_resume` keep working
+without warnings. Use roots in new code.
 
 ## Running the examples
 

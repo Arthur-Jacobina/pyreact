@@ -1,4 +1,10 @@
-"""Session.suspend() / AppRunner.resume(): manifests, participants, turns, policies."""
+"""Session.suspend() / AppRunner.resume(): manifests, participants, turns, policies.
+
+Deprecated wrappers (ADR 0001) over the root machinery
+(``pyreact.boot.root.suspend_session`` / ``_hydrate_on_loop``), kept for one
+release: their DeprecationWarnings are silenced here, except in the test
+that checks them.
+"""
 
 import asyncio
 import json
@@ -14,6 +20,8 @@ from pyreact.boot import (
     SuspendError,
 )
 from pyreact.core import component, hooks, use_turn
+
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 DELAYS = {"slow": 0.4, "long": 30.0}
 
@@ -210,15 +218,15 @@ def test_failed_suspend_leaves_the_session_running(runner):
     events = _kinds(s, [])
     s.invoke("long")
     time.sleep(0.1)
-    with pytest.raises(SuspendError, match="disk full"):
-        s.suspend(on_active="interrupt")
-    assert not s.closed and not s.suspending
-    assert "suspending" in s.participants.get("broken").refused
-    assert [k for k, _ in events][-1] == "session.suspend.failed"
-    assert app.manifest_store.load("f") is None
-    # the cut turn is re-queued; new input works
-    DELAYS["long"] = 0.01
+    DELAYS["long"] = 0.01  # the running one keeps sleeping; its re-run will be quick
     try:
+        with pytest.raises(SuspendError, match="disk full"):
+            s.suspend(on_active="interrupt")
+        assert not s.closed and not s.suspending
+        assert "suspending" in s.participants.get("broken").refused
+        assert [k for k, _ in events][-1] == "session.suspend.failed"
+        assert app.manifest_store.load("f") is None
+        # the cut turn is re-queued; new input works
         s.wait_turn("f/t1", timeout=5)
         tid = s.invoke("after", wait=True, timeout=5)
     finally:
@@ -330,3 +338,30 @@ def test_legacy_suspend_and_resume_carry_use_dehydrate_slices(runner):
     seen.clear()
     app.resume("legacy", m)
     assert seen[0] == 2
+
+
+@pytest.mark.filterwarnings("default::DeprecationWarning")
+def test_legacy_api_warns_and_runs_on_the_root_machinery(runner):
+    from pyreact.core import use_dehydrate
+
+    @component
+    def Box():
+        use_dehydrate("v", dehydrate=lambda: 7)
+        return []
+
+    with pytest.warns(DeprecationWarning, match="0001-look-like-react") as w:
+        app = runner(Box, participants=[Notes])
+    assert "participants=" in str(w[0].message)
+    s = app.open_session("dep")
+    events = _kinds(s, [])
+    with pytest.warns(DeprecationWarning, match=r"Session.suspend\(\) is deprecated"):
+        m = s.suspend()
+    assert m["slices"] == {"Box": {"v": 7}}
+    suspended = [p for k, p in events if k == "session.suspended"][0]
+    # the root's payload plus the legacy participant list
+    assert suspended["slices"] == 1 and suspended["participants"] == ["turns", "notes"]
+    with pytest.warns(DeprecationWarning, match=r"AppRunner.resume\(\) is deprecated"):
+        r = app.resume("dep", m)
+    assert r.root.children == [] and r.resumed_from is m
+    with pytest.warns(DeprecationWarning, match="add_participant"):
+        app.add_participant(Notes)

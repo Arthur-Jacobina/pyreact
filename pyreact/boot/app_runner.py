@@ -6,7 +6,6 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from pyreact.core.dehydrate import finish_hydration, hydration_of
 from pyreact.core.hook import HookContext
 from pyreact.core import runtime
 from pyreact.core.events import EventBus
@@ -14,7 +13,7 @@ from pyreact.core.runtime import run_renders
 from pyreact.core.turns import POLICIES, TurnManager
 from pyreact.web.console import MessageBuffer
 from pyreact.observability import install_session_error_events
-from .session import DEFAULT_SESSION_ID, Session
+from .session import DEFAULT_SESSION_ID, Session, _deprecated
 from .stateful import (
     ManifestError,
     ManifestStore,
@@ -112,8 +111,12 @@ class AppRunner:
         self._default: Optional[Session] = None
         self._session_hooks: List[Dict[str, Optional[Callable[[Session], Any]]]] = []
         self._hooks_lock = threading.Lock()
+        participants = list(participants)
+        if participants:
+            _deprecated("AppRunner(participants=...)",
+                        "create_root / hydrate_root (libraries dehydrate their own state)")
         for factory in participants:
-            self.add_participant(factory)
+            self._add_participant(factory)
 
         self._fps: int = max(1, int(fps))
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -245,9 +248,17 @@ class AppRunner:
         return _remove
 
     def add_participant(self, factory: Callable[..., Any]) -> Callable[[], None]:
-        """Add a checkpoint participant to every session that opens from now
+        """Deprecated: libraries dehydrate their own state (``use_dehydrate``);
+        suspend with ``root.suspend()``.
+
+        Add a checkpoint participant to every session that opens from now
         on. ``factory(session)`` (or ``factory()``) returns the participant
         (a class works). Returns a function that stops adding it."""
+        _deprecated("AppRunner.add_participant()",
+                    "create_root / hydrate_root (libraries dehydrate their own state)")
+        return self._add_participant(factory)
+
+    def _add_participant(self, factory: Callable[..., Any]) -> Callable[[], None]:
         wants_session = _accepts_arg(factory)
 
         def _add(sess: Session) -> None:
@@ -408,7 +419,7 @@ class AppRunner:
                 sess = self.get_session(sid)
                 try:
                     if sess is not None and not sess.closed:
-                        sess.suspend(reason="idle")
+                        self._submit(sess._suspend_on_loop("wait", None, None, "idle")).result()
                         closed.append(sid)
                 except (SuspendError, RuntimeError) as exc:
                     runtime.report_error(exc, None, "idle-suspend")
@@ -426,7 +437,8 @@ class AppRunner:
                 sess = self.get_session(sid)
                 try:
                     if sess is not None and not sess.closed:
-                        await sess.asuspend(reason="idle")
+                        await asyncio.wrap_future(self._submit(
+                            sess._suspend_on_loop("wait", None, None, "idle")))
                         closed.append(sid)
                 except (SuspendError, RuntimeError) as exc:
                     runtime.report_error(exc, None, "idle-suspend")
@@ -467,78 +479,74 @@ class AppRunner:
                                turn_policy, *, resume_turns: bool, wait: bool,
                                consume: bool, store: Optional[ManifestStore] = None
                                ) -> Session:
-        t0 = time.time()
+        """The legacy manifest resume, on the root machinery
+        (``pyreact.boot.root._hydrate_on_loop``): the manifest's slices and
+        turns hydrate the tree; participants get their fragments before the
+        first render and ``resumed()`` once hydration completed."""
+        from pyreact.core.dehydrate import SNAPSHOT_FORMAT
+
+        from .root import _hydrate_on_loop
+
         if manifest.get("session_id") != session_id:
             raise ManifestError(f"manifest is for session {manifest.get('session_id')!r}, "
                                 f"not {session_id!r}")
-        with self._sessions_lock:
-            cur = self._sessions.get(session_id)
-            if cur is not None and not cur.closed:
-                raise RuntimeError(f"session {session_id!r} is already open")
-            policy = turn_policy or manifest.get("turn_policy") or self._turn_policy
-            if policy not in POLICIES:
-                policy = self._turn_policy
-            sess = self._new_session(session_id, app, policy)
-        sess.resumed_from = manifest
-        sess._resume_turns = bool(resume_turns)
-        if session_id == self._default_id and self._default is None:
-            self._default = sess
-        self._opened(sess, resumed=True)
         fragments = manifest.get("participants") or {}
-        for name in fragments:
-            if name not in sess.participants:
-                sess.degrade(name, "no participant registered for this fragment")
-        restored = []
-        for p in sess.participants:
-            if p.name not in fragments:
-                continue
-            try:
-                await p.resume(sess, fragments[p.name])
-                restored.append(p)
-            except Exception as exc:
-                sess.degrade(p.name, "resume failed", error=f"{type(exc).__name__}: {exc}")
+        turns = dict(fragments.get("turns") or {})
+        turns.setdefault("policy", manifest.get("turn_policy"))
         slices = manifest.get("slices")
-        sess._mount(slices=slices if isinstance(slices, dict) else None)
-        await sess._drain()
-        if isinstance(slices, dict):  # use_dehydrate hooks (see pyreact.boot.root)
-            state = hydration_of(sess.root)
-            while state is not None:
-                pending = [t for t in state.pending if not t.done()]
-                if not pending:
-                    break
-                await asyncio.wait(pending)
-                await sess._drain()
-            finish_hydration(sess.root)
-        for p in restored:
-            fn = getattr(p, "resumed", None)
-            if callable(fn):
-                try:
-                    await fn(sess)
-                except Exception as exc:
-                    sess.degrade(p.name, "resumed() failed", error=f"{type(exc).__name__}: {exc}")
-        if resume_turns:
-            for t in sess.turns.pending_turns():  # a crash before the suspend
-                try:
-                    sess.turns.resume(t.id)
-                    sess._resumed_turns.append(t.id)
-                except Exception as exc:
-                    runtime.report_error(exc, sess.root, "resume")
-        if consume and store is not None:
-            try:
-                store.delete(session_id)
-            except Exception as exc:
-                runtime.report_error(exc, sess.root, "resume")
-        ok = [p.name for p in restored
-              if p.name not in {d["participant"] for d in sess.degraded}]
-        sess.event_bus.publish("session.resumed", {
-            "session_id": session_id, "turn_seq": manifest.get("turn_seq"),
-            "suspended_at": manifest.get("suspended_at"), "participants": ok,
-            "degraded": [d["participant"] for d in sess.degraded],
-            "turns": list(sess._resumed_turns), "duration": round(time.time() - t0, 4)})
-        if wait:
-            for tid in list(sess._resumed_turns):
-                await sess.turns.wait(tid)
-        return sess
+        snapshot = {"format": SNAPSHOT_FORMAT, "session_id": session_id,
+                    "created_at": manifest.get("created_at"),
+                    "slices": slices if isinstance(slices, dict) else None,
+                    "turns": turns, "versions": manifest.get("versions") or {}}
+        runner = self
+
+        class _Legacy:
+            restored: List[Any] = []
+
+            async def before_mount(self, sess: Session) -> None:
+                sess.resumed_from = manifest
+                if session_id == runner._default_id and runner._default is None:
+                    runner._default = sess
+                for name in fragments:
+                    if name not in sess.participants:
+                        sess.degrade(name, "no participant registered for this fragment")
+                for p in sess.participants:
+                    if p.name == "turns":  # the snapshot's turns (TurnManager.hydrate)
+                        self.restored.append(p)
+                        continue
+                    if p.name not in fragments:
+                        continue
+                    try:
+                        await p.resume(sess, fragments[p.name])
+                        self.restored.append(p)
+                    except Exception as exc:
+                        sess.degrade(p.name, "resume failed",
+                                     error=f"{type(exc).__name__}: {exc}")
+
+            async def after_hydrate(self, sess: Session) -> None:
+                for p in self.restored:
+                    fn = getattr(p, "resumed", None)
+                    if p.name == "turns" or not callable(fn):
+                        continue
+                    try:
+                        await fn(sess)
+                    except Exception as exc:
+                        sess.degrade(p.name, "resumed() failed",
+                                     error=f"{type(exc).__name__}: {exc}")
+
+            def payload(self, sess: Session) -> Dict[str, Any]:
+                bad = {d["participant"] for d in sess.degraded}
+                return {"turn_seq": manifest.get("turn_seq"),
+                        "suspended_at": manifest.get("suspended_at"),
+                        "participants": [p.name for p in self.restored if p.name not in bad],
+                        "degraded": [d["participant"] for d in sess.degraded]}
+
+        legacy = _Legacy()
+        legacy.restored = []
+        return await _hydrate_on_loop(
+            self, session_id, app, snapshot, turn_policy=turn_policy,
+            resume_turns=resume_turns, consume_from=store if consume else None,
+            wait=wait, legacy=legacy)
 
     def resume(
         self,
@@ -553,7 +561,12 @@ class AppRunner:
         wait: bool = False,
         timeout: Optional[float] = None,
     ) -> Session:
-        """Re-open a suspended session (same id) from its manifest.
+        """Deprecated (``DeprecationWarning``): use :func:`~pyreact.boot.root.hydrate_root`,
+        which needs no participants. A wrapper over the same machinery
+        (``pyreact.boot.root._hydrate_on_loop``), kept for one release; the
+        manifest's ``slices`` hydrate the tree's ``use_dehydrate`` hooks.
+
+        Re-open a suspended session (same id) from its manifest.
 
         ``manifest``: a manifest dict, a path to one, or ``None`` to load it
         from ``store`` (default: ``manifest_store``). Steps: the session is
@@ -573,6 +586,7 @@ class AppRunner:
         loaded from once resumed (an old manifest must not be resumed twice).
         ``wait=True`` blocks until the re-run turns end.
         """
+        _deprecated("AppRunner.resume()", "hydrate_root(App, session_id=..., store=...)")
         m, src = self._manifest_for(session_id, manifest, store)
         if self._on_loop_thread():
             raise RuntimeError("AppRunner.resume() blocks; use 'await app.aresume(...)' on the loop")
@@ -588,7 +602,8 @@ class AppRunner:
                       store: Optional[ManifestStore] = None, app: Optional[Callable] = None,
                       turn_policy: Optional[str] = None, resume_turns: bool = True,
                       consume: bool = True, wait: bool = False) -> Session:
-        """Async :meth:`resume`."""
+        """Async :meth:`resume` (deprecated: ``ahydrate_root``)."""
+        _deprecated("AppRunner.aresume()", "await ahydrate_root(App, session_id=..., store=...)")
         m, src = self._manifest_for(session_id, manifest, store)
         return await asyncio.wrap_future(self._submit(self._aresume_on_loop(
             session_id, m, app, turn_policy, resume_turns=resume_turns, wait=wait,
