@@ -12,6 +12,7 @@ from pyreact.core.turns import TurnManager
 from pyreact.input.bus import InputBus
 from pyreact.router.nav_service import NavService
 from pyreact.web.console import MessageBuffer
+from pyreact.observability import Observer, install_error_events
 
 
 class AppRunner:
@@ -41,6 +42,10 @@ class AppRunner:
         self._bus = None
 
         self._root_ctx: Optional[HookContext] = None
+        # Set in the loop thread before ready (see _loop_main)
+        self._event_bus: Optional[EventBus] = None
+        self.observer: Optional[Observer] = None
+        self._uninstall_error_events: Optional[Callable[[], None]] = None
 
         # Web bridge callbacks (set by server): executed from runner thread
         self._on_nav: Optional[Callable[[str], None]] = None
@@ -53,6 +58,23 @@ class AppRunner:
         self._ready.wait()
         if self._startup_error is not None:
             raise RuntimeError("AppRunner failed to start") from self._startup_error
+
+    # Observability accessors (EventLog / UsageAggregator / TurnTimeline)
+    @property
+    def event_bus(self) -> Optional[EventBus]:
+        return self._event_bus
+
+    @property
+    def events(self):
+        return self.observer.log if self.observer else None
+
+    @property
+    def usage(self):
+        return self.observer.usage if self.observer else None
+
+    @property
+    def timeline(self):
+        return self.observer.timeline if self.observer else None
 
     @property
     def is_running(self) -> bool:
@@ -326,6 +348,11 @@ class AppRunner:
         self._root_ctx = HookContext(
             self._app_component_fn.__name__, self._app_component_fn
         )
+        # Observability: record events from the very first render and turn
+        # component errors into "error" events (still printed to stderr).
+        self._event_bus = self._root_ctx.get_service("event_bus", EventBus)
+        self.observer = Observer().attach(self._event_bus)
+        self._uninstall_error_events = install_error_events(self._event_bus)
         schedule_rerender(self._root_ctx, reason="app startup")
         self._bus = self._root_ctx.get_service("input_bus", InputBus)
         self._turns = self._root_ctx.get_service("turns", TurnManager).configure(
@@ -412,3 +439,5 @@ class AppRunner:
             for t in runtime.pending_tasks():
                 t.cancel()
             runtime.bind_loop(None)
+            if self._uninstall_error_events is not None:
+                self._uninstall_error_events()

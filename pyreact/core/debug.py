@@ -102,7 +102,11 @@ _TRACE_CTX: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
     "_TRACE_CTX", default=None
 )
 _TRACE_DEPTH: ContextVar[int] = ContextVar("_TRACE_DEPTH", default=0)
+_TRACE_ROOT: ContextVar[Any] = ContextVar("_TRACE_ROOT", default=None)
 _TRACE_ENABLED: bool = False
+# When true (and tracing is enabled), each finished render trace is also
+# published as a ``trace.render`` event on the root's ``event_bus`` service.
+_TRACE_EVENTS: bool = False
 
 # Keep a log of recent traces (each trace is a dict with events)
 _TRACE_LOG: List[Dict[str, Any]] = []
@@ -140,12 +144,52 @@ def start_trace(root_ctx: Any, reasons: Optional[List[str]] = None) -> None:
     if len(_TRACE_LOG) > _TRACE_LOG_LIMIT:
         del _TRACE_LOG[:-_TRACE_LOG_LIMIT]
     _TRACE_CTX.set(trace)
+    _TRACE_ROOT.set(root_ctx)
     _TRACE_DEPTH.set(0)
 
 
 def end_trace() -> None:
+    trace = _TRACE_CTX.get()
+    root = _TRACE_ROOT.get()
     _TRACE_CTX.set(None)
+    _TRACE_ROOT.set(None)
     _TRACE_DEPTH.set(0)
+    if trace is not None:
+        trace["duration"] = time.time() - trace["ts"]
+        if _TRACE_EVENTS:
+            _publish_trace(root, trace)
+
+
+def trace_payload(trace: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-friendly view of a render trace (payload of ``trace.render``)."""
+    return {
+        "trace_id": trace["id"],
+        "root": trace["root_name"],
+        "reasons": [str(r) for r in trace["reasons"]],
+        "duration": trace.get("duration"),
+        "rendered": [
+            {
+                "name": e.get("name"),
+                "key": e.get("key"),
+                "depth": e.get("depth"),
+                "kind": e.get("kind"),
+            }
+            for e in trace["events"]
+        ],
+    }
+
+
+def _publish_trace(root: Any, trace: Dict[str, Any]) -> None:
+    get_service = getattr(root, "get_service", None)
+    if get_service is None:
+        return
+    try:
+        from .events import EventBus
+
+        bus = get_service("event_bus", EventBus)
+        bus.publish("trace.render", trace_payload(trace), source="debug")
+    except Exception:
+        pass
 
 
 def enter_render(ctx: Any) -> Any:
@@ -208,9 +252,22 @@ def print_last_trace() -> None:
     print(f"{BOLD}{CYAN}===================={RESET}\n")
 
 
-def enable_tracing() -> None:
-    global _TRACE_ENABLED
+def enable_tracing(events: Optional[bool] = None) -> None:
+    """Enable render tracing; ``events=True`` also publishes ``trace.render``."""
+    global _TRACE_ENABLED, _TRACE_EVENTS
     _TRACE_ENABLED = True
+    if events is not None:
+        _TRACE_EVENTS = bool(events)
+
+
+def set_trace_events(enabled: bool) -> None:
+    """Toggle publishing of ``trace.render`` events (needs tracing enabled)."""
+    global _TRACE_EVENTS
+    _TRACE_EVENTS = bool(enabled)
+
+
+def trace_events_enabled() -> bool:
+    return _TRACE_EVENTS
 
 
 def disable_tracing() -> None:
