@@ -12,8 +12,8 @@ is resolved lazily on first access):
   :class:`DockerDriver`, snapshot stores.
 - React border (``pyreact_sandbox.react``): ``SandboxProvider``,
   ``use_sandbox``, :class:`SandboxHandle`.
-- stateful sessions: ``SandboxParticipant`` (sandboxes in a session's
-  suspend manifest; ``pyreact_sandbox.stateful``).
+- roots: ``root.suspend()`` / ``hydrate_root`` carry sandboxes (the provider
+  dehydrates their snapshot refs); ``SandboxParticipant`` is deprecated.
 - integrations: ``SandboxInterpreter`` (dspy ``CodeInterpreter`` for RLM),
   ``sandbox_tools(handle)`` (tools for ``use_agent`` / ``ToolProvider``).
 """

@@ -1,44 +1,29 @@
-"""Checkpoint participant: a session's sandboxes in its suspend manifest.
+"""Deprecated: ``SandboxParticipant`` (kept for one release).
 
-The core's stateful sessions (``Session.suspend`` / ``AppRunner.resume``,
-``pyreact.boot.stateful``) ask every registered participant for a JSON
-fragment. This one covers every sandbox handle the session created with
-:func:`~pyreact_sandbox.use_sandbox`::
+:func:`~pyreact_sandbox.use_sandbox` / :func:`~pyreact_sandbox.SandboxProvider`
+now dehydrate their own state through the core's ``use_dehydrate`` (ADR 0001,
+``docs/adr/0001-look-like-react.md``): on ``root.suspend()`` the effect
+cleanup (``use_cleanup_reason() == "suspend"``) snapshots or pauses each
+sandbox per ``on_close`` (``resolve_policy(on_close, "suspend")``: never an
+implicit destroy) and the provider's slice records how to bring it back::
 
-    "sandbox": {"mode": "snapshot", "sandboxes": [
-        {"key": "default", "store_key": "agent-1/default", "driver": "docker",
-         "sandbox_id": null, "snapshot": {...SnapshotRef...}, "spec": {...}}]}
+    "slices": {"App/SandboxProvider[sandbox]": {"sandboxes": {
+        "default": {"driver": "docker", "spec": {...}, "sandbox_id": null,
+                    "snapshot": {...SnapshotRef...}}}}}
 
-``mode`` -- what a suspend does to a running sandbox:
+``hydrate_root`` restores from it (a missing snapshot boots a fresh sandbox
+and reports a ``hydration.mismatch`` + ``session.resume.degraded``).
 
-- ``"snapshot"`` (default): snapshot it (``sandbox.snapshot``), then destroy it
-  when the tree unmounts. Resume boots a new sandbox from the snapshot.
-  Survives a machine restart; costs a snapshot (``docker commit``).
-- ``"suspend"``: pause it (``docker pause``) and keep it. Resume reattaches
-  (and unpauses) -- fast, same process tree -- and falls back to the last
-  snapshot it has, if any.
-- ``"keep"``: leave it running; resume reattaches.
-
-On resume (before the first render) the records are handed to the handles
-``use_sandbox`` creates for the same keys; they win over the provider's
-``SnapshotStore``. Failure semantics: if the snapshot is gone (or the
-sandbox, or the driver changed), a **fresh sandbox** boots and
-``session.resume.degraded`` is published (``participant: "sandbox"``,
-``reason: "snapshot missing" | "restore failed" | "sandbox gone" |
-"driver changed"``) -- the agent goes on, without its files.
-
-    from pyreact_sandbox import SandboxParticipant
-    app = AppRunner(App, participants=[DurableParticipant, SandboxParticipant])
-    # or a mode: participants=[lambda s: SandboxParticipant(s, mode="suspend")]
-
-Sandbox closes are asynchronous (a private worker loop); ``suspended()``
-waits for them, so when ``session.suspend()`` returns the sandboxes are in
-their final state.
+This participant still works with ``Session.suspend`` / ``AppRunner.resume``:
+``mode`` -- ``"snapshot"`` (snapshot, then destroy), ``"suspend"`` (pause and
+keep) or ``"keep"`` -- overrides the handles' suspend policy, and its
+fragment lists the sandboxes as before.
 """
 
 from __future__ import annotations
 
 import asyncio
+import warnings
 from typing import Any, Dict, List
 
 from .react import HANDLES_SERVICE, RESTORE_SERVICE
@@ -50,7 +35,7 @@ _POLICY = {"snapshot": "destroy", "suspend": "suspend", "keep": "keep"}
 
 
 class SandboxParticipant:
-    """``name = "sandbox"``. ``SandboxParticipant(session=None, mode="snapshot")``."""
+    """Deprecated. ``name = "sandbox"``. ``SandboxParticipant(session=None, mode="snapshot")``."""
 
     name = "sandbox"
     version = "1"
@@ -59,6 +44,11 @@ class SandboxParticipant:
                  close_timeout: float = 120.0) -> None:
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+        warnings.warn(
+            "SandboxParticipant is deprecated: use_sandbox / SandboxProvider dehydrate "
+            "their snapshot ref themselves (use_dehydrate); suspend with root.suspend() "
+            "and set the policy with on_close={'suspend': ...}; no participants needed "
+            "(see docs/adr/0001-look-like-react.md)", DeprecationWarning, stacklevel=2)
         self.session = session
         self.mode = mode
         self.close_timeout = close_timeout
@@ -106,4 +96,4 @@ class SandboxParticipant:
                                        "snapshot": e.get("snapshot"), "spec": e.get("spec")}
 
     def __repr__(self) -> str:
-        return f"<SandboxParticipant mode={self.mode!r}>"
+        return f"<SandboxParticipant mode={self.mode!r} (deprecated)>"
