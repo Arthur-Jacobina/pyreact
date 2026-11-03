@@ -31,7 +31,7 @@ from opentelemetry.trace import Span
 from pyreact.core.events import Event, EventBus, _matches
 
 from . import attributes as A
-from .tracing import _jsonable, _trace_names, turn_span
+from .tracing import _jsonable, _trace_name_of, turn_span
 
 __all__ = ["DEFAULT_KINDS", "CONTENT_KEYS", "EventBridge"]
 
@@ -129,7 +129,7 @@ class EventBridge:
         attrs = self.attributes(ev)
         root_name = None
         if target is not None:
-            root_name = _trace_names.get(target.get_span_context().trace_id)
+            root_name = _trace_name_of(target.get_span_context().trace_id)
         if self.extra_attributes is not None:
             attrs.update(self.extra_attributes(ev, target, root_name) or {})
         ts = int(ev.ts * 1e9)
