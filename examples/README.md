@@ -38,6 +38,14 @@ from the repository root with `uv run python -m examples.<name>`.
 
 Inspect any log while the app runs: `uv run python -m pyreact_durable show <file>`.
 
+## Harness: failure handling (`examples/harness/`)
+
+| Example | Idea | LLM |
+|---|---|---|
+| `harness.02_resilient_agent` | Flaky tool + flaky/slow model, simulated deterministically: `retry` with backoff and `Retry-After`, `timeout`, `circuit_breaker` opening and closing, `fallback_model`, an `ErrorBoundary` fallback message, then `kill -9` mid-turn and `resume_pending()` with `durable_lm` replay | yes (6 calls) |
+
+See [Error recovery](../README.md#error-recovery) in the main README.
+
 ## Learning: architectures & optimizers (`examples/learn/`)
 
 | Example | Idea |
@@ -53,4 +61,5 @@ Inspect any log while the app runs: `uv run python -m pyreact_durable show <file
 
 - **New to pyreact:** `message` → `qa_guardrail` → `tools` → `main_web --app tools`.
 - **Need memory:** `durable.01_counter` → `durable.02_branches_sqlite` → `durable.04_llm_chat`.
+- **Going to production:** `harness.02_resilient_agent` (recovery), then `durable.04_llm_chat`.
 - **Want better prompts:** `learn.01` → `learn.02` → `learn.03` → `learn.05`.
