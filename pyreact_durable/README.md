@@ -269,6 +269,27 @@ the turn, the turn is re-run, the identical request hashes to the same key,
 and the answer is replayed — **0 model calls, identical answer**, and the
 turn completes exactly once.
 
+## Resuming crashed turns (`pyreact_durable.turns`)
+
+pyreact's core defines a generic `TurnStore` hook (`TurnManager.configure(store=...)`);
+`DurableTurnStore(log)` implements it from the `turn.start` / `turn.end`
+events `Durable` already journals — nothing extra is written. A turn whose
+last `turn.start` on the current branch has no `turn.end` after it is
+*pending* (the process died mid-turn). `Durable(resume_turns=True)` (the
+default; needs `turn.*` in `journal`) attaches the store on mount, so after
+a restart:
+
+```python
+app = bootstrap(App)                  # Durable(log=...) + use_durable_lm(...)
+app.resume_pending(wait=True)         # {"default": ["t7"]}: same id, same text
+```
+
+The resumed turn's LLM calls that answered before the crash replay from the
+log through `durable_lm` (0 model calls); the turn's other side effects run
+again, so commit results atomically at the end of the turn. Proven by
+`tests/test_resume_turns.py` (SIGKILL mid-turn, then resume) and
+`examples/harness/02_resilient_agent.py`.
+
 ## CLI
 
 ```bash

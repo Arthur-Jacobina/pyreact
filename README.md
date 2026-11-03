@@ -113,8 +113,12 @@ a ContextVar set while a boundary runs, which follows spawned tasks,
 | kind | before the call | after `call_next` returns (or raises) |
 |------|-----------------|---------------------------------------|
 | `turn` | `turn_id`, `index`, `source` | `status` (`done`/`interrupted`/`error`), `duration` (s) |
-| `llm` | `call_id`, `module_key`, `arch`, `model` | `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`; cumulative across retries), `cost`, `latency` (s, of the last module run), `outputs` (preview), `lm_calls` (prompts + completions) |
+| `llm` | `call_id`, `module_key`, `arch`, `model`; with a `DSPyProvider(models=...)` registry also `model_key` (registry key in use) and `model_names` (`{key: model}`) | `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`; cumulative across retries), `cost`, `latency` (s, of the last module run), `outputs` (preview), `lm_calls` (prompts + completions) |
 | `tool` | `call_id` (of the LLM call that asked for it) | `result` (preview), `latency` (s) |
+
+Recovery middleware adds `retries`, `fallback`, `circuit` (state the call
+met), `timed_out`; `fallback_model` rewrites `model_key` / `model`
+(see [Error recovery](#error-recovery)).
 
 ### Ordering and scope
 
@@ -198,6 +202,114 @@ check.run(comment=text, tag=turn.id)
 if check.tag == turn.id and not check.loading:
     verdict = check.result.verdict
 ```
+
+### Error recovery
+
+Failure handling is explicit and composable, React-style: **middleware**
+for boundary calls (`pyreact/core/recovery.py`, any kind; DSPy-aware
+`fallback_model` in `integrations/recovery.py`, which re-exports the rest),
+an **`ErrorBoundary` component** for render/effect failures, and **resume**
+for turns cut short by a crash. Example:
+`uv run python -m examples.harness.02_resilient_agent`.
+
+| middleware | does | events |
+|---|---|---|
+| `retry(max_attempts=3, backoff=exponential(base, max, jitter), retry_on=types\|predicate, kinds=("llm", "tool"))` | re-runs the call (`b.attempt` bumped); never retries `Blocked`, cancellation or `exc.retryable = False`; honors a `Retry-After` hint (`exc.retry_after`, `Retry-After`/`retry-after-ms` headers; capped by `max_retry_after`); an interrupted turn cancels it in its backoff sleep | `recovery.retry`, `recovery.exhausted` |
+| `timeout(seconds \| fn(b), kinds=...)` | bounds each run; cancels the inner call (`CancelledError` inside it) and raises `BoundaryTimeout` (a retryable `TimeoutError`). Worker threads (sync tools/LMs) cannot be interrupted: the boundary returns on time, the thread finishes in the background | `recovery.timeout` |
+| `circuit_breaker(failure_threshold, reset_timeout, key=lambda b: b.attrs.get("model") or b.name, fallback=None)` | closed → (N consecutive failures) open → fail fast with `CircuitOpen` (`retryable=False`, `retry_after`) or `fallback(b, exc)` → after `reset_timeout` one half-open trial → closed / open. `.state(key)`, `.reset()` | `recovery.circuit` |
+| `fallback_model(chain=["default", "fast"], on=...)` (`llm`) | re-runs the call with the next `DSPyProvider(models=...)` key; starts from the call's own model; an open circuit falls back at once | `recovery.fallback` |
+| `fallback(fn, on=...)` | returns `fn(b, exc)` instead of failing (a `dspy.Prediction` for `llm`) | `recovery.fallback` |
+
+**Ordering.** Outermost first:
+
+```python
+HarnessProvider(middleware=[
+    otel,                                         # sees the final outcome, one span per boundary
+    guards, verify,                               # a refusal is final: never retried
+    fallback_model(chain=["default", "fast"]),    # degrade after retries gave up / circuit open
+    retry(max_attempts=3, backoff=exponential(0.5, 8.0)),
+    circuit_breaker(failure_threshold=5, reset_timeout=30),  # counts every attempt
+    timeout(30),                                  # bounds each attempt
+], children=[Agent()])
+```
+
+- telemetry outermost sees one boundary with its `retries` / `fallback` /
+  `circuit` attrs (put it innermost instead to get one span per attempt);
+- guards (`Blocked`) and verification sit outside recovery: a blocked
+  call is not retried, and verification judges the final answer
+  (retry-with-feedback for *verification* failures belongs to the
+  verification middleware);
+- `circuit_breaker` inside `retry` so each attempt counts and an open
+  circuit stops the retries; inside `fallback_model` so its default key
+  (`b.attrs["model"]`) follows the model switch;
+- `timeout` innermost: per attempt, not for the whole retry loop.
+
+**How `fallback_model` switches models.** `use_call` passes the provider's
+registry to `invoke_module`; the `llm` boundary carries
+`b.attrs["model_key"]` and `b.attrs["model_names"]`. A middleware that sets
+`b.attrs["model_key"] = "fast"` before `call_next` makes that run use
+`models["fast"]`; `b.attrs["model"]`, `llm.end` (`model`, `model_key`) and
+the call record name the model that answered. A call with an explicit
+`lm=` and no provider registry is passed through untouched.
+
+**`ErrorBoundary`** (`pyreact.core.ErrorBoundary`) — React error
+boundaries:
+
+```python
+ErrorBoundary(
+    fallback=lambda error: Message(text=f"(chart unavailable: {error})"),
+    on_error=lambda error, info: log.warning("%s: %s", info["component"], error),
+    reset_on="turn",              # or "props" (+ reset_keys=[...]) or fn(error, info) -> bool
+    children=[Chart(key="chart")],
+)
+```
+
+- catches errors of its *descendants* while rendering, in effects (sync, or
+  an async effect's task) and in tasks they `spawn` — not its own errors,
+  not cleanup errors, not what a hook turns into data (`call.error`);
+- on an error: unmounts the children, renders `fallback` (a VNode/list, or a
+  function/component given the parameters it declares among `error`,
+  `info`, `reset`), calls `on_error(error, info)` (`info`: `component`,
+  `phase`, `turn_id`, `boundary`), publishes `error.caught` (with the
+  traceback) instead of `error`; the error is not printed and the turn
+  does not end as `"error"`;
+- resets (re-mounts fresh children) on the next turn (`"turn"`, default),
+  when `reset_keys` change (`"props"`), when `reset_on(error, info)` is
+  true, or when the fallback calls `reset()`;
+- an error of the fallback goes to the next boundary up; errors no boundary
+  catches keep the default behavior (last good subtree kept, `error` event,
+  turn status `"error"`);
+- transparent like providers (`@component(transparent=True)`): wrapping a
+  subtree in a boundary does not change its components' paths, so durable
+  state keyed by path survives adding one.
+
+**Resume.** A turn the process never finished (crash, `kill -9`, deploy)
+can be re-run with the same id and text:
+
+```python
+app = bootstrap(App)                        # App mounts Durable(log=...) + durable_lm
+app.resume_pending(wait=True)               # {session_id: [turn ids]}
+session.resume_turn("t7")                   # one turn (also an interrupted one)
+```
+
+The core only defines the hook: a `TurnStore` (`on_turn_start`,
+`on_turn_end`, `pending()`, optional `get(turn_id)`) set with
+`TurnManager.configure(store=...)`. `pyreact_durable` implements it
+(`DurableTurnStore`, attached by `Durable(resume_turns=True)`, the
+default) from the `turn.start` / `turn.end` events it already journals: a
+start without an end is pending. A resumed turn has `turn.resumed` and
+`turn.start` carries `"resumed": true`. Re-running a turn is at-least-once
+for its side effects: commit results atomically at the end of the turn,
+and put the LM behind `durable_lm` — the calls that answered before the
+crash are replayed from the log (no model call, no cost), only the rest
+run. `tests/test_resume_turns.py` kills a process with SIGKILL mid-turn and
+checks the resumed turn gives the same answer with no repeated model call.
+
+**Telemetry.** Every recovery action is a `recovery.*` event (session bus
+and global bus, with `turn_id` and the component path): `:events`,
+`Durable` journals (add `"recovery.*"` to `journal=`), sinks and trace
+exporters see them. Middleware-level state is on the boundary
+(`b.attempt`, `retries`, `fallback`, `circuit`, `timed_out`).
 
 ## Running the examples
 
