@@ -1,4 +1,3 @@
-import json
 from pyreact.boot import bootstrap, read_terminal_and_invoke
 from pyreact.core.core import component
 from examples.components import Root
@@ -23,39 +22,13 @@ def Boot():
 
 
 async def main():
-    def _on_console(text: str) -> None:
-        if text.startswith("__MESSAGE__:"):
-            message_json = text[12:]  # Remove "__MESSAGE__:"
-            message_data = json.loads(message_json)
-
-            sender_colors = {
-                "user": "\x1b[34m",  # Blue
-                "system": "\x1b[90m",  # Gray
-                "assistant": "\x1b[32m",  # Green
-            }
-            type_colors = {
-                "chat": "",
-                "info": "\x1b[36m",  # Cyan
-                "warning": "\x1b[33m",  # Yellow
-                "error": "\x1b[31m",  # Red
-            }
-
-            sender = message_data["sender"]
-            message_type = message_data["message_type"]
-            text = message_data["text"]
-
-            color = sender_colors.get(sender, "") + type_colors.get(message_type, "")
-            reset = "\x1b[0m"
-            formatted_text = f"{color}[{sender.upper()}] {text}{reset}\n"
-
-            print(formatted_text, end="", flush=True)
-
     myapp = bootstrap(Boot, fps=20)
-    myapp.attach_web_bridge(
-        on_console=_on_console,
-        target_loop=asyncio.get_running_loop(),
-    )
-    await read_terminal_and_invoke(myapp, prompt="> ", wait=True)
+    try:
+        # Chat messages / errors are rendered from typed events by the
+        # terminal's ConsoleSink; try :events, :usage, :turns, :help.
+        await read_terminal_and_invoke(myapp, prompt="> ", wait=True)
+    finally:
+        myapp.shutdown()
 
 
 if __name__ == "__main__":

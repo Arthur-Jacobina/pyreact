@@ -1,4 +1,3 @@
-import json
 import asyncio
 import os
 import dotenv
@@ -23,35 +22,18 @@ def Boot():
 
 
 async def main():
-    def _on_console(text: str) -> None:
-        if not text.startswith("__MESSAGE__:"):
-            return
-        message_data = json.loads(text[12:])  # strip "__MESSAGE__:"
-
-        sender_colors = {
-            "user": "\x1b[34m",  # Blue
-            "system": "\x1b[90m",  # Gray
-            "assistant": "\x1b[32m",  # Green
-        }
-        type_colors = {
-            "chat": "",
-            "info": "\x1b[36m",  # Cyan
-            "warning": "\x1b[33m",  # Yellow
-            "error": "\x1b[31m",  # Red
-        }
-
-        sender = message_data["sender"]
-        message_type = message_data["message_type"]
-        color = sender_colors.get(sender, "") + type_colors.get(message_type, "")
-        reset = "\x1b[0m"
-        print(f"{color}[{sender.upper()}] {message_data['text']}{reset}\n", end="", flush=True)
-
     myapp = bootstrap(Boot, fps=20)
-    myapp.attach_web_bridge(
-        on_console=_on_console,
-        target_loop=asyncio.get_running_loop(),
-    )
-    await read_terminal_and_invoke(myapp, prompt="> ", wait=True)
+    try:
+        # Messages and errors are rendered from typed events (ConsoleSink);
+        # also show LLM and tool activity. :events, :usage, :turns for more.
+        await read_terminal_and_invoke(
+            myapp,
+            prompt="> ",
+            wait=True,
+            console_kinds=("message", "error", "llm.end", "llm.error", "tool.*"),
+        )
+    finally:
+        myapp.shutdown()
 
 
 if __name__ == "__main__":
