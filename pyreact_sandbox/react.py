@@ -103,6 +103,10 @@ __all__ = [
 ON_CLOSE = ("destroy", "suspend", "snapshot", "keep")
 _PREVIEW = 400
 
+# Session services shared with pyreact_sandbox.stateful.SandboxParticipant.
+HANDLES_SERVICE = "pyreact_sandbox.handles"  # {store key: SandboxHandle} of the session
+RESTORE_SERVICE = "pyreact_sandbox.restore"  # {store key: record} from a resumed manifest
+
 
 # ---------------------------------------------------------------------------
 # Private worker loop: sandbox I/O independent from the render loop
@@ -244,6 +248,11 @@ class SandboxHandle:
         self.error: Optional[BaseException] = None
         self.closed = False
         self.dirty = False
+        # set by a resumed manifest: tried before the store's record
+        self.restore_record: Optional[Dict[str, Any]] = None
+        # close policy forced for close_reason "suspend" (SandboxParticipant)
+        self.suspend_policy: Optional[str] = None
+        self.close_future: Optional[concurrent.futures.Future] = None
         self._create_lock: Optional[asyncio.Lock] = None
         self._rw: Optional[_RWLock] = None
         self._unsubs: list = []
@@ -314,9 +323,23 @@ class SandboxHandle:
             self._save(sandbox_id=sb.id)
             return sb
 
+    def _degrade(self, reason: str, **info: Any) -> None:
+        """A manifest said how to bring this sandbox back and it could not
+        be done (``session.resume.degraded``)."""
+        fn = getattr(self.session, "degrade", None)
+        if callable(fn):
+            try:
+                fn("sandbox", reason, key=self.key, **info)
+            except Exception:
+                pass
+
     async def _boot(self) -> Sandbox:
         t0 = time.perf_counter()
-        rec = self.store.get(self.store_key) if self.store is not None else None
+        from_manifest, self.restore_record = self.restore_record, None
+        rec = from_manifest or (self.store.get(self.store_key) if self.store is not None else None)
+        if from_manifest and from_manifest.get("driver") != self.driver.name:
+            self._degrade("driver changed", expected=from_manifest.get("driver"),
+                          driver=self.driver.name)
         if rec and rec.get("driver") == self.driver.name:
             sid = rec.get("sandbox_id")
             if sid:
@@ -343,6 +366,9 @@ class SandboxHandle:
                 except SandboxError as exc:
                     self._publish("sandbox.error", {"phase": "restore", "error": repr(exc),
                                                     "snapshot": ref.id})
+                    if from_manifest:
+                        self._degrade("snapshot missing" if isinstance(exc, SandboxNotFound)
+                                      else "restore failed", snapshot=ref.id, error=repr(exc))
                 else:
                     self.restored = "snapshot"
                     self.last_snapshot = ref
@@ -351,6 +377,8 @@ class SandboxHandle:
                         "mode": "snapshot", "snapshot": ref.id,
                         "duration": time.perf_counter() - t0})
                     return sb
+            elif from_manifest and sid:
+                self._degrade("sandbox gone", sandbox_id=sid)
         sb = await self.driver.create(self.spec)
         self.sandbox = sb
         self._publish("sandbox.created", {"image": self.spec.image,
@@ -533,8 +561,14 @@ class SandboxHandle:
         resolved against the session's ``close_reason``."""
         if policy is None:
             reason = getattr(self.session, "close_reason", None) or "unmount"
-            policy = resolve_policy(self.on_close, reason)
-        return _worker.submit(self._aclose(policy), track=True)
+            if reason == "suspend" and self.suspend_policy is not None:
+                policy = self.suspend_policy
+            else:
+                policy = resolve_policy(self.on_close, reason)
+        fut = _worker.submit(self._aclose(policy), track=True)
+        if self.close_future is None:
+            self.close_future = fut
+        return fut
 
     async def _aclose(self, policy: str) -> None:  # worker loop
         if policy not in ON_CLOSE:
@@ -777,17 +811,23 @@ def use_sandbox(spec: Union[SandboxSpec, Mapping[str, Any], None] = None, *,
         eff_spec = env.spec
     drv = get_driver(driver) if driver is not None else env.driver
 
+    registry = hooks.get_service(HANDLES_SERVICE, dict)
+    restore = hooks.get_service(RESTORE_SERVICE, dict)
+
     def make() -> SandboxHandle:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-        return SandboxHandle(
+        h = SandboxHandle(
             key=k, store_key=f"{sid}/{k}", driver=drv, spec=eff_spec,
             store=store if store is not None else env.store,
             on_close=on_close or env.on_close,
             autosnapshot=autosnapshot if autosnapshot is not None else env.autosnapshot,
             bus=bus, owner=ctx, source=path, home_loop=loop, session=session)
+        h.restore_record = restore.pop(h.store_key, None)
+        registry[h.store_key] = h  # for a SandboxParticipant
+        return h
 
     local = hooks.use_ref(None)
     if scope == "session":

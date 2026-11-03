@@ -12,6 +12,8 @@ is resolved lazily on first access):
   :class:`DockerDriver`, snapshot stores.
 - React border (``pyreact_sandbox.react``): ``SandboxProvider``,
   ``use_sandbox``, :class:`SandboxHandle`.
+- stateful sessions: ``SandboxParticipant`` (sandboxes in a session's
+  suspend manifest; ``pyreact_sandbox.stateful``).
 - integrations: ``SandboxInterpreter`` (dspy ``CodeInterpreter`` for RLM),
   ``sandbox_tools(handle)`` (tools for ``use_agent`` / ``ToolProvider``).
 """
@@ -53,6 +55,7 @@ __all__ = [
     "SandboxHandle",
     "SandboxInterpreter",
     "SandboxNotFound",
+    "SandboxParticipant",
     "SandboxProcess",
     "SandboxProvider",
     "SandboxSetupError",
@@ -82,6 +85,7 @@ _LAZY = {
     "wait_closed": ".react",
     "SandboxInterpreter": ".interpreter",
     "sandbox_tools": ".tools",
+    "SandboxParticipant": ".stateful",
 }
 
 
