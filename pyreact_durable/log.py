@@ -719,6 +719,12 @@ class SessionLog:
                 "branch_points": len(self.branch_points()),
                 "labels": len(self._labels), "leaf": self._leaf}
 
+    def render(self, width: int = 60) -> str:
+        """The entry tree as text (what ``python -m pyreact_durable show``
+        prints): labels, ``⑂`` branch points, ``*`` leaf."""
+        from .render import render_tree
+
+        return "\n".join(render_tree(self, width))
 
 
 # ---------------------------------------------------------------------------

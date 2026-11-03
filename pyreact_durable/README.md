@@ -167,6 +167,7 @@ log.checkout(ref)                         # writes a `leaf` entry
 log.fork_file(new_path, at=None)          # new file, parentSession header
 log.checkpoint(summary=None)              # compaction snapshot
 log.tree(); log.branch_points(); log.stats()
+log.render(width=60)                      # the tree as text (same as `show`)
 log.set_name("support chat"); log.name
 log.subscribe(fn)                         # fn(entry, moved) after each append
 log.close()                               # also a context manager
@@ -246,6 +247,8 @@ python -m pyreact_durable checkpoint chat.jsonl --summary "after onboarding"
 
 Read commands open the file read-only (safe while the app runs); write
 commands take the writer lock, so they fail cleanly while an app holds it.
+`show` prints `pyreact_durable.render_tree(log)` (also `log.render()`), so an
+app can show the same tree (e.g. `say(log.render())` for a `/tree` command):
 
 ```
 session 4f8185e0-…  v1  52 entries  2 branch point(s)  leaf=50072721

@@ -130,7 +130,7 @@ def short(s: str, n: int = 70) -> str:
 
 def parent(keep: bool) -> int:
     from pyreact_durable import SessionLog
-    from pyreact_durable.__main__ import render_tree
+    from pyreact_durable import render_tree
 
     tmp = Path(tempfile.mkdtemp(prefix="e2e_durable_"))
     log_path = str(tmp / "chat.jsonl")
