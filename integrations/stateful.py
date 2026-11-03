@@ -1,106 +1,66 @@
-"""Checkpoint participant: learned / compiled DSPy programs survive a suspend.
+"""Deprecated: ``CompiledModulesParticipant`` (kept for one release).
 
-A session's ``DSPyProvider`` envs hold the programs an optimizer compiled or
-``OptimizationResult.hot_swap`` swapped in (``env.compiled``). Without this,
-a restart rebuilds every module from its signature and the optimized prompt
-is gone. ``CompiledModulesParticipant`` (name ``"dspy.compiled"``) records
-each one in the suspend manifest::
+Learned programs are state of the tree (ADR 0001,
+``docs/adr/0001-look-like-react.md``) and dehydrate themselves through the
+core's ``use_dehydrate``, so ``root.suspend()`` / ``hydrate_root(...)`` carry
+them with no participant:
 
-    "dspy.compiled": {"modules": [
-        {"key": ["ReAct", "Coder", "App/Agent[agent]"], "key_str": "ReAct:Coder:App/Agent[agent]",
-         "provider": "App/DSPyProvider[dspy]", "arch": "react",
-         "path": "artifacts/coder_gepa.json"}]}          # or "state": {...} inline
+- ``LearnedProgram`` / ``LearnedPrograms`` providers: slice ``"programs"``
+  (``{name: path | {"state": ...} | None}``, see
+  ``integrations.learn.programs``);
+- the ``DSPyProvider`` env's compiled / hot-swapped-by-key modules
+  (``env.compiled``): slice ``"compiled"``::
 
-- ``path``: the ``integrations.learn`` result file the program came from
-  (``OptimizationResult.save`` / ``load`` then ``hot_swap``), or one written
-  now under ``dir`` (``<dir>/<session>/<key>.json``, same format) for
-  programs that have no file;
-- ``state``: the program's ``dump_state()`` inline, when there is neither.
+      "slices": {"App/DSPyProvider[dspy]": {"compiled": [
+          {"key": ["ReAct", "QA", "coder"], "key_str": "ReAct:QA:coder", "arch": "react",
+           "path": "artifacts/coder_gepa.json"}]}}          # or "state": {...} inline
 
-On resume the states are loaded **before the first render** and applied
-when ``use_module`` / ``use_agent`` build the module for the same key (the
-module is then in ``env.compiled`` again, so the next suspend keeps it and an
-optimizer does not recompile it). A result file that is gone or unreadable
-degrades (``session.resume.degraded``, ``participant: "dspy.compiled"``) and
-that module starts from its signature.
+  hydrated before the first render and applied when ``use_module`` /
+  ``use_agent`` build the module for the same key; a result file that is
+  gone is a ``hydration.mismatch`` (plus ``session.resume.degraded``,
+  ``participant: "dspy.compiled"``) and that module starts from its
+  signature.
 
-    app = AppRunner(App, participants=[DurableParticipant,
-                                       lambda s: CompiledModulesParticipant(s, dir="runs/learned")])
+The legacy ``Session.suspend`` manifest carries the same slices, so this
+participant's fragment is empty (``dir=`` is ignored: programs without a
+result file are inlined). It still reads the ``modules`` fragment of a
+manifest written by an older pyreact.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+import warnings
+from typing import Any, Dict, Optional
 
 __all__ = ["CompiledModulesParticipant"]
 
 
-def _plain(obj: Any) -> Any:
-    return json.loads(json.dumps(obj, default=str))
-
-
 class CompiledModulesParticipant:
-    """``CompiledModulesParticipant(session=None, dir=None)``."""
+    """Deprecated: ``CompiledModulesParticipant(session=None, dir=None)``."""
 
     name = "dspy.compiled"
-    version = "1"
+    version = "2"
 
     def __init__(self, session: Any = None, *, dir: Optional[os.PathLike] = None) -> None:
+        warnings.warn(
+            "CompiledModulesParticipant is deprecated: DSPyProvider and LearnedProgram "
+            "dehydrate learned programs themselves (use_dehydrate); suspend with "
+            "root.suspend() and resume with hydrate_root(...), no participants needed "
+            "(see docs/adr/0001-look-like-react.md)", DeprecationWarning, stacklevel=2)
         self.session = session
-        self.dir = Path(dir) if dir is not None else None
-
-    def _save(self, session: Any, key: Any, program: Any) -> Optional[str]:
-        if self.dir is None:
-            return None
-        from integrations.feedback import key_str
-        from integrations.learn.result import OptimizationResult
-
-        from .architectures import arch_of
-
-        path = (self.dir / quote(str(session.id), safe="")
-                / f"{quote(key_str(key), safe='')}.json")
-        try:
-            res = OptimizationResult(program=program,
-                                     optimizer=getattr(program, "_pyreact_optimizer", "unknown"),
-                                     arch=arch_of(program), module_key=key)
-            return res.save(str(path))
-        except Exception:
-            return None
+        self.dir = dir
 
     async def suspend(self, session: Any) -> Dict[str, Any]:
-        from integrations.feedback import key_str
-        from integrations.learn.hmr import find_envs
-
-        from .architectures import arch_of
-
-        modules: List[Dict[str, Any]] = []
-        seen = set()
-        for provider, env in find_envs(session):
-            for key, program in list(env.compiled.items()):
-                if key in seen or not isinstance(key, tuple):
-                    continue
-                seen.add(key)
-                entry: Dict[str, Any] = {"key": list(key), "key_str": key_str(key),
-                                         "provider": provider, "arch": arch_of(program)}
-                path = getattr(program, "_pyreact_result_path", None)
-                if not (path and os.path.exists(path)):
-                    path = self._save(session, key, program)
-                if path:
-                    entry["path"] = str(path)
-                else:
-                    entry["state"] = _plain(program.dump_state())
-                modules.append(entry)
-        return {"modules": modules}
+        return {}  # the learned modules ride in the manifest's "slices"
 
     async def resume(self, session: Any, fragment: Dict[str, Any]) -> None:
         from .hooks import RESTORE_SERVICE
 
-        restore = session.services.setdefault(RESTORE_SERVICE, {})
-        for e in fragment.get("modules") or []:
+        modules = fragment.get("modules") or []
+        restore = session.services.setdefault(RESTORE_SERVICE, {}) if modules else {}
+        for e in modules:  # a manifest from an older pyreact
             key = tuple(e.get("key") or ())
             state = e.get("state")
             if state is None and e.get("path"):
@@ -117,4 +77,4 @@ class CompiledModulesParticipant:
                 restore[key] = state
 
     def __repr__(self) -> str:
-        return f"<CompiledModulesParticipant dir={self.dir}>"
+        return "<CompiledModulesParticipant (deprecated)>"

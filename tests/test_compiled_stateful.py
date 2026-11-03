@@ -1,17 +1,31 @@
-"""CompiledModulesParticipant: learned programs survive suspend / resume."""
+"""Learned programs dehydrate themselves (use_dehydrate): roots carry them.
+
+- ``DSPyProvider``: modules an optimizer compiled / a hot swap by key put in
+  ``env.compiled`` (slice ``"compiled"``);
+- ``LearnedProgram`` / ``LearnedPrograms``: the provider's ``{name: src}``
+  state, a swap included (slice ``"programs"``).
+"""
 
 import copy
+import warnings
 
 import dspy
 import pytest
 from dspy.utils import DummyLM
 
 from integrations import DSPyProvider, use_agent, use_dspy_env, use_module
-from integrations.learn import OptimizationResult
+from integrations.learn import (
+    LearnedProgram,
+    OptimizationResult,
+    use_learned,
+    use_learned_registry,
+)
 from integrations.learn.hmr import hot_swap_into, resolve_module
 from integrations.stateful import CompiledModulesParticipant
-from pyreact.boot import AppRunner, DirectoryManifestStore
-from pyreact.core import component, hooks
+from pyreact.boot import AppRunner, DirectoryManifestStore, create_root, hydrate_root
+from pyreact.core import HydrationWarning, component, hooks, use_imperative_handle
+
+DSPY = "App/DSPyProvider[dspy]"
 
 
 class QA(dspy.Signature):
@@ -42,19 +56,14 @@ def App():
 
 
 @pytest.fixture
-def make(tmp_path):
+def roots():
     made = []
-
-    def _make(**kw):
-        app = AppRunner(App, default_session=False,
-                        participants=[lambda s: CompiledModulesParticipant(s, **kw)],
-                        manifest_store=DirectoryManifestStore(tmp_path / "m"))
-        made.append(app)
-        return app
-
-    yield _make
-    for app in made:
-        app.shutdown()
+    yield made
+    for r in made:
+        try:
+            r.unmount()
+        except Exception:
+            pass
 
 
 def _learned(program, text):
@@ -70,47 +79,144 @@ def _swap(sess, key, text):
     sess.wait_idle(timeout=5)
 
 
-@pytest.mark.parametrize("where", ["inline", "dir"])
-def test_learned_programs_come_back_before_the_first_render(make, tmp_path, where):
-    app = make(dir=tmp_path / "learned") if where == "dir" else make()
-    s = app.open_session("a")
-    _swap(s, "qa", "LEARNED QA")
-    _swap(s, "coder", "LEARNED AGENT")
-    assert s.services["seen"][-1] == ("LEARNED QA", "LEARNED AGENT")
-    m = s.suspend()
-    mods = {e["key_str"]: e for e in m["participants"]["dspy.compiled"]["modules"]}
+def _seen(root):
+    return root.session.services["seen"]
+
+
+def test_compiled_modules_come_back_before_the_first_render(roots):
+    root = create_root(App, session_id="a")
+    _swap(root.session, "qa", "LEARNED QA")
+    _swap(root.session, "coder", "LEARNED AGENT")
+    assert _seen(root)[-1] == ("LEARNED QA", "LEARNED AGENT")
+    snap = root.suspend()
+    mods = {e["key_str"]: e for e in snap["slices"][DSPY]["compiled"]}
     assert set(mods) == {"Predict:QA:qa", "ReAct:QA:coder"}
-    for e in mods.values():
-        assert ("path" in e) == (where == "dir") and ("state" in e) == (where == "inline")
-    app.shutdown()
+    assert all("state" in e for e in mods.values())  # no result file: inlined
 
-    app2 = make()
-    r = app2.resume("a")
-    assert r.services["seen"][0] == ("LEARNED QA", "LEARNED AGENT")  # first render
+    r = hydrate_root(App, session_id="a", snapshot=snap)  # a new runner
+    roots.append(r)
+    assert _seen(r)[0] == ("LEARNED QA", "LEARNED AGENT")  # first render
+    assert r.mismatches == []
     # still compiled: a second suspend keeps them
-    m2 = r.suspend()
-    assert len(m2["participants"]["dspy.compiled"]["modules"]) == 2
+    assert len(r.suspend()["slices"][DSPY]["compiled"]) == 2
 
 
-def test_result_path_is_reused_and_missing_file_degrades(make, tmp_path):
-    app = make()
-    s = app.open_session("p")
-    _env, key, mod = resolve_module(s, "qa")
+def test_result_path_is_reused_and_missing_file_is_a_mismatch(roots, tmp_path):
+    root = create_root(App, session_id="p")
+    _env, key, mod = resolve_module(root.session, "qa")
     res = OptimizationResult(program=_learned(mod, "FROM FILE"), optimizer="gepa",
                              module_key=key)
     res.save(str(tmp_path / "qa.json"))
-    res.hot_swap(s, key)
-    s.wait_idle(timeout=5)
-    m = s.suspend()
-    [e] = m["participants"]["dspy.compiled"]["modules"]
-    assert e["path"] == str(tmp_path / "qa.json")
+    res.hot_swap(root.session, key)
+    root.wait_idle(timeout=5)
+    snap = root.suspend()
+    [e] = snap["slices"][DSPY]["compiled"]
+    assert e["path"] == str(tmp_path / "qa.json") and "state" not in e
 
-    r = app.resume("p", m, consume=False)
-    assert r.services["seen"][0][0] == "FROM FILE"
-    r.suspend()
+    r = hydrate_root(App, session_id="p", snapshot=snap)
+    assert _seen(r)[0][0] == "FROM FILE"
+    r.unmount()
 
     (tmp_path / "qa.json").unlink()
-    r2 = app.resume("p", m)
-    assert [(d["participant"], d["reason"]) for d in r2.degraded] == [
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", HydrationWarning)
+        r2 = hydrate_root(App, session_id="p", snapshot=snap)
+    roots.append(r2)
+    assert [(m["path"], m["key"], m["reason"]) for m in r2.mismatches] == [
+        (DSPY, "compiled", "result missing")]
+    assert [(d["participant"], d["reason"]) for d in r2.session.degraded] == [
         ("dspy.compiled", "result missing")]
-    assert r2.services["seen"][0][0] == "Answer the question."
+    assert _seen(r2)[0][0] == "Answer the question."
+
+
+# ---------------------------------------------------------------------------
+# LearnedProgram: the provider's state is the learned program reference
+# ---------------------------------------------------------------------------
+def _result(tmp_path, name, text):
+    p = dspy.Predict(QA)
+    p.signature = p.signature.with_instructions(text)
+    path = str(tmp_path / f"{name}.json")
+    OptimizationResult(program=p, optimizer="gepa", arch="predict").save(path)
+    return path
+
+
+def learned_app(src):
+    @component
+    def Leaf():
+        qa = use_module(QA, name="qa", program=use_learned("qa"))
+        use_imperative_handle("learned", lambda: use_learned_registry(), [])
+        hooks.get_service("seen", list).append(qa.signature.instructions)
+        return []
+
+    @component
+    def App():
+        return [DSPyProvider(key="dspy", lm=DummyLM([]), children=[
+            LearnedProgram(key="qa", src=src, children=[Leaf(key="leaf")])])]
+
+    return App
+
+
+def test_learned_program_swap_survives_suspend(roots, tmp_path):
+    one, two = _result(tmp_path, "one", "ONE"), _result(tmp_path, "two", "TWO")
+    root = create_root(learned_app(one), session_id="lp")
+    assert _seen(root)[-1] == "ONE"
+    reg = root.session.services["learn.programs"]["App/LearnedProgram[qa]"]
+    reg.set("qa", two)  # a hot swap: the provider's state changes
+    root.wait_idle(timeout=5)
+    assert _seen(root)[-1] == "TWO"
+    snap = root.suspend()
+    assert snap["slices"]["App/LearnedProgram[qa]"] == {"programs": {"qa": two}}
+    # the DSPy env does not carry it twice (the LearnedProgram owns it)
+    assert snap["slices"][DSPY] == {"compiled": []}
+
+    r = hydrate_root(learned_app(one), session_id="lp", snapshot=snap)
+    roots.append(r)
+    assert _seen(r)[0] == "TWO"  # the swapped program, on the first render
+    assert r.mismatches == []
+
+
+def test_learned_program_with_a_lost_file_falls_back_to_the_prop(roots, tmp_path):
+    one, two = _result(tmp_path, "one", "ONE"), _result(tmp_path, "two", "TWO")
+    root = create_root(learned_app(one), session_id="lost")
+    root.session.services["learn.programs"]["App/LearnedProgram[qa]"].set("qa", two)
+    root.wait_idle(timeout=5)
+    snap = root.suspend()
+    (tmp_path / "two.json").unlink()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", HydrationWarning)
+        r = hydrate_root(learned_app(one), session_id="lost", snapshot=snap)
+    roots.append(r)
+    assert _seen(r)[0] == "ONE"
+    [m] = r.mismatches
+    assert (m["path"], m["key"], m["reason"]) == (
+        "App/LearnedProgram[qa]", "programs", "result missing")
+
+
+# ---------------------------------------------------------------------------
+# Deprecated: CompiledModulesParticipant keeps working for one release
+# ---------------------------------------------------------------------------
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_deprecated_participant_still_round_trips(tmp_path):
+    with pytest.warns(DeprecationWarning, match="CompiledModulesParticipant is deprecated"):
+        CompiledModulesParticipant()
+
+    def make():
+        return AppRunner(App, default_session=False,
+                         participants=[lambda s: CompiledModulesParticipant(s)],
+                         manifest_store=DirectoryManifestStore(tmp_path / "m"))
+
+    app = make()
+    try:
+        s = app.open_session("old")
+        _swap(s, "qa", "LEARNED QA")
+        m = s.suspend()
+        assert m["participants"]["dspy.compiled"] == {}
+        assert [e["key_str"] for e in m["slices"][DSPY]["compiled"]] == ["Predict:QA:qa"]
+    finally:
+        app.shutdown()
+    app2 = make()
+    try:
+        r = app2.resume("old")
+        assert r.services["seen"][0][0] == "LEARNED QA" and r.degraded == []
+    finally:
+        app2.shutdown()

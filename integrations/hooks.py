@@ -40,15 +40,19 @@ from pyreact.tools import Tool, resolve_tools, use_tools
 from . import telemetry as tm
 from .dspy_integration import DSPyEnv
 
-# Session service filled by integrations.stateful.CompiledModulesParticipant
-# on resume: {module key tuple: dspy state}, applied when the module is built.
+# Deprecated session service filled by integrations.stateful.CompiledModulesParticipant
+# from a legacy manifest: {module key tuple: dspy state}. Hydration now goes
+# through the DSPyProvider's own slice (env.restore).
 RESTORE_SERVICE = "dspy.compiled.restore"
 
 
 def _apply_restored(restore: Dict[Any, Any], env: Optional[DSPyEnv], key: Any, mod: Any) -> Any:
-    """Load a learned state a resumed manifest recorded for ``key`` into the
-    freshly built ``mod`` and mark it compiled (so the next suspend keeps it)."""
-    state = restore.pop(key, None) if restore else None
+    """Load the learned state hydrated for ``key`` (the provider's slice, or a
+    legacy manifest) into the freshly built ``mod`` and mark it compiled (so
+    the next suspend keeps it)."""
+    state = env.restore.pop(key, None) if env is not None and env.restore else None
+    legacy = restore.pop(key, None) if restore else None
+    state = state if state is not None else legacy
     if state is None:
         return mod
     try:
@@ -94,8 +98,9 @@ def _use_program(env: Optional[DSPyEnv], key: Any, live: Any, program: Any) -> A
     idempotent: a new ``program`` object (a re-render after the
     ``LearnedProgram`` source changed) is applied once; ``program=None``
     after a program was applied restores ``live``'s own state (the
-    baseline). The module is marked compiled (``env.compiled``), so the
-    suspend participant, ``:modules`` and optimizers see it as learned.
+    baseline). The module is marked compiled (``env.compiled``), so
+    ``:modules`` and optimizers see it as learned (the ``LearnedProgram``
+    provider dehydrates it, not the DSPy env).
     """
     box = hooks.use_ref(None)
     mine = box.current

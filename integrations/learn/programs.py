@@ -34,6 +34,12 @@ mutation only for apps that have no provider. In the tree,
 
 Providers are transparent (``@component(transparent=True)``): wrapping a
 subtree in one does not change its components' paths.
+
+Suspend / hydrate (ADR 0001): the provider's state is dehydrated with
+``use_dehydrate("programs")`` (:func:`dehydrate_programs`: ``{name: path |
+{"state": ...} | None}``), so ``root.suspend()`` carries the learned program
+-- the one swapped in last, not only the declared prop -- and
+``hydrate_root`` restores it during the provider's first render.
 """
 
 from __future__ import annotations
@@ -45,6 +51,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
+from pyreact.core import report_hydration_mismatch, use_dehydrate
 from pyreact.core.core import _context_stack, component, hooks
 from pyreact.core.provider import create_context
 from pyreact.core.runtime import schedule_rerender
@@ -200,7 +207,7 @@ LearnedContext = create_context(default=None, name="Learned")
 # Sources -> programs
 # ---------------------------------------------------------------------------
 def _tag(program: Any, path: Optional[str], optimizer: Optional[str]) -> Any:
-    # a suspend (CompiledModulesParticipant) can then point at the file
+    # a dehydrated slice can then point at the file instead of inlining it
     for attr, val in (("_pyreact_result_path", path), ("_pyreact_optimizer", optimizer)):
         if val:
             try:
@@ -273,7 +280,7 @@ def _declared_sig(declared: Mapping[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Dehydration (the hook-in point for core use_dehydrate, ADR 0001)
+# Dehydration (the provider's use_dehydrate slice, ADR 0001)
 # ---------------------------------------------------------------------------
 def _plain(obj: Any) -> Any:
     import json
@@ -318,6 +325,23 @@ def hydrate_programs(slice_: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+def _hydrate_checked(slice_: Any) -> Dict[str, Any]:
+    """:func:`hydrate_programs` for the provider: a learned program whose
+    result file is gone is a ``hydration.mismatch``; that name then uses the
+    provider's declared ``src`` (dropped from the hydrated state)."""
+    if not isinstance(slice_, Mapping):
+        raise TypeError(f"a learned-programs slice is a dict {{name: src}}, "
+                        f"got {type(slice_).__name__}")
+    out = hydrate_programs(slice_)
+    for name, src in list(out.items()):
+        if _is_path(src) and not os.path.exists(src):
+            del out[name]
+            report_hydration_mismatch("programs", f"learned program {name!r}: result file "
+                                      f"{os.fspath(src)!r} is gone (using the declared src)",
+                                      name=name, src=os.fspath(src), reason="result missing")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The provider
 # ---------------------------------------------------------------------------
@@ -354,17 +378,15 @@ def _use_learned_provider(declared: Mapping[str, Any], *, watch: bool, interval:
                           children: Any) -> list:
     ctx = _context_stack.get()
     # The provider's state: {name: src}, src a path whenever there is one, so
-    # it is a single JSON-able value ({name: path}) held by ONE hook.
-    # TODO(use_dehydrate): in the migration PR this use_state becomes
-    #   programs, set_programs = use_dehydrate("learned", initial=dict(declared),
-    #       dehydrate=lambda: dehydrate_programs(<current state>),
-    #       hydrate=hydrate_programs)
-    # so the learned program reference survives suspend/resume as state of the
-    # provider (replacing CompiledModulesParticipant for programs given through
-    # a provider). Nothing else here changes: the state is already that one
-    # JSON-able value and every swap goes through set_programs.
+    # it is a single JSON-able value ({name: path}) held by ONE hook. It is
+    # dehydrated with use_dehydrate (ADR 0001): a suspend carries the learned
+    # program reference (a swap included) and hydrate_root gives it back
+    # during the first render, before the children apply it.
+    hydrated = use_dehydrate("programs", dehydrate=lambda: dehydrate_programs(reg._state()),
+                             hydrate=_hydrate_checked)
     state_idx = ctx.hook_idx
-    programs, set_programs = hooks.use_state(dict(declared))
+    programs, set_programs = hooks.use_state(
+        {**declared, **hydrated} if hydrated is not None else dict(declared))
     box = hooks.use_ref(None)
     if box.current is None:
         box.current = {"declared": _declared_sig(declared), "registry": LearnedRegistry(ctx.path)}
