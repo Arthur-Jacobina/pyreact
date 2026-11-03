@@ -79,7 +79,26 @@ class _Registry:
 
 
 _live = _Registry()
-_trace_names = _Registry()  # trace_id -> name of the trace's root boundary
+_trace_info = _Registry()  # trace_id -> {"name", "session_id", "user_id", "turn_id"} of the trace
+
+
+def _remember_trace(trace_id: int, b: Boundary, is_root: bool) -> Dict[str, Any]:
+    """Trace-level facts, set by the root and completed by any span that knows
+    them, so every span of the trace can carry session/user/turn."""
+    info = _trace_info.get(trace_id)
+    if info is None:
+        info = {"name": trace_name(b) if is_root else None}
+        _trace_info.put(trace_id, info)
+    for key, value in (("session_id", b.session_id), ("user_id", b.attrs.get("user_id")),
+                       ("turn_id", b.turn_id)):
+        if value is not None and info.get(key) is None:
+            info[key] = value
+    return info
+
+
+def _trace_name_of(trace_id: int) -> Optional[str]:
+    info = _trace_info.get(trace_id)
+    return info.get("name") if info else None
 
 
 def trace_name(b: Boundary) -> str:
@@ -420,9 +439,7 @@ def otel_middleware(
             record_exception=False, set_status_on_exception=False,
         ) as span:
             keys = _register(b, span)
-            trace_id = span.get_span_context().trace_id
-            if is_root:
-                _trace_names.put(trace_id, trace_name(b))
+            trace_info = _remember_trace(span.get_span_context().trace_id, b, is_root)
             t0 = time.perf_counter()
             result: Any = None
             has_result = False
@@ -440,8 +457,7 @@ def otel_middleware(
                     _live.pop(k, span)
                 try:
                     _finish(span, b, result, has_result, error, capture_content,
-                            max_content_length, enrichers,
-                            _trace_names.get(trace_id), is_root)
+                            max_content_length, enrichers, trace_info, is_root)
                 except Exception:  # telemetry must never break a call
                     pass
                 if metrics is not None:
@@ -456,10 +472,20 @@ def otel_middleware(
 
 def _finish(span: Span, b: Boundary, result: Any, has_result: bool,
             error: Optional[BaseException], capture_content: bool, limit: int,
-            enrichers: Sequence[Enricher], root_name: Optional[str] = None,
+            enrichers: Sequence[Enricher], trace_info: Optional[Dict[str, Any]] = None,
             is_root: bool = False) -> None:
     # The owner fills attrs (model, usage, cost...) during the call: re-read them.
     attrs = {**_base_attributes(b), **_kind_attributes(b)}
+    trace_info = trace_info or {}
+    # Inherit trace-level facts this boundary did not know (e.g. a call made
+    # outside a component): backends group by session/user on every span.
+    if A.SESSION not in attrs and trace_info.get("session_id"):
+        attrs[A.SESSION] = attrs[A.SESSION_ID] = trace_info["session_id"]
+    if A.USER_ID not in attrs and trace_info.get("user_id") is not None:
+        attrs[A.USER_ID] = str(trace_info["user_id"])
+    if A.TURN not in attrs and trace_info.get("turn_id"):
+        attrs[A.TURN] = trace_info["turn_id"]
+    root_name = trace_info.get("name")
     span.update_name(span_name(b))
     if isinstance(error, asyncio.CancelledError):
         attrs[A.CANCELLED] = True
