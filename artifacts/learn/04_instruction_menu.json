@@ -1,0 +1,67 @@
+{
+  "format": "pyreact.learn/1",
+  "created": "2026-11-03T01:49:56",
+  "optimizer": "instruction_menu",
+  "budget": "light",
+  "baseline": 0.3333333333333333,
+  "score": 1.0,
+  "calls": 12,
+  "seconds": 15.17,
+  "train_size": 3,
+  "val_size": 3,
+  "metric": "team_match",
+  "arch": "predict",
+  "signature": "ticket -> team",
+  "signature_class": "__main__:TicketSig",
+  "module_key": null,
+  "details": {
+    "menu_scores": [
+      0.3333333333333333,
+      1.0
+    ],
+    "calls_by_phase": {
+      "baseline": 3,
+      "compile": 6,
+      "evaluate": 3
+    },
+    "log_dir": null
+  },
+  "state": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention. House rules: refunds and charge disputes -> account; login, password and 2FA -> tech; invoices, receipts, payment methods -> billing; any wish to cancel or switch provider -> retention.",
+      "fields": [
+        {
+          "prefix": "Ticket:",
+          "description": "${ticket}"
+        },
+        {
+          "prefix": "Team:",
+          "description": "one of: billing, tech, account, retention"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "baseline_state": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
+      "fields": [
+        {
+          "prefix": "Ticket:",
+          "description": "${ticket}"
+        },
+        {
+          "prefix": "Team:",
+          "description": "one of: billing, tech, account, retention"
+        }
+      ]
+    },
+    "lm": null
+  }
+}

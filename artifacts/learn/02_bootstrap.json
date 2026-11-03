@@ -1,0 +1,73 @@
+{
+  "format": "pyreact.learn/1",
+  "created": "2026-11-03T01:50:00",
+  "optimizer": "bootstrap",
+  "budget": 2,
+  "baseline": 0.5,
+  "score": 0.5,
+  "calls": 7,
+  "seconds": 16.48,
+  "train_size": 6,
+  "val_size": 4,
+  "metric": "route_metric",
+  "arch": "predict",
+  "signature": "ticket -> team",
+  "signature_class": "__main__:TicketSig",
+  "module_key": null,
+  "details": {
+    "calls_by_phase": {
+      "compile": 3,
+      "evaluate": 4
+    },
+    "log_dir": null
+  },
+  "state": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "augmented": true,
+        "ticket": "Can you send me a copy of my March invoice?",
+        "team": "billing"
+      },
+      {
+        "augmented": true,
+        "ticket": "I want to cancel, your app keeps crashing",
+        "team": "retention"
+      }
+    ],
+    "signature": {
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
+      "fields": [
+        {
+          "prefix": "Ticket:",
+          "description": "${ticket}"
+        },
+        {
+          "prefix": "Team:",
+          "description": "one of: billing, tech, account, retention"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "baseline_state": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
+      "fields": [
+        {
+          "prefix": "Ticket:",
+          "description": "${ticket}"
+        },
+        {
+          "prefix": "Team:",
+          "description": "one of: billing, tech, account, retention"
+        }
+      ]
+    },
+    "lm": null
+  }
+}

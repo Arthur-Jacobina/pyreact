@@ -1,0 +1,63 @@
+{
+  "format": "pyreact.learn/1",
+  "created": "2026-11-03T01:51:24",
+  "optimizer": "mipro",
+  "budget": 3,
+  "baseline": 0.5,
+  "score": 0.5,
+  "calls": 31,
+  "seconds": 83.93,
+  "train_size": 6,
+  "val_size": 4,
+  "metric": "route_metric",
+  "arch": "predict",
+  "signature": "ticket -> team",
+  "signature_class": "__main__:TicketSig",
+  "module_key": null,
+  "details": {
+    "best_score": 50.0,
+    "calls_by_phase": {
+      "compile": 27,
+      "evaluate": 4
+    },
+    "log_dir": null
+  },
+  "state": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
+      "fields": [
+        {
+          "prefix": "Ticket:",
+          "description": "${ticket}"
+        },
+        {
+          "prefix": "Team:",
+          "description": "one of: billing, tech, account, retention"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "baseline_state": {
+    "traces": [],
+    "train": [],
+    "demos": [],
+    "signature": {
+      "instructions": "Route the support ticket to one team: billing, tech, account or retention.",
+      "fields": [
+        {
+          "prefix": "Ticket:",
+          "description": "${ticket}"
+        },
+        {
+          "prefix": "Team:",
+          "description": "one of: billing, tech, account, retention"
+        }
+      ]
+    },
+    "lm": null
+  }
+}

@@ -144,6 +144,62 @@ uv run python -m scripts.e2e_turns
 uv run python scripts/e2e_durable.py
 ```
 
+## Learning: architectures & optimizers
+
+Same React analogy, one level up: the **architecture** is *how* a component
+thinks (a prop you can swap), an **optimizer** is a *build step* that produces
+a better program, **hot swap** ships it into the running app (HMR), and
+**events** are the trace you debug and learn from (`integrations.learn`).
+
+```python
+from integrations import use_agent_call
+from integrations.learn import dataset_from_events, split, optimize, exact_match
+
+call = use_agent_call("context, question -> answer", arch="cot")      # or "predict", "react",
+#                                         "rlm", "pot", "refine", "best_of_n", your own...
+data = dataset_from_events(app.events, "supervisor", min_score=1.0)  # runs + :feedback
+train, val = split(data, val=0.3)
+result = optimize(router, trainset=train, valset=val, metric=exact_match("name"),
+                  optimizer="gepa", budget=40, lm=lm, reflection_lm=lm)  # or mipro, bootstrap...
+print(result.report(), result.diff())        # score before -> after, instructions/demos diff
+result.save("artifacts/router.json"); result.hot_swap(app, "supervisor")
+```
+
+- **Architectures**: `use_module(sig, arch=..., **kw)` + `use_call`, or `use_agent_call(...)`;
+  every arch has the same `Call` shape, `llm.*` events and cancellation (RLM runs in a worker
+  thread and stops at the next REPL step). `register_architecture(name, factory)`,
+  `list_architectures()`.
+- **Optimizers**: `optimize(..., optimizer="gepa"|"mipro"|"bootstrap"|"bootstrap_rs"|"simba"|"copro")`,
+  `budget="light"` or an int (GEPA: metric calls, MIPRO: trials, bootstrap: demos, ...;
+  `python -m integrations.learn list`). `register_optimizer(name, adapter)`.
+- **Metrics**: write `metric(example, pred) -> float | bool | (score, "why")` once; it is adapted
+  to GEPA's feedback signature and to every other optimizer. Helpers: `exact_match(field)`,
+  `contains(field)`, `llm_judge(criteria, lm=...)`.
+- **Datasets**: `dataset_from_events(events, key)` takes `app.events`, `Event`s/dicts, a JSONL
+  path or a session log; `feedback` events (`send_feedback`, `:feedback - name=shipping`) become
+  scores and corrected labels.
+- **CLI**: `python -m integrations.learn optimize mod:program --data events.jsonl --module-key
+  supervisor --optimizer gepa --budget 40 --out artifacts/x.json`; `inspect x.json`; `diff a.json b.json`.
+- **Examples** (`examples/learn/`, dev LM via `claude -p`): `01_architectures`,
+  `02_optimizers`, `03_live_feedback_loop [--demo]`, `04_custom_architecture_and_optimizer`.
+
+### Debug checklist
+
+1. **Which program ran?** `:modules` (key, arch, compiled?, swaps) and `:inspect <key>` /
+   `inspect_program(program)` (instructions + demos actually in use).
+2. **What did the LM see?** `:explain [call_id]` / `explain(last=True)`: exact prompt messages
+   and raw completions (RLM: every REPL step). `set_debug(True)` also puts them on `llm.end`.
+3. **What happened, in order?** `:events llm.*`, `:turns`, `:usage` (llm events land in the
+   session log: latency, tokens, `lm_calls`, `rlm.iteration` progress).
+4. **Is the data right?** `dataset_from_events(...)` → check labels (`feedback.expected`
+   corrections win) and `feedback_text`; empty → rate more turns with `:feedback`.
+5. **Is the metric right?** run it on one example: it must return a number/bool/(score, text);
+   `evaluate(program, val, metric, lm=lm)` returns per-example rows with feedback.
+6. **Did it improve?** `result.report()` (baseline → score, LM calls) and `result.diff()`;
+   GEPA: a reused `log_dir` is never resumed silently (`resume=True` to continue).
+7. **Is the new program live?** after `result.hot_swap(app, key)` / `:optimize`, `:modules`
+   shows `compiled swaps=1`, and the next `:explain` shows the new instructions.
+
 ## Troubleshooting
 
 ### Error: "DSPy context not available"
