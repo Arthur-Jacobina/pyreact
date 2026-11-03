@@ -19,6 +19,7 @@ the session doing the call (and the process-global bus), with the boundary's
     recovery.exhausted  {kind, name, boundary_id, attempts, error}
     recovery.fallback   {kind, name, boundary_id, to, error}
     recovery.circuit    {kind, name, boundary_id, key, state, prev, failures, error}
+    recovery.timeout    {kind, name, boundary_id, attempt, seconds}
 
 DSPy-aware recovery (switching models) lives in :mod:`integrations.recovery`.
 """
@@ -37,6 +38,7 @@ from .harness import Blocked, Boundary, Middleware, Next, middleware
 
 __all__ = [
     "Backoff",
+    "BoundaryTimeout",
     "CircuitOpen",
     "circuit_breaker",
     "RetryOn",
@@ -47,6 +49,7 @@ __all__ = [
     "publish_recovery",
     "retry",
     "retry_after_of",
+    "timeout",
 ]
 
 Backoff = Callable[[int], float]  # retry number (1, 2, ...) -> seconds
@@ -452,3 +455,56 @@ def circuit_breaker(
     _breaker.state = state  # type: ignore[attr-defined]
     _breaker.reset = reset  # type: ignore[attr-defined]
     return _breaker
+
+
+# ---------------------------------------------------------------------------
+# timeout
+# ---------------------------------------------------------------------------
+class BoundaryTimeout(TimeoutError):
+    """A boundary call took longer than its :func:`timeout` (retryable)."""
+
+    def __init__(self, b: Boundary, seconds: float):
+        super().__init__(f"{b.kind} {b.name!r} timed out after {seconds:g}s")
+        self.boundary = b
+        self.seconds = seconds
+
+
+def timeout(
+    seconds: Union[float, Callable[[Boundary], Optional[float]]],
+    kinds: Optional[Iterable[str]] = DEFAULT_KINDS,
+    *,
+    name: str = "timeout",
+) -> Middleware:
+    """Bound each run of the call to ``seconds`` (a number, or
+    ``fn(b) -> seconds | None``; ``None`` = no limit for that call).
+
+    On expiry the inner call is cancelled (``CancelledError`` inside it, so
+    ``finally`` blocks and async LM/tool clients clean up) and
+    :class:`BoundaryTimeout` (a ``TimeoutError``) is raised; a
+    ``TimeoutError`` raised by the call itself passes through unchanged.
+    Place it innermost to bound each attempt of an outer :func:`retry`.
+    Work running in a worker thread (sync tools, sync LMs via
+    ``asyncio.to_thread``) cannot be interrupted: the boundary returns on
+    time, the thread finishes in the background.
+
+    Sets ``b.attrs["timed_out"] = True`` and publishes ``recovery.timeout``.
+    """
+
+    @middleware(kinds=kinds, name=name)
+    async def _timeout(b: Boundary, call_next: Next) -> Any:
+        limit = seconds(b) if callable(seconds) else seconds
+        if limit is None:
+            return await call_next(b)
+        cm = asyncio.timeout(float(limit))
+        try:
+            async with cm:
+                return await call_next(b)
+        except TimeoutError:
+            if not cm.expired():
+                raise
+            b.attrs["timed_out"] = True
+            publish_recovery("recovery.timeout", {
+                **_base(b), "attempt": b.attempt, "seconds": float(limit)}, b)
+            raise BoundaryTimeout(b, float(limit)) from None
+
+    return _timeout
