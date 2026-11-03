@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Uni
 import dspy
 
 from pyreact.core.core import _context_stack, hooks
+from pyreact.core.harness import Blocked, Boundary, Harness, HarnessContext, resolve_harness, through
 from pyreact.core.runtime import schedule_rerender, spawn
 from pyreact.tools import Tool, resolve_tools, use_tools
 
@@ -54,6 +55,7 @@ __all__ = [
 ]
 
 POLICIES = ("replace", "parallel", "ignore")
+_NO_RESULT = object()
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +330,22 @@ async def invoke_module(
     on_chunk: Optional[Callable[[str, str, bool], None]] = None,
     call_id: Optional[str] = None,
     debug: Optional[bool] = None,
+    harness: Optional[Harness] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Run one module call with per-call settings and publish llm.* events.
 
     Returns ``(result, usage)`` (``usage["call_id"]`` identifies the call for
     ``explain`` / feedback). Usable outside components too (scripts,
     evaluation). On failure the exception gets a ``usage`` attribute.
+
+    The call is an ``"llm"`` boundary (:func:`pyreact.core.harness.through`):
+    ``harness`` (default: process-wide + the providers of the calling
+    component) wraps it. Middleware sees ``b.inputs`` and ``b.attrs``
+    (``call_id``, ``module_key``, ``arch``, ``model``; after the call
+    ``usage``, ``cost``, ``latency``, ``outputs``, ``lm_calls``); calling
+    ``call_next`` again re-runs the module, not calling it short-circuits
+    with the middleware's prediction, :class:`~pyreact.core.harness.Blocked`
+    fails the call (``llm.blocked`` + ``llm.error``).
 
     Architectures with a custom runner (e.g. ``rlm``: worker thread +
     cooperative cancellation) are awaited through it; everything else via
@@ -383,8 +395,9 @@ async def invoke_module(
     def _status(message):
         pub("llm.status", {"call_id": call_id, "module": label, "message": message})
 
-    def _record(result=None, error=None, latency=None):
-        lm_calls = tm.lm_calls_of(recorder.history)
+    def _record(result=None, error=None, latency=None, lm_calls=None):
+        if lm_calls is None:
+            lm_calls = tm.lm_calls_of(recorder.history)
         tm.record_call({
             "call_id": call_id, "module": label, "module_key": base.get("module_key"),
             "arch": arch, "component": component, "turn_id": turn_id, "model": model,
@@ -393,23 +406,40 @@ async def invoke_module(
         })
         return lm_calls
 
+    extra: Dict[str, Any] = {}
+
+    async def _attempt(b: Boundary):
+        # One run of the module (a retrying middleware calls this again).
+        nonlocal extra
+        args = b.inputs
+        t_run = time.perf_counter()
+        try:
+            with dspy.context(**overrides):
+                if runner is not None:
+                    result, more = await runner(
+                        module, args, call_id=call_id,
+                        publish=lambda kind, payload: pub(kind, {"module": label, **payload}),
+                    )
+                    extra = dict(more or {})
+                elif stream_fields:
+                    result = await _stream_call(module, args, stream_fields, _chunk, _status)
+                else:
+                    result = await _plain_call(module, args)
+        except BaseException:
+            _annotate(b, recorder, t_run)
+            raise
+        _annotate(b, recorder, t_run, result)
+        return result
+
     pub("llm.start", {**base, "arch": arch, "inputs": tm.brief(inputs),
                       "input_chars": _input_chars(inputs), "stream": bool(stream_fields)})
     token = tm.enter_scope(tm.CallScope(call_id, label, component, turn_id))
     t0 = time.perf_counter()
-    extra: Dict[str, Any] = {}
     try:
-        with dspy.context(**overrides):
-            if runner is not None:
-                result, extra = await runner(
-                    module, inputs, call_id=call_id,
-                    publish=lambda kind, payload: pub(kind, {"module": label, **payload}),
-                )
-                extra = dict(extra or {})
-            elif stream_fields:
-                result = await _stream_call(module, inputs, stream_fields, _chunk, _status)
-            else:
-                result = await _plain_call(module, inputs)
+        result = await through(
+            "llm", label, inputs, _attempt, harness=harness,
+            call_id=call_id, module_key=base.get("module_key"), arch=arch, model=model,
+        )
     except asyncio.CancelledError:
         _record(error="cancelled", latency=time.perf_counter() - t0)
         pub("llm.cancel", {**base, "latency": time.perf_counter() - t0})
@@ -420,6 +450,10 @@ async def invoke_module(
         lm_calls = _record(error=repr(exc), latency=time.perf_counter() - t0)
         payload = {**base, "latency": time.perf_counter() - t0, "usage": usage,
                    "cost": usage["cost"], "error": repr(exc)}
+        if isinstance(exc, Blocked):
+            info = {"reason": exc.reason, "by": exc.by, "message": str(exc)}
+            pub("llm.blocked", {**base, **info})
+            payload["blocked"] = info
         if debug:
             payload["lm_calls"] = lm_calls
         pub("llm.error", payload)
@@ -440,6 +474,18 @@ async def invoke_module(
         payload["lm_calls"] = lm_calls
     pub("llm.end", payload)
     return result, usage
+
+
+def _annotate(b: Boundary, recorder: "tm.UsageRecorder", t_run: float, result: Any = _NO_RESULT):
+    """Fill the llm boundary's after-call attrs (usage so far, across attempts)."""
+    usage = recorder.summary()
+    b.attrs["usage"] = {k: usage[k] for k in ("prompt_tokens", "completion_tokens",
+                                              "total_tokens")}
+    b.attrs["cost"] = usage["cost"]
+    b.attrs["latency"] = time.perf_counter() - t_run
+    b.attrs["lm_calls"] = tm.lm_calls_of(recorder.history)
+    if result is not _NO_RESULT:
+        b.attrs["outputs"] = tm.outputs_of(result)
 
 
 def _input_chars(inputs: dict) -> int:
@@ -531,6 +577,7 @@ def _use_call_machine(
     ref = hooks.use_memo(lambda: {"alive": True, "tasks": set(), "latest": None}, [])
     ctx = _context_stack.get()
     env = hooks.use_context(_dspy_ctx())  # optional: works without a provider if lm=...
+    scoped = hooks.use_context(HarnessContext)  # providers above us (see _do)
 
     # Latest config read at run time (stable run/cancel, never stale).
     ref["cfg"] = {
@@ -545,6 +592,7 @@ def _use_call_machine(
         "stream_fields": stream_fields,
         "throttle": throttle,
         "debug": (env.settings.get("debug") if env is not None else None) or None,
+        "harness": scoped,
     }
 
     def _mount():
@@ -600,6 +648,8 @@ def _use_call_machine(
                     stream_fields=cfg["stream_fields"],
                     on_chunk=_on_chunk if cfg["stream_fields"] else None,
                     call_id=call_id, debug=cfg["debug"],
+                    # scoped middleware captured at render + process-wide now
+                    harness=resolve_harness(cfg["harness"]),
                 )
             except Exception as exc:
                 result, usage, err = None, getattr(exc, "usage", None), exc
