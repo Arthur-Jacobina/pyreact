@@ -5,10 +5,27 @@ from weakref import WeakSet
 from . import core as _core
 from .core import VNode
 from .runtime import schedule_rerender, report_error, spawn, current_owner
+import functools
 import inspect
 import warnings
 
 _MISSING = object()
+
+
+def is_updater(value: Any) -> bool:
+    """Whether ``set_state(value)`` treats ``value`` as an updater
+    (``value(previous) -> next``) rather than as the next value.
+
+    React calls any function passed to ``setState``. In Python many values
+    are callable (a DSPy module, a class instance with ``__call__``, a class),
+    so only *functions* are updaters: plain functions and lambdas, bound
+    methods, builtins and ``functools.partial``. Anything else -- a callable
+    object included -- is stored as the value. The same rule makes a function
+    passed to ``use_state(initial)`` a lazy initializer (called once, on
+    mount).
+    """
+    return (inspect.isfunction(value) or inspect.ismethod(value)
+            or inspect.isbuiltin(value) or isinstance(value, functools.partial))
 
 # Why the cleanup currently running runs (see ``use_cleanup_reason``).
 CLEANUP_REASONS = ("unmount", "deps", "hidden", "suspend")
@@ -212,9 +229,18 @@ class HookContext:
         return HookContext._services if services is None else services
 
     def use_state(self, initial):
+        """``(value, set_value)`` (React ``useState``); rerenders when
+        ``set_value`` changes the value (``!=``).
+
+        Functions are special (see :func:`is_updater`): ``initial`` that is a
+        function (lambda, ``def``, bound method, ``partial``) is a lazy
+        initializer, called once on mount; ``set_value(fn)`` with a function
+        is an updater, ``fn(previous) -> next``. Any other value -- a callable
+        object such as a DSPy module included -- is stored as is.
+        """
         idx = self.hook_idx
         if idx >= len(self.hooks):
-            self.hooks.append(initial)
+            self.hooks.append(initial() if is_updater(initial) else initial)
 
         def set_state(val):
             nonlocal idx
@@ -222,7 +248,7 @@ class HookContext:
                 self, "_mounted", True
             ):  # Ignore state updates after unmount
                 return
-            if callable(val):
+            if is_updater(val):  # callable objects (modules...) are values
                 val = val(self.hooks[idx])
 
             if val != self.hooks[idx]:

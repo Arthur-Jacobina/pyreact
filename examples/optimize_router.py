@@ -233,9 +233,7 @@ def make_router_app(models: Dict[str, Any], routes: List[Tuple[str, str, int]]):
     @component
     def RouterDemo():
         program, set_program = hooks.use_state(None)  # None: the baseline prompt
-        # set_program(lambda _: p): a program is callable, so never pass it bare
-        use_imperative_handle("learned", lambda: SimpleNamespace(
-            swap=lambda p: set_program(lambda _old: p)), [])
+        use_imperative_handle("learned", lambda: SimpleNamespace(swap=set_program), [])
         return [DSPyProvider(key="dspy", models=models, children=[
             LearnedProgram(key="supervisor", src=program, children=[RouterHome(key="home")]),
         ])]

@@ -1,5 +1,5 @@
 # pyreact/core/__init__.py
-from .hook import HookContext, Ref, use_cleanup_reason
+from .hook import HookContext, Ref, is_updater, use_cleanup_reason
 from .activity import Activity
 from .dehydrate import (
     SNAPSHOT_FORMAT,
@@ -32,6 +32,7 @@ from .harness import Blocked, Boundary, HarnessProvider, current_boundary, throu
 __all__ = [
     "HookContext",
     "Ref",
+    "is_updater",
     "use_cleanup_reason",
     "Activity",
     "Hydrating",

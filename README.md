@@ -22,7 +22,7 @@ Key pieces:
 ### 3) State/hooks ↔ Agent internal memory
 - React `useState`/`useReducer` manage local state and rerender on change.
 - Pyreact mirrors this in `HookContext`:
-  - `use_state(initial)`: returns `[state, set_state]`; calls `schedule_rerender` when value changes.
+  - `use_state(initial)`: returns `[state, set_state]`; calls `schedule_rerender` when value changes. As in React, a function is special: `use_state(fn)` is a lazy initializer and `set_state(fn)` an updater (`fn(prev) -> next`). In Python only *functions* count (plain functions, lambdas, bound methods, builtins, `functools.partial`; `pyreact.core.is_updater`): callable objects such as a DSPy module are stored as values, so `set_program(compiled)` just works.
   - `use_reducer(reducer, initial, init_fn=None, deps=None)`: returns `[state, dispatch]`; supports lazy init and dependency‑based re‑init.
   - `use_memo(factory, deps)`, `use_callback(fn, deps)`: memoization primitives.
   - `use_ref(initial)`: a `Ref` whose `.current` persists across renders (React `useRef`); mutating it does not rerender. Use it for "latest value" boxes read by long-lived callbacks.
@@ -97,7 +97,7 @@ If you know React, you know pyreact: every public hook, with its React counterpa
 
 | Area | Hook | Purpose | React |
 |---|---|---|---|
-| state | `hooks.use_state(initial)` | `(value, set_value)`; rerenders when the value changes | `useState` |
+| state | `hooks.use_state(initial)` | `(value, set_value)`; rerenders when the value changes; a *function* is a lazy initializer / an updater, a callable object (e.g. a DSPy module) is a value | `useState` |
 | state | `hooks.use_reducer(reducer, initial, init_fn=None, deps=None)` | `(state, dispatch)`; re-init when `deps` change | `useReducer` |
 | state | `hooks.use_memo(factory, deps)` / `hooks.use_callback(fn, deps)` | memoized value / function | `useMemo` / `useCallback` |
 | effects | `hooks.use_effect(fn, deps)` | side effect after commit (sync or async), returns an optional cleanup | `useEffect` |
