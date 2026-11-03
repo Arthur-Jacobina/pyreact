@@ -131,6 +131,8 @@ class TurnManager:
         self._waiters: Dict[str, List[asyncio.Future]] = {}
         self._interrupted: set = set()  # turns that had tasks cancelled
         self._interrupt_req: set = set()  # turns asked to give way
+        self._abort_req: set = set()  # turns whose tasks are all cancelled
+        self._held = False  # hold(): queued turns wait (session suspending)
         self._listeners: List[TurnListener] = []
         self.store: Optional[TurnStore] = None  # see TurnStore / resume()
         self._pump: Optional[asyncio.Task] = None
@@ -252,6 +254,13 @@ class TurnManager:
             nxt = next(self._counter)
             self._counter = itertools.count(max(nxt, int(index)))
 
+    def next_index(self) -> int:
+        """Index the next allocated turn will get (does not allocate it)."""
+        with self._lock:
+            nxt = next(self._counter)
+            self._counter = itertools.count(nxt)
+        return nxt
+
     def new_turn(self, text: str, *, source: str = "term") -> Turn:
         """Allocate a Turn (thread-safe) without queueing it."""
         with self._lock:
@@ -325,6 +334,44 @@ class TurnManager:
             self._interrupt_req.add(self._active.id)
             self._cancel_tasks(self._active, only_policy="interrupt")
 
+    def abort_active(self) -> Optional[Turn]:
+        """Cancel *every* task of the active turn, whatever its policy (it
+        ends ``interrupted``). Used to suspend a session mid-turn. Returns the
+        aborted turn, if any. Must run on the render loop."""
+        turn = self._active
+        if turn is not None:
+            self._abort_req.add(turn.id)
+            self._cancel_tasks(turn, only_policy=None)
+        return turn
+
+    def hold(self) -> None:
+        """Stop starting queued turns (the active one runs on) until
+        :meth:`release`. Must run on the render loop."""
+        self._held = True
+
+    def release(self) -> None:
+        """Undo :meth:`hold`: queued turns start again."""
+        self._held = False
+        if self._queue:
+            self._ensure_pump()
+
+    @property
+    def held(self) -> bool:
+        return self._held
+
+    def abandon(self, status: str = "abandoned") -> List[Turn]:
+        """Drop the queued turns, resolving their waiters with ``status``
+        (the session is going away). Returns the dropped turns."""
+        dropped, self._queue = list(self._queue), deque()
+        ids = {t.id for t in dropped}
+        if self._active is not None:
+            ids.add(self._active.id)
+        for tid in ids:
+            for fut in self._waiters.pop(tid, []):
+                if not fut.done():
+                    fut.set_result({"status": status, "duration": 0.0})
+        return dropped
+
     async def wait(self, turn_id: str) -> Dict[str, Any]:
         """Wait until ``turn_id`` ends; returns ``{"status", "duration"}``."""
         res = self._results.get(turn_id)
@@ -355,10 +402,11 @@ class TurnManager:
         while len(self._history) > self.max_history:
             self._history.popitem(last=False)
 
-    def _cancel_tasks(self, turn: Turn, *, only_policy: str) -> None:
+    def _cancel_tasks(self, turn: Turn, *, only_policy: Optional[str]) -> None:
         cancelled = False
         for t in runtime.pending_turn_tasks(turn.id):
-            if _effective_policy(runtime.task_owner(t), self.policy) == only_policy:
+            if (only_policy is None
+                    or _effective_policy(runtime.task_owner(t), self.policy) == only_policy):
                 t.cancel()
                 cancelled = True
         if cancelled:
@@ -376,7 +424,7 @@ class TurnManager:
         # errors) to the session that owns this manager.
         if self._owner is not None:
             runtime.current_owner.set(self._owner)
-        while self._queue:
+        while self._queue and not self._held:
             turn = self._queue.popleft()
             try:
                 await self._process(turn)
@@ -466,7 +514,9 @@ class TurnManager:
     async def _wait_settled(self, turn: Turn, poll: float = 0.02) -> None:
         tid = turn.id
         while True:
-            if tid in self._interrupt_req:
+            if tid in self._abort_req:
+                self._cancel_tasks(turn, only_policy=None)
+            elif tid in self._interrupt_req:
                 self._cancel_tasks(turn, only_policy="interrupt")
             pending = runtime.pending_turn_tasks(tid)
             if pending:
@@ -487,6 +537,7 @@ class TurnManager:
             runtime.set_active_turn(None, scope=self)
         self._interrupted.discard(turn.id)
         self._interrupt_req.discard(turn.id)
+        self._abort_req.discard(turn.id)
         runtime.pop_turn_errors(turn.id)
         res = {"status": status, "duration": round(time.time() - t0, 4)}
         self._results[turn.id] = res

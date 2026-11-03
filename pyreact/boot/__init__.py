@@ -8,6 +8,14 @@ from .terminal import (
 from .web import make_web_app, run_web
 from .app_runner import AppRunner
 from .session import Session, current_session, session_of, DEFAULT_SESSION_ID
+from .stateful import (
+    DirectoryManifestStore,
+    ManifestError,
+    ManifestStore,
+    MemoryManifestStore,
+    SuspendError,
+    load_manifest,
+)
 
 __all__ = [
     "run_web",
@@ -18,6 +26,12 @@ __all__ = [
     "current_session",
     "session_of",
     "DEFAULT_SESSION_ID",
+    "ManifestStore",
+    "MemoryManifestStore",
+    "DirectoryManifestStore",
+    "ManifestError",
+    "SuspendError",
+    "load_manifest",
     "read_terminal_and_invoke",
     "register_command",
     "handle_command",

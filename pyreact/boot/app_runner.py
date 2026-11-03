@@ -14,6 +14,16 @@ from pyreact.core.turns import POLICIES, TurnManager
 from pyreact.web.console import MessageBuffer
 from pyreact.observability import install_session_error_events
 from .session import DEFAULT_SESSION_ID, Session
+from .stateful import (
+    ManifestError,
+    ManifestStore,
+    MemoryManifestStore,
+    SuspendError,
+    check_manifest,
+    load_manifest,
+)
+
+IDLE_POLICIES = ("close", "suspend")
 
 
 def _accepts_arg(fn: Callable[..., Any]) -> bool:
@@ -62,6 +72,9 @@ class AppRunner:
         session_id: str = DEFAULT_SESSION_ID,
         default_session: bool = True,
         participants: Iterable[Callable[..., Any]] = (),
+        manifest_store: Optional[ManifestStore] = None,
+        idle_policy: str = "close",
+        auto_resume: Optional[bool] = None,
     ):
         """``turn_policy``: default ``"queue"`` or ``"interrupt"`` for every
         session (see ``pyreact.core.turns``); ``open_session`` may override it.
@@ -72,10 +85,24 @@ class AppRunner:
         ``participants``: factories of checkpoint participants added to every
         session when it opens (see :meth:`add_participant`); registered
         before the default session opens.
+
+        Stateful sessions (see ``pyreact.boot.stateful``):
+        ``manifest_store`` is where :meth:`Session.suspend` writes manifests
+        and :meth:`resume` reads them (default: in memory).
+        ``idle_policy="suspend"`` makes idle reaping
+        (:meth:`close_idle_sessions`) suspend sessions instead of closing
+        them; ``auto_resume`` (default: on with that policy) makes
+        ``open_session(id)`` resume a session that has a manifest.
         """
         if turn_policy not in POLICIES:
             raise ValueError(f"turn_policy must be 'queue' or 'interrupt', got {turn_policy!r}")
+        if idle_policy not in IDLE_POLICIES:
+            raise ValueError(f"idle_policy must be one of {IDLE_POLICIES}, got {idle_policy!r}")
         self._turn_policy = turn_policy
+        self.manifest_store: ManifestStore = (
+            manifest_store if manifest_store is not None else MemoryManifestStore())
+        self.idle_policy = idle_policy
+        self.auto_resume = (idle_policy == "suspend") if auto_resume is None else bool(auto_resume)
         self._app_component_fn = app_component_fn
         self._open_default = bool(default_session)
         self._default_id = session_id
@@ -272,6 +299,15 @@ class AppRunner:
         return sess, True
 
     async def _aopen_on_loop(self, session_id, app, turn_policy=None) -> Session:
+        if self.auto_resume:
+            cur = self._sessions.get(session_id)
+            if cur is None or cur.closed:
+                manifest = self.manifest_store.load(session_id)
+                if manifest is not None:
+                    return await self._aresume_on_loop(
+                        session_id, check_manifest(manifest), app, turn_policy,
+                        resume_turns=True, wait=False, consume=True,
+                        store=self.manifest_store)
         sess, created = self._open_on_loop(session_id, app, turn_policy)
         if created:
             # Commit the first render (and its effects, e.g. input
@@ -293,7 +329,10 @@ class AppRunner:
         Blocks until the first render is committed. Thread-safe; from inside
         a running event loop prefer :meth:`aopen_session`. Called on the
         runner's own loop thread (e.g. from an effect) it returns immediately
-        without waiting for the first render.
+        without waiting for the first render (and never auto-resumes).
+
+        With ``auto_resume``, a session that is not open but has a manifest
+        in ``manifest_store`` is resumed (:meth:`resume`) instead.
         """
         sid = session_id or uuid.uuid4().hex
         if self._on_loop_thread():
@@ -357,10 +396,22 @@ class AppRunner:
         The default session is never closed. ``keep(session)`` returning True
         also protects a session (e.g. one with a connected socket). Returns the
         ids closed. Blocking; see :meth:`aclose_idle_sessions`.
+
+        With ``idle_policy="suspend"`` idle sessions are suspended
+        (``reason="idle"``) instead; one that fails to suspend stays open
+        (the error is reported) and is not in the result.
         """
         closed = []
         for sid in self._idle_session_ids(ttl, keep):
-            if self.close_session(sid, reason="idle"):
+            if self.idle_policy == "suspend":
+                sess = self.get_session(sid)
+                try:
+                    if sess is not None and not sess.closed:
+                        sess.suspend(reason="idle")
+                        closed.append(sid)
+                except (SuspendError, RuntimeError) as exc:
+                    runtime.report_error(exc, None, "idle-suspend")
+            elif self.close_session(sid, reason="idle"):
                 closed.append(sid)
         return closed
 
@@ -370,9 +421,167 @@ class AppRunner:
         """Async :meth:`close_idle_sessions`."""
         closed = []
         for sid in self._idle_session_ids(ttl, keep):
-            if await self.aclose_session(sid, reason="idle"):
+            if self.idle_policy == "suspend":
+                sess = self.get_session(sid)
+                try:
+                    if sess is not None and not sess.closed:
+                        await sess.asuspend(reason="idle")
+                        closed.append(sid)
+                except (SuspendError, RuntimeError) as exc:
+                    runtime.report_error(exc, None, "idle-suspend")
+            elif await self.aclose_session(sid, reason="idle"):
                 closed.append(sid)
         return closed
+
+    # -------------------------------
+    # Suspend / resume (stateful sessions)
+    # -------------------------------
+    def suspend_session(self, session_id: str, **kw: Any) -> Dict[str, Any]:
+        """:meth:`Session.suspend` by id (``KeyError`` if not open)."""
+        sess = self.get_session(session_id)
+        if sess is None or sess.closed:
+            raise KeyError(f"no open session {session_id!r}")
+        return sess.suspend(**kw)
+
+    async def asuspend_session(self, session_id: str, **kw: Any) -> Dict[str, Any]:
+        """Async :meth:`suspend_session`."""
+        sess = self.get_session(session_id)
+        if sess is None or sess.closed:
+            raise KeyError(f"no open session {session_id!r}")
+        return await sess.asuspend(**kw)
+
+    def _manifest_for(self, session_id: str, manifest: Any, store: Optional[ManifestStore]):
+        """-> (manifest dict, store it came from or None)."""
+        if manifest is None:
+            store = store if store is not None else self.manifest_store
+            found = store.load(session_id)
+            if found is None:
+                raise KeyError(f"no manifest for session {session_id!r} in {store!r}")
+            return check_manifest(found), store
+        if isinstance(manifest, dict):
+            return check_manifest(manifest), None
+        return load_manifest(manifest), None  # a path
+
+    async def _aresume_on_loop(self, session_id: str, manifest: Dict[str, Any], app,
+                               turn_policy, *, resume_turns: bool, wait: bool,
+                               consume: bool, store: Optional[ManifestStore] = None
+                               ) -> Session:
+        t0 = time.time()
+        if manifest.get("session_id") != session_id:
+            raise ManifestError(f"manifest is for session {manifest.get('session_id')!r}, "
+                                f"not {session_id!r}")
+        with self._sessions_lock:
+            cur = self._sessions.get(session_id)
+            if cur is not None and not cur.closed:
+                raise RuntimeError(f"session {session_id!r} is already open")
+            policy = turn_policy or manifest.get("turn_policy") or self._turn_policy
+            if policy not in POLICIES:
+                policy = self._turn_policy
+            sess = self._new_session(session_id, app, policy)
+        sess.resumed_from = manifest
+        sess._resume_turns = bool(resume_turns)
+        if session_id == self._default_id and self._default is None:
+            self._default = sess
+        self._opened(sess, resumed=True)
+        fragments = manifest.get("participants") or {}
+        for name in fragments:
+            if name not in sess.participants:
+                sess.degrade(name, "no participant registered for this fragment")
+        restored = []
+        for p in sess.participants:
+            if p.name not in fragments:
+                continue
+            try:
+                await p.resume(sess, fragments[p.name])
+                restored.append(p)
+            except Exception as exc:
+                sess.degrade(p.name, "resume failed", error=f"{type(exc).__name__}: {exc}")
+        sess._mount()
+        await sess._drain()
+        for p in restored:
+            fn = getattr(p, "resumed", None)
+            if callable(fn):
+                try:
+                    await fn(sess)
+                except Exception as exc:
+                    sess.degrade(p.name, "resumed() failed", error=f"{type(exc).__name__}: {exc}")
+        if resume_turns:
+            for t in sess.turns.pending_turns():  # a crash before the suspend
+                try:
+                    sess.turns.resume(t.id)
+                    sess._resumed_turns.append(t.id)
+                except Exception as exc:
+                    runtime.report_error(exc, sess.root, "resume")
+        if consume and store is not None:
+            try:
+                store.delete(session_id)
+            except Exception as exc:
+                runtime.report_error(exc, sess.root, "resume")
+        ok = [p.name for p in restored
+              if p.name not in {d["participant"] for d in sess.degraded}]
+        sess.event_bus.publish("session.resumed", {
+            "session_id": session_id, "turn_seq": manifest.get("turn_seq"),
+            "suspended_at": manifest.get("suspended_at"), "participants": ok,
+            "degraded": [d["participant"] for d in sess.degraded],
+            "turns": list(sess._resumed_turns), "duration": round(time.time() - t0, 4)})
+        if wait:
+            for tid in list(sess._resumed_turns):
+                await sess.turns.wait(tid)
+        return sess
+
+    def resume(
+        self,
+        session_id: str,
+        manifest: Any = None,
+        *,
+        store: Optional[ManifestStore] = None,
+        app: Optional[Callable] = None,
+        turn_policy: Optional[str] = None,
+        resume_turns: bool = True,
+        consume: bool = True,
+        wait: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Session:
+        """Re-open a suspended session (same id) from its manifest.
+
+        ``manifest``: a manifest dict, a path to one, or ``None`` to load it
+        from ``store`` (default: ``manifest_store``). Steps: the session is
+        created; ``open`` hooks run (participant factories register their
+        participants); ``session.opened`` (``resumed: true``); each
+        participant's ``resume(session, fragment)`` -- **before the first
+        render**; the tree mounts; optional ``resumed(session)`` hooks; then
+        with ``resume_turns`` the turns the suspend carried and those a
+        ``TurnStore`` saw cut short are queued again; ``session.resumed``.
+
+        Failure semantics: the resume never fails because of one participant.
+        A fragment nobody claims, or a participant that raises, is recorded
+        in ``session.degraded`` and published as ``session.resume.degraded``;
+        the session goes on with what was restored (e.g. a fresh sandbox).
+
+        ``consume`` (default) deletes the manifest from the store it was
+        loaded from once resumed (an old manifest must not be resumed twice).
+        ``wait=True`` blocks until the re-run turns end.
+        """
+        m, src = self._manifest_for(session_id, manifest, store)
+        if self._on_loop_thread():
+            raise RuntimeError("AppRunner.resume() blocks; use 'await app.aresume(...)' on the loop")
+        fut = self._submit(self._aresume_on_loop(
+            session_id, m, app, turn_policy, resume_turns=resume_turns, wait=wait,
+            consume=consume, store=src))
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"session {session_id!r} not resumed after {timeout}s") from None
+
+    async def aresume(self, session_id: str, manifest: Any = None, *,
+                      store: Optional[ManifestStore] = None, app: Optional[Callable] = None,
+                      turn_policy: Optional[str] = None, resume_turns: bool = True,
+                      consume: bool = True, wait: bool = False) -> Session:
+        """Async :meth:`resume`."""
+        m, src = self._manifest_for(session_id, manifest, store)
+        return await asyncio.wrap_future(self._submit(self._aresume_on_loop(
+            session_id, m, app, turn_policy, resume_turns=resume_turns, wait=wait,
+            consume=consume, store=src)))
 
     def _idle_session_ids(self, ttl, keep) -> List[str]:
         now = time.time()
