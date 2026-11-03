@@ -7,12 +7,15 @@ here mutates global ``dspy.settings`` (``dspy.configure`` is owner-thread /
 owner-task only, and per-render mutation leaked across subtrees).
 """
 
+import json
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import dspy
 
+from pyreact.core import report_hydration_mismatch, use_dehydrate
 from pyreact.core.core import component, hooks, use_path
 from pyreact.core.provider import create_context
 
@@ -30,6 +33,8 @@ class DSPyEnv:
     adapter: Optional[Any] = None  # e.g. dspy.JSONAdapter(); None = DSPy default
     # module keys with an optimizer compile in flight (dedupe across components)
     compiling: set = field(default_factory=set, repr=False)
+    # hydration: {module key: learned state} applied when the module is built
+    restore: Dict = field(default_factory=dict, repr=False)
 
     def lm_for(self, model: Optional[str] = None, lm: Optional[Any] = None) -> Any:
         """Resolve an LM: explicit ``lm`` > ``models[model]`` > ``models['default']``."""
@@ -51,6 +56,88 @@ class DSPyEnv:
 
 
 ENVS_SERVICE = "dspy_envs"  # session service: {provider path: DSPyEnv}
+
+
+# ---------------------------------------------------------------------------
+# Dehydration: compiled / hot-swapped programs are state of the provider
+# ---------------------------------------------------------------------------
+def _plain(obj: Any) -> Any:
+    return json.loads(json.dumps(obj, default=str))
+
+
+def dehydrate_compiled(env: Optional[DSPyEnv]) -> List[Dict[str, Any]]:
+    """The provider's ``"compiled"`` slice: one entry per learned module in
+    ``env.compiled`` (an optimizer compiled it, or a program was hot-swapped
+    in by key)::
+
+        {"key": ["ReAct", "Coder", "coder"], "key_str": "ReAct:Coder:coder",
+         "arch": "react", "path": "artifacts/coder.json"}   # or "state": {...}
+
+    ``path``: the ``integrations.learn`` result file the program came from,
+    when it still exists; else its ``dump_state()`` inline. Modules that carry
+    a ``LearnedProgram`` / ``program=`` are skipped (that provider dehydrates
+    them); states hydrated but not applied in this run are carried over."""
+    if env is None:
+        return []
+    from integrations.feedback import key_str
+
+    from .architectures import arch_of
+    from .hooks import _Applied
+
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for key, program in list(env.compiled.items()):
+        if not isinstance(key, tuple) or isinstance(
+                getattr(program, "_pyreact_learned", None), _Applied):
+            continue
+        seen.add(key)
+        entry: Dict[str, Any] = {"key": list(key), "key_str": key_str(key),
+                                 "arch": arch_of(program)}
+        path = getattr(program, "_pyreact_result_path", None)
+        if path and os.path.exists(path):
+            entry["path"] = str(path)
+        else:
+            entry["state"] = _plain(program.dump_state())
+        out.append(entry)
+    for key, state in list(env.restore.items()):
+        if isinstance(key, tuple) and key not in seen:
+            out.append({"key": list(key), "key_str": key_str(key), "state": _plain(state)})
+    return out
+
+
+def hydrate_compiled(slice_: Any, session: Any = None) -> Dict[Tuple, Any]:
+    """Inverse of :func:`dehydrate_compiled`: ``{module key: state}``. A
+    result file that is gone or unreadable is a ``hydration.mismatch`` (and
+    ``session.resume.degraded``, ``participant: "dspy.compiled"``); that
+    module starts from its signature."""
+    if not isinstance(slice_, list):
+        raise TypeError(f"a compiled-modules slice is a list, got {type(slice_).__name__}")
+    out: Dict[Tuple, Any] = {}
+    for e in slice_:
+        if not isinstance(e, dict) or not e.get("key"):
+            continue
+        key = tuple(e["key"])
+        state = e.get("state")
+        if state is None and e.get("path"):
+            try:
+                with open(e["path"], encoding="utf-8") as f:
+                    data = json.load(f)
+                state = data["state"] if isinstance(data, dict) and "state" in data else data
+            except Exception as exc:
+                reason = ("result missing" if isinstance(exc, FileNotFoundError)
+                          else "result unreadable")
+                degrade = getattr(session, "degrade", None)
+                if callable(degrade):
+                    degrade("dspy.compiled", reason, key=e.get("key_str"), path=e["path"],
+                            error=repr(exc))
+                report_hydration_mismatch(
+                    "compiled", f"learned module {e.get('key_str')}: {reason} "
+                    f"({e['path']}); it starts from its signature",
+                    reason=reason, module=e.get("key_str"), src=e["path"])
+                continue
+        if state is not None:
+            out[key] = state
+    return out
 
 # Create DSPy context - will be automatically managed by create_context
 DSPyContext = create_context(default=None, name="DSPy")
@@ -82,10 +169,18 @@ def DSPyProvider(
     adapter=None,
     children=None,
 ):
+    # Learned modules are state of the provider (ADR 0001): a suspend
+    # dehydrates them, hydrate_root hands them back before the modules are
+    # built (``use_module`` / ``use_agent`` apply them).
+    session = hooks.get_service("session", lambda: None)
+    current = hooks.use_ref(None)
+    hydrated = use_dehydrate("compiled", dehydrate=lambda: dehydrate_compiled(current.current),
+                             hydrate=lambda s: hydrate_compiled(s, session))
     # Module caches survive env rebuilds (modules are LM-agnostic: the LM is
     # applied per call). Compiled programs are tied to the optimizer.
     store = hooks.use_ref(
-        {"caches": {}, "compiled": {}, "compiling": set(), "optimizer": None}
+        {"caches": {}, "compiled": {}, "compiling": set(), "optimizer": None,
+         "restore": dict(hydrated or {})}
     ).current
 
     def _factory():
@@ -107,6 +202,7 @@ def DSPyProvider(
             settings=dict(settings or {}),
             adapter=adapter,
             compiling=store["compiling"],
+            restore=store["restore"],
         )
 
     env = hooks.use_memo(
@@ -119,6 +215,7 @@ def DSPyProvider(
             id(adapter),
         ],
     )
+    current.current = env
     # Make the env discoverable from outside the tree (dev tools, hot swap by
     # key): ``session.services["dspy_envs"][provider_path] = env``.
     try:
