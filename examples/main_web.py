@@ -13,7 +13,8 @@ Run from the repo root::
 
     uv run python -m examples.main_web --check              # self-test, no server
 
-``--check`` drives the app through starlette's ``TestClient`` (hello ->
+``--check`` builds the same ASGI app ``run_web`` serves with
+``make_web_app(Root)`` and drives it through starlette's ``TestClient`` (hello ->
 submit -> ``turn.end``) and exits 0 if an assistant/system message came back.
 
 LM: ``examples._lm`` (``claude -p`` by default; ``PYREACT_EXAMPLE_LM=openai|offline``).
@@ -25,7 +26,7 @@ import argparse
 import importlib
 import sys
 
-from pyreact.boot import AppRunner, run_web
+from pyreact.boot import make_web_app, run_web
 
 # Offline smoke run (tests/test_examples_smoke.py, PYREACT_EXAMPLE_LM=offline).
 SMOKE = {"args": ["--check", "--app", "router_app"], "timeout": 120}
@@ -43,9 +44,7 @@ def check(root, text: str, timeout: float = 180) -> int:
 
     from starlette.testclient import TestClient
 
-    from pyreact.web.server import create_fastapi_app
-
-    app, _ = create_fastapi_app(AppRunner(root, default_session=False), capture_stdout=False)
+    app, _runner = make_web_app(root, capture_stdout=False)  # what run_web serves
     messages, deadline = [], time.time() + timeout
     with TestClient(app) as client:
         assert "<html" in client.get("/").text.lower()

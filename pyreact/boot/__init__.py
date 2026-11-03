@@ -5,12 +5,13 @@ from .terminal import (
     read_terminal_and_invoke,
     register_command,
 )
-from .web import run_web
+from .web import make_web_app, run_web
 from .app_runner import AppRunner
 from .session import Session, current_session, session_of, DEFAULT_SESSION_ID
 
 __all__ = [
     "run_web",
+    "make_web_app",
     "bootstrap",
     "AppRunner",
     "Session",
